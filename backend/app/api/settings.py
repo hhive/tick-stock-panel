@@ -641,7 +641,13 @@ def save_plugin_key(req: PluginKeyIn) -> dict:
     ok, message = custom_sources.probe_plugin_key(name, key)
     if not ok:
         return {"ok": False, "reason": "invalid", "error": message}
-    secrets_store.save({f"{name}_api_key": key})
+    # 插件 Key 喂的是**共享行情**, 属部署级; 键名动态生成, 无法用静态
+    # DEPLOYMENT_KEYS 覆盖 → 显式走部署级写入。
+    # **原先这里是错的**: 用 save() 时键不在 DEPLOYMENT_KEYS 里, 于是落进
+    # **调用方的每用户文件**, 而读取侧 get_env_backed_secret 读的是部署级文件
+    # ⇒ 界面里保存的 Key **永远读不到**(写入与读取作用域不一致)。
+    # 同时统一小写: 读取侧用的是 name.lower()。
+    secrets_store.save_deployment({f"{name.lower()}_api_key": key})
     custom_sources.load_all()
     status = next((p for p in custom_sources.list_plugins() if p["name"] == name), None)
     return {
@@ -662,7 +668,10 @@ def clear_plugin_key(name: str) -> dict:
         raise HTTPException(status_code=404, detail=f"插件 '{name}' 不存在")
     if not manifest.get("api_key_env"):
         raise HTTPException(status_code=400, detail=f"插件 '{name}' 不支持在界面配置 Key")
-    secrets_store.clear(f"{name.lower()}_api_key")
+    # 与写入侧同作用域: 插件 Key 是**部署级**的(喂共享行情)。原先 clear() 清的是
+    # 调用方的每用户文件 —— 那里从来没存过这个键, 于是"清除"实际什么也没清,
+    # 而部署级文件里的旧 Key 继续生效。
+    secrets_store.clear_deployment(f"{name.lower()}_api_key")
     custom_sources.load_all()
     status = next((p for p in custom_sources.list_plugins() if p["name"] == name), None)
     return {

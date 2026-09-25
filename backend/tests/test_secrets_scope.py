@@ -105,6 +105,31 @@ def test_plugin_key_falls_back_to_env(_isolated, monkeypatch):
     assert secrets_store.get_env_backed_secret("myplugin_api_key", "MYPLUGIN_API_KEY") == "pk-from-env"
 
 
+def test_plugin_key_write_and_read_use_the_same_scope(_isolated):
+    """插件 Key 的**写入与读取必须同作用域** —— 否则保存了永远读不到。
+
+    这是拆分凭据作用域时引入的真实缺陷: 写入侧(界面保存插件 Key)用 save(),
+    而 ``{plugin}_api_key`` 不在 DEPLOYMENT_KEYS 里 ⇒ 落进**调用方的每用户文件**;
+    读取侧 ``get_env_backed_secret`` 读的是**部署级文件** ⇒ 界面里保存的 Key
+    永远不会被读到, 且**不报错**。
+
+    这里钉住两端: 写进部署级文件, 且能被读取侧读到。
+    """
+    secrets_store.save_deployment({"myplugin_api_key": "pk-123"})
+    dep = _isolated / "deployment_secrets.json"
+    assert dep.is_file()
+    assert "myplugin_api_key" in json.loads(dep.read_text(encoding="utf-8"))
+    assert secrets_store.get_env_backed_secret("myplugin_api_key", "MYPLUGIN_API_KEY") == "pk-123"
+
+
+def test_plugin_key_clear_targets_the_deployment_file(_isolated, as_user):
+    """清除也必须作用于部署级文件 —— 清错文件等于没清, 且旧 Key 继续生效。"""
+    secrets_store.save_deployment({"myplugin_api_key": "pk-123"})
+    secrets_store.clear_deployment("myplugin_api_key")
+    assert "myplugin_api_key" not in secrets_store.load_deployment()
+    assert secrets_store.get_env_backed_secret("myplugin_api_key", "MYPLUGIN_API_KEY") == ""
+
+
 def test_deployment_file_wins_over_env(_isolated, monkeypatch):
     monkeypatch.setenv("MYPLUGIN_API_KEY", "pk-from-env")
     secrets_store.save_deployment({"myplugin_api_key": "pk-from-file"})

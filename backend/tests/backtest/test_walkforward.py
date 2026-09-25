@@ -367,22 +367,33 @@ def test_wf_job_key_distinguishes_params_and_overrides():
 
 def test_wf_cancel_by_echoed_key():
     import asyncio
+    from types import SimpleNamespace
 
     from app.api.backtest import _BacktestJob, _running_jobs, walkforward_cancel
 
     class _Req:
-        def __init__(self, body):
+        """最小请求替身: 账户身份读 request.state.account_id (任务表的键含账户维度)。"""
+
+        def __init__(self, body, account_id=1):
             self._body = body
+            self.state = SimpleNamespace(account_id=account_id)
+
         async def json(self):
             return self._body
 
     key = "wfkey_test_1"
-    _running_jobs[key] = _BacktestJob(key)
+    _running_jobs[(1, key)] = _BacktestJob(1, key)
     try:
         res = asyncio.run(walkforward_cancel(_Req({"job_key": key})))
         assert res["ok"] is True
-        assert _running_jobs[key].cancel_event.is_set()
+        assert _running_jobs[(1, key)].cancel_event.is_set()
         res2 = asyncio.run(walkforward_cancel(_Req({"job_key": "nope"})))
         assert res2["ok"] is False
+
+        # 跨账户: 另一账户拿同一把 key → 拒, 别人的任务不受影响
+        _running_jobs[(1, key)].cancel_event.clear()
+        res3 = asyncio.run(walkforward_cancel(_Req({"job_key": key}, account_id=2)))
+        assert res3["ok"] is False
+        assert not _running_jobs[(1, key)].cancel_event.is_set()
     finally:
-        _running_jobs.pop(key, None)
+        _running_jobs.pop((1, key), None)

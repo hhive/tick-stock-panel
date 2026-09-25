@@ -44,7 +44,7 @@ def capacity(monkeypatch, tmp_path):
 
 def test_queued_pipeline_is_cancellable_and_not_reaped(capacity):
     store, limiter = capacity
-    jid, _ = store.create(timeout_s=1)
+    jid, _ = store.create(owner_account_id=None, timeout_s=1)
     called = threading.Event()
     assert limiter.acquire("normal", timeout=0)
     with ThreadPoolExecutor(max_workers=1) as pool:
@@ -69,7 +69,7 @@ def test_queued_pipeline_is_cancellable_and_not_reaped(capacity):
 
 def test_cancel_does_not_release_running_worker_capacity(capacity):
     store, limiter = capacity
-    jid, _ = store.create()
+    jid, _ = store.create(owner_account_id=None)
     entered, finish = threading.Event(), threading.Event()
 
     def work():
@@ -106,7 +106,7 @@ def test_cache_refresh_queues_and_can_nest_in_pipeline(capacity, monkeypatch):
         finally:
             limiter.release("normal")
         future.result(timeout=1)
-    jid, _ = store.create()
+    jid, _ = store.create(owner_account_id=None)
     run_with_capacity(jid, repo._refresh_enriched)
     assert calls == [2, 2]
     assert limiter.in_use == 0

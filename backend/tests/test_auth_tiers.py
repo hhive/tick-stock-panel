@@ -276,6 +276,77 @@ def regular_user(client):
     return client
 
 
+def test_every_admin_only_entry_matches_a_real_route():
+    """门控路径必须命中**真实路由** —— 否则门控是死的，而测试会空转。
+
+    这是我在本项目里亲自犯过的错误，而且**当时任何测试都发现不了**：门控写成
+    `/api/strategy/*`（单数），而真实前缀是 `/api/strategies`（复数）。中间件在
+    路由**之前**拦截，于是对不存在的路径也返回 403 —— 断言 403 的测试照样通过，
+    而真实端点（会写盘、并被进程内 exec 的策略源码写入路径）完全没被保护。
+
+    这条断言把"门控是否接上真实路由"变成可检测的事实，而不是靠人眼核对前缀拼写。
+    """
+    paths = {r.path for r in app_main.app.routes}
+    real = {p for p in paths if p.startswith("/api/")}
+
+    for p in app_main._ADMIN_ONLY_EXACT:
+        assert p in paths, f"管理员门控路径不是真实路由(门控失效): {p}"
+
+    for pattern in (*app_main._ADMIN_ONLY_RE_POST, *app_main._ADMIN_ONLY_RE_DELETE):
+        assert any(pattern.match(p) for p in real), (
+            f"管理员门控正则未命中任何真实路由(门控失效): {pattern.pattern}"
+        )
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("POST", "/api/data/clear"),
+        ("POST", "/api/strategies/build"),
+        ("POST", "/api/strategies/build/stream"),
+        ("POST", "/api/strategies/ai/generate"),
+        ("POST", "/api/strategies/ai/iterate"),
+        ("POST", "/api/strategies/ai/save"),
+        ("POST", "/api/strategies/ai/test"),
+        ("POST", "/api/strategies/code/save"),
+        ("POST", "/api/strategies/code/validate"),
+        ("POST", "/api/strategies/composite/save"),
+        ("POST", "/api/strategies/reload"),
+        ("POST", "/api/strategies/whatever/publish"),
+        ("DELETE", "/api/strategies/whatever"),
+        ("POST", "/api/custom-signals"),
+        ("POST", "/api/custom-signals/ai/generate"),
+        ("DELETE", "/api/custom-signals/whatever"),
+        ("POST", "/api/factors/custom"),
+        ("POST", "/api/factors/composite"),
+        ("POST", "/api/factors/custom/whatever/update"),
+        ("DELETE", "/api/factors/custom/whatever"),
+        # 部署级凭据的设置端点: 改的是**全站**取数端点 / 数据源 Key
+        ("POST", "/api/settings/switch_endpoint"),
+        ("POST", "/api/settings/tickflow-key"),
+        ("DELETE", "/api/settings/tickflow-key"),
+        ("POST", "/api/settings/plugin-key"),
+        ("DELETE", "/api/settings/plugin-key/whatever"),
+    ],
+)
+def test_dangerous_endpoints_are_gated_by_real_path(method, path):
+    """对**真实存在的**危险路径逐条断言门控生效。
+
+    与上一条互补：上一条保证门控清单不指向空气，这一条保证清单**覆盖**了那些
+    真正会写盘 / 删库 / 触发进程内执行的具体端点。逐条列出而不是遍历推导，
+    是为了让"新增一个危险端点却忘了加门控"在 diff 里看得见。
+    """
+    assert app_main._is_admin_only(method, path), f"{method} {path} 未被门控"
+
+
+def test_gated_paths_exist_in_the_route_table():
+    """上一条列出的路径必须是真实路由 —— 两半合起来才构成"真的被保护了"。"""
+    paths = {r.path for r in app_main.app.routes}
+    for p in ("/api/data/clear", "/api/strategies/code/save", "/api/custom-signals",
+              "/api/factors/custom"):
+        assert p in paths, f"断言了一个不存在的路由(测试会空转): {p}"
+
+
 def test_regular_user_cannot_clear_shared_data(regular_user):
     """删光共享行情/财务/任务表的端点必须 admin-only。
 
@@ -297,23 +368,23 @@ def test_regular_user_cannot_write_strategy_source(regular_user):
     只藏前端入口不够：请求可以绕过 UI 直接发。面板作者的 AST 名单自述"不是真正的
     沙箱"，因此对不可信用户开放该路径等于放弃隔离。
     """
-    for path in ("/api/strategy/build", "/api/strategy/build/stream",
-                 "/api/strategy/ai/generate", "/api/strategy/ai/iterate",
-                 "/api/strategy/ai/save", "/api/strategy/ai/test",
-                 "/api/strategy/code/save", "/api/strategy/code/validate",
-                 "/api/strategy/composite/save", "/api/strategy/reload"):
+    for path in ("/api/strategies/build", "/api/strategies/build/stream",
+                 "/api/strategies/ai/generate", "/api/strategies/ai/iterate",
+                 "/api/strategies/ai/save", "/api/strategies/ai/test",
+                 "/api/strategies/code/save", "/api/strategies/code/validate",
+                 "/api/strategies/composite/save", "/api/strategies/reload"):
         assert regular_user.post(path, json={}).status_code == 403, path
 
 
 def test_regular_user_cannot_delete_or_publish_strategy(regular_user):
-    assert regular_user.delete("/api/strategy/some_id").status_code == 403
-    assert regular_user.post("/api/strategy/some_id/publish").status_code == 403
+    assert regular_user.delete("/api/strategies/some_id").status_code == 403
+    assert regular_user.post("/api/strategies/some_id/publish").status_code == 403
 
 
 def test_regular_user_can_still_run_strategies(regular_user):
     """核心产品功能**不得**被门控误伤：用内置策略跑自己的参数、改自己的覆盖值。"""
-    assert regular_user.post("/api/strategy/run", json={}).status_code != 403
-    assert regular_user.patch("/api/strategy/config/x", json={}).status_code != 403
+    assert regular_user.post("/api/strategies/run", json={}).status_code != 403
+    assert regular_user.patch("/api/strategies/config/x", json={}).status_code != 403
 
 
 def test_guest_cannot_reach_admin_endpoints(client):

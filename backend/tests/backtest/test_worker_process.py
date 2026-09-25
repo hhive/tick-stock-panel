@@ -270,6 +270,8 @@ def test_spawn_mining_writes_four_artifacts_and_returns_compact_summary(tmp_path
         "request": manifest["request"],
         "data_fingerprint": manifest["data_fingerprint"],
         "source": "manual",
+        # 运行产物按账户分家: 子进程没有请求上下文, 账户根必须随载荷传下去。
+        "user_root": str(data_dir),
     }
 
     result = run_worker_task(make_worker_task("mining", data_dir, payload))
@@ -324,6 +326,8 @@ def test_spawn_mining_benchmarks_strategy_on_every_outer_fold(tmp_path):
         "request": manifest["request"],
         "data_fingerprint": manifest["data_fingerprint"],
         "source": "manual",
+        # 运行产物按账户分家: 子进程没有请求上下文, 账户根必须随载荷传下去。
+        "user_root": str(data_dir),
     }
 
     result = run_worker_task(make_worker_task("mining", data_dir, payload))
@@ -383,6 +387,8 @@ def test_spawn_mining_rejects_generation_change_after_queue(tmp_path):
         "request": manifest["request"],
         "data_fingerprint": manifest["data_fingerprint"],
         "source": "manual",
+        # 运行产物按账户分家: 子进程没有请求上下文, 账户根必须随载荷传下去。
+        "user_root": str(data_dir),
     }
 
     with pytest.raises(
@@ -585,6 +591,7 @@ def _queue_mining_run(data_dir, start: date, run_id: str) -> dict:
         "request": manifest["request"],
         "data_fingerprint": manifest["data_fingerprint"],
         "source": "manual",
+        "user_root": str(data_dir),
     }
 
 

@@ -62,26 +62,51 @@ class _Repo:
 
 
 class _Manager:
-    def __init__(self, data_dir) -> None:
-        self.store = MiningRunStore(data_dir)
+    """与真 manager 同一接缝的假实现: store_for(user_root) + start/cancel 带账户根。
 
-    def start(self, request, fingerprint, force=False, source="manual", run_id=None):
+    刻意按账户根分家 (而不是一个共享 store): 端点已改为按账户根取存储, 假实现若
+    仍是单一 store, 隔离缺陷就会在这里被掩盖。
+    """
+
+    def __init__(self) -> None:
+        self._stores: dict[Path, MiningRunStore] = {}
+
+    def store_for(self, user_root: Path) -> MiningRunStore:
+        root = Path(user_root)
+        store = self._stores.get(root)
+        if store is None:
+            store = MiningRunStore(root)
+            self._stores[root] = store
+        return store
+
+    def start(
+        self,
+        request,
+        fingerprint,
+        *,
+        user_root: Path,
+        force=False,
+        source="manual",
+        run_id=None,
+    ):
         del force
-        manifest = self.store.create(request, fingerprint, run_id=run_id)
-        self.store.append_event(
+        store = self.store_for(user_root)
+        manifest = store.create(request, fingerprint, run_id=run_id)
+        store.append_event(
             manifest["run_id"],
             "queued",
             {"status": "queued", "source": source},
         )
         return manifest
 
-    def cancel(self, run_id):
-        manifest = self.store.get(run_id)
+    def cancel(self, run_id: str, *, user_root: Path):
+        store = self.store_for(user_root)
+        manifest = store.get(run_id)
         if manifest is None:
             raise KeyError(run_id)
         if manifest["status"] == "queued":
-            manifest = self.store.transition_status(run_id, "cancelled")
-            self.store.append_event(run_id, "cancelled", {"status": "cancelled"})
+            manifest = store.transition_status(run_id, "cancelled")
+            store.append_event(run_id, "cancelled", {"status": "cancelled"})
         return manifest
 
 
@@ -106,9 +131,9 @@ def _client(tmp_path):
     app = FastAPI()
     app.include_router(router)
     app.state.repo = _Repo(tmp_path)
-    app.state.mining_manager = _Manager(tmp_path)
+    app.state.mining_manager = _Manager()
     app.state.strategy_engine = SimpleNamespace()
-    return TestClient(app), app.state.mining_manager.store
+    return TestClient(app), app.state.mining_manager.store_for(tmp_path)
 
 
 def _successful_run(store: MiningRunStore, run_id: str = "result-run"):
@@ -640,7 +665,7 @@ def test_start_returns_400_with_guidance_while_enriched_publication_active(
     app = FastAPI()
     app.include_router(router)
     app.state.repo = _PublishingRepo(tmp_path)
-    app.state.mining_manager = _Manager(tmp_path)
+    app.state.mining_manager = _Manager()
     app.state.strategy_engine = SimpleNamespace()
     client = TestClient(app)
 

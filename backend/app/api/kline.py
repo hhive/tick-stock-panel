@@ -89,6 +89,19 @@ def _minute_allowed(capset) -> bool:
     return not fallback
 
 
+def _job_owner(request: Request) -> int | None:
+    """同步任务的归属账户 (记进 JobStore, 决定谁有权取消)。
+
+    账户身份由认证中间件注入 (app.main); 拿不到就是"无主": 单密码应急入口本身
+    没有 account_id, 游客则根本进不来 (这些端点在"需登录"侧)。**无主任务只有
+    管理员能取消** —— 所以读不到身份时的降级方向是收紧而不是放开 (与
+    app/api/deps.py 的 fail-closed 姿态一致)。
+    """
+    state = getattr(request, "state", None)
+    raw = getattr(state, "account_id", None)
+    return raw if isinstance(raw, int) and not isinstance(raw, bool) else None
+
+
 @lru_cache(maxsize=8192)
 def _name_pinyin_keys(name: str) -> tuple[str, ...]:
     """返回中文名称所有可能的拼音首字母串 (多音字展开为笛卡尔积)。
@@ -1234,7 +1247,7 @@ async def sync_minute(request: Request):
     extend_flag = body.get("extend")
 
     # 分钟K全市场同步是长任务(数据量是日K的 ~240 倍),用更宽松的卡死阈值
-    job_id, is_new = job_store.create(long_running=True)
+    job_id, is_new = job_store.create(long_running=True, owner_account_id=_job_owner(request))
     if not is_new:
         return {"status": "reused", "job_id": job_id}
 
@@ -1446,7 +1459,7 @@ async def extend_history(request: Request):
         from app.services.pipeline_jobs import JobCancelledError, job_store, release_run_slot, run_with_capacity, try_acquire_run_slot
         from app.api.data import invalidate_storage_cache
 
-        job_id, is_new = job_store.create()
+        job_id, is_new = job_store.create(owner_account_id=_job_owner(request))
         if not is_new:
             return {"status": "reused", "job_id": job_id}
 
@@ -1527,7 +1540,7 @@ async def repair_daily(request: Request):
         from app.services.pipeline_jobs import JobCancelledError, job_store, release_run_slot, run_with_capacity, try_acquire_run_slot
         from app.api.data import invalidate_storage_cache
 
-        job_id, is_new = job_store.create()
+        job_id, is_new = job_store.create(owner_account_id=_job_owner(request))
         if not is_new:
             return {"status": "reused", "job_id": job_id}
 
@@ -1589,7 +1602,7 @@ async def rebuild_enriched(request: Request):
         from app.services.pipeline_jobs import JobCancelledError, job_store, release_run_slot, run_with_capacity, try_acquire_run_slot
         from app.api.data import invalidate_storage_cache
 
-        job_id, is_new = job_store.create()
+        job_id, is_new = job_store.create(owner_account_id=_job_owner(request))
         if not is_new:
             return {"status": "reused", "job_id": job_id}
 

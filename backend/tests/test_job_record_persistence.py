@@ -28,7 +28,7 @@ def _read_disk(d, jid: str) -> dict:
 def test_create_writes_pending_snapshot_to_disk(tmp_path):
     d = tmp_path / "jobs"
     store = JobStore(store_dir=d)
-    jid, _ = store.create(timeout_s=60)
+    jid, _ = store.create(owner_account_id=None, timeout_s=60)
 
     disk = _read_disk(d, jid)
     assert disk["status"] == "pending"
@@ -38,7 +38,7 @@ def test_create_writes_pending_snapshot_to_disk(tmp_path):
 def test_start_updates_disk_snapshot_to_running(tmp_path):
     d = tmp_path / "jobs"
     store = JobStore(store_dir=d)
-    jid, _ = store.create(timeout_s=60)
+    jid, _ = store.create(owner_account_id=None, timeout_s=60)
     store.start(jid)
 
     disk = _read_disk(d, jid)
@@ -52,7 +52,7 @@ def test_orphan_running_record_is_reaped_on_next_boot(tmp_path):
     """核心场景: 进程死在 running(甚至工作已做完但未终态), 记录必须可见。"""
     d = tmp_path / "jobs"
     dead = JobStore(store_dir=d)
-    jid, _ = dead.create(timeout_s=60)
+    jid, _ = dead.create(owner_account_id=None, timeout_s=60)
     dead.start(jid)
     dead.progress(jid, "sync", 50, "halfway")  # 进度只更新内存
 
@@ -74,7 +74,7 @@ def test_orphan_pending_record_is_reaped(tmp_path):
     """进程死在 create() 与 start() 之间: 记录同样可见, 时长为 None。"""
     d = tmp_path / "jobs"
     dead = JobStore(store_dir=d)
-    jid, _ = dead.create(timeout_s=60)
+    jid, _ = dead.create(owner_account_id=None, timeout_s=60)
     # 未 start 即死亡
 
     revived = JobStore(store_dir=d)
@@ -86,7 +86,7 @@ def test_orphan_pending_record_is_reaped(tmp_path):
 def test_reap_does_not_touch_terminal_records(tmp_path):
     d = tmp_path / "jobs"
     store = JobStore(store_dir=d)
-    jid, _ = store.create(timeout_s=60)
+    jid, _ = store.create(owner_account_id=None, timeout_s=60)
     store.start(jid)
     store.succeed(jid, {"daily_rows": 100})
 
@@ -100,11 +100,11 @@ def test_reap_allows_new_job_after_dead_orphan(tmp_path):
     """补录后旧 job 已 failed: 新进程 create() 不被死孤儿阻塞(单飞只看内存)。"""
     d = tmp_path / "jobs"
     dead = JobStore(store_dir=d)
-    old_jid, _ = dead.create(timeout_s=60)
+    old_jid, _ = dead.create(owner_account_id=None, timeout_s=60)
     dead.start(old_jid)
 
     revived = JobStore(store_dir=d)
-    new_jid, is_new = revived.create(timeout_s=60)
+    new_jid, is_new = revived.create(owner_account_id=None, timeout_s=60)
     assert is_new is True
     assert new_jid != old_jid
 
@@ -114,7 +114,7 @@ def test_reap_allows_new_job_after_dead_orphan(tmp_path):
 def test_terminal_write_replaces_running_snapshot(tmp_path):
     d = tmp_path / "jobs"
     store = JobStore(store_dir=d)
-    jid, _ = store.create(timeout_s=60)
+    jid, _ = store.create(owner_account_id=None, timeout_s=60)
     store.start(jid)
     store.fail(jid, "boom")
 

@@ -934,7 +934,9 @@ def _run_tracked(fn, job_label: str) -> bool:
     """
     from app.services.pipeline_jobs import JobCancelledError, job_store, release_run_slot, run_with_capacity, try_acquire_run_slot
 
-    job_id, is_new = job_store.create()
+    # 调度器发起的任务没有账户归属 (它们代表全站的盘后管道): 显式记 None,
+    # 于是只有管理员能取消 —— 普通账户停掉全站同步的效果超出单个账户。
+    job_id, is_new = job_store.create(owner_account_id=None)
     if not is_new:
         logger.info("scheduled %s 跳过: 已有活跃任务在运行 (job_id=%s)", job_label, job_id)
         return False

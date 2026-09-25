@@ -8,9 +8,13 @@ from zoneinfo import ZoneInfo
 import polars as pl
 import pytest
 
+from app import config as app_config
 from app.jobs import daily_pipeline
-from app.services import mining_schedule, preferences
+from app.services import mining_schedule, preferences, user_paths
 from app.services.mining_jobs import MiningRunStore
+
+ACCOUNT_A = 1
+ACCOUNT_B = 2
 
 
 class FakeRepo:
@@ -38,27 +42,73 @@ class FakeRepo:
 
 
 class FakeManager:
-    def __init__(self, data_dir: Path) -> None:
-        self.store = MiningRunStore(data_dir)
+    """与真 manager 同一接缝的假实现: store_for(user_root) + start(..., user_root=)。
+
+    刻意按账户根分家 —— 若这里退回"单个共享 store", 双账户用例就会互相看见,
+    测试也就无法证明隔离。
+    """
+
+    def __init__(self) -> None:
+        self._stores: dict[Path, MiningRunStore] = {}
         self.calls: list[dict] = []
 
-    def start(self, request, fingerprint, *, force: bool, source: str, run_id: str):
+    def store_for(self, user_root: Path) -> MiningRunStore:
+        root = Path(user_root)
+        store = self._stores.get(root)
+        if store is None:
+            store = MiningRunStore(root)
+            self._stores[root] = store
+        return store
+
+    def start(
+        self,
+        request,
+        fingerprint,
+        *,
+        user_root: Path,
+        force: bool,
+        source: str,
+        run_id: str,
+    ):
         call = {
             "request": request,
             "fingerprint": fingerprint,
             "force": force,
             "source": source,
             "run_id": run_id,
+            "user_root": Path(user_root),
         }
         self.calls.append(call)
-        manifest = self.store.create(request, fingerprint, run_id=run_id)
+        manifest = self.store_for(user_root).create(request, fingerprint, run_id=run_id)
         return {"run_id": manifest["run_id"]}
 
 
-@pytest.fixture
-def scheduled_state(tmp_path: Path, monkeypatch):
+def _account_root(tmp_path: Path, account_id: int) -> Path:
+    """账户根走**真实**路径构造 (settings.data_dir 已指向 tmp_path)。"""
+    return user_paths.user_root(account_id)
+
+
+def _scheduled_state(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    account_ids: tuple[int, ...] = (ACCOUNT_A,),
+    days: int = 1200,
+    manager=None,
+) -> SimpleNamespace:
+    """构造一个已开启周度调度的 state, 并按 account_ids 扇出。
+
+    `iter_user_roots` 读的是**真实**账号注册表, 测试里必须拦截, 否则用例会
+    按部署里实际存在的账号扇出 (不 hermetic)。data_dir 指向 tmp_path, 于是
+    user_root(id) == tmp_path/users/<id>, 与部署布局一致 (共享行情在 tmp_path
+    顶层, 账户私有数据在 users/<id> 之下)。
+
+    manager=None 时用 FakeManager (隔离 claim 逻辑); 传真 manager 时整条链路
+    (schedule_claim → store_for → MiningRunStore) 都走生产实现。
+    """
+    monkeypatch.setattr(app_config.settings, "data_dir", tmp_path)
     repo = FakeRepo(tmp_path)
-    manager = FakeManager(tmp_path)
+    manager = FakeManager() if manager is None else manager
     state = SimpleNamespace(repo=repo, mining_manager=manager, strategy_engine=None)
     monkeypatch.setattr(
         preferences,
@@ -69,8 +119,21 @@ def scheduled_state(tmp_path: Path, monkeypatch):
             "mining_budget_profile": "balanced",
         },
     )
-    _write_prerequisites(tmp_path, repo.latest, days=1200)
+    monkeypatch.setattr(
+        user_paths,
+        "iter_user_roots",
+        lambda: [
+            (account_id, _account_root(tmp_path, account_id))
+            for account_id in account_ids
+        ],
+    )
+    _write_prerequisites(tmp_path, repo.latest, days=days)
     return state
+
+
+@pytest.fixture
+def scheduled_state(tmp_path: Path, monkeypatch):
+    return _scheduled_state(tmp_path, monkeypatch)
 
 
 def _friday(week_offset: int = 0) -> datetime:
@@ -265,7 +328,8 @@ def test_later_workday_catches_up_once_in_same_iso_week(scheduled_state, monkeyp
     second = mining_schedule.run_weekly_mining(scheduled_state, now=_friday())
 
     assert first["status"] == "enqueued"
-    assert second == {"status": "already_claimed", "run_id": first["run_id"]}
+    assert second["status"] == "already_claimed"
+    assert second["accounts"][0]["run_id"] == first["accounts"][0]["run_id"]
     assert len(scheduled_state.mining_manager.calls) == 1
 
 
@@ -274,13 +338,22 @@ def test_same_week_and_fingerprint_enqueue_once(scheduled_state):
     second = mining_schedule.run_weekly_mining(scheduled_state, now=_friday())
 
     assert first["status"] == "enqueued"
-    assert second == {"status": "already_claimed", "run_id": first["run_id"]}
+    assert first["accounts"] == [
+        {
+            "account_id": ACCOUNT_A,
+            "status": "enqueued",
+            "run_id": f"weekly-{ACCOUNT_A}-2026-W33",
+        }
+    ]
+    assert second["status"] == "already_claimed"
+    assert second["accounts"][0]["run_id"] == first["accounts"][0]["run_id"]
     assert len(scheduled_state.mining_manager.calls) == 1
     call = scheduled_state.mining_manager.calls[0]
     assert call["force"] is False
     assert call["source"] == "scheduled"
-    assert call["run_id"] == first["run_id"]
+    assert call["run_id"] == first["accounts"][0]["run_id"]
     assert call["run_id"] == call["fingerprint"]["source_claim"]
+    assert call["user_root"] == _account_root(Path(scheduled_state.repo.store.data_dir), ACCOUNT_A)
     assert call["request"]["asset_type"] == "stock"
     assert call["request"]["symbols"] is None
     assert call["request"]["strategy_ids"] == []
@@ -289,11 +362,14 @@ def test_same_week_and_fingerprint_enqueue_once(scheduled_state):
     assert len(call["request"]["factor_names"]) <= 48
 
 
-def test_profile_change_cannot_bypass_same_week_claim(scheduled_state, monkeypatch):
+def test_profile_change_cannot_bypass_same_week_claim(
+    scheduled_state,
+    monkeypatch,
+    tmp_path,
+):
     first = mining_schedule.run_weekly_mining(scheduled_state, now=_friday())
-    scheduled_state.mining_manager.store.transition_status(
-        first["run_id"], "failed", error="worker failed"
-    )
+    store = scheduled_state.mining_manager.store_for(_account_root(tmp_path, ACCOUNT_A))
+    store.transition_status(first["accounts"][0]["run_id"], "failed", error="worker failed")
     monkeypatch.setattr(
         preferences,
         "get_mining_schedule",
@@ -306,7 +382,8 @@ def test_profile_change_cannot_bypass_same_week_claim(scheduled_state, monkeypat
 
     second = mining_schedule.run_weekly_mining(scheduled_state, now=_friday())
 
-    assert second == {"status": "already_claimed", "run_id": first["run_id"]}
+    assert second["status"] == "already_claimed"
+    assert second["accounts"][0]["run_id"] == first["accounts"][0]["run_id"]
     assert len(scheduled_state.mining_manager.calls) == 1
 
 
@@ -326,17 +403,20 @@ def test_new_week_creates_new_claim_but_same_week_metadata_change_does_not(
     latest_file.write_bytes(b"changed-enriched-metadata")
     changed = mining_schedule.run_weekly_mining(scheduled_state, now=_friday())
 
-    assert first["run_id"] != next_week["run_id"]
-    assert changed == {"status": "already_claimed", "run_id": first["run_id"]}
+    assert first["accounts"][0]["run_id"] != next_week["accounts"][0]["run_id"]
+    assert changed["status"] == "already_claimed"
+    assert changed["accounts"][0]["run_id"] == first["accounts"][0]["run_id"]
     assert len(manager.calls) == 2
 
 
-def test_missing_regime_records_visible_skipped_prerequisite(scheduled_state):
+def test_missing_regime_records_visible_skipped_prerequisite(scheduled_state, tmp_path):
     regime = scheduled_state.repo.store.data_dir / "regime_history" / "part.parquet"
     regime.unlink()
 
     result = mining_schedule.run_weekly_mining(scheduled_state, now=_friday())
-    manifest = scheduled_state.mining_manager.store.get(result["run_id"])
+    manifest = scheduled_state.mining_manager.store_for(
+        _account_root(tmp_path, ACCOUNT_A)
+    ).get(result["accounts"][0]["run_id"])
 
     assert result["status"] == "skipped_prerequisite"
     assert manifest is not None
@@ -345,7 +425,7 @@ def test_missing_regime_records_visible_skipped_prerequisite(scheduled_state):
     assert scheduled_state.mining_manager.calls == []
 
 
-def test_incomplete_regime_coverage_records_visible_skip(scheduled_state):
+def test_incomplete_regime_coverage_records_visible_skip(scheduled_state, tmp_path):
     regime_path = (
         scheduled_state.repo.store.data_dir
         / "regime_history"
@@ -355,7 +435,9 @@ def test_incomplete_regime_coverage_records_visible_skip(scheduled_state):
     history.filter(pl.col("date") != history["date"][-2]).write_parquet(regime_path)
 
     result = mining_schedule.run_weekly_mining(scheduled_state, now=_friday())
-    manifest = scheduled_state.mining_manager.store.get(result["run_id"])
+    manifest = scheduled_state.mining_manager.store_for(
+        _account_root(tmp_path, ACCOUNT_A)
+    ).get(result["accounts"][0]["run_id"])
 
     assert result["status"] == "skipped_prerequisite"
     assert manifest is not None
@@ -363,14 +445,16 @@ def test_incomplete_regime_coverage_records_visible_skip(scheduled_state):
     assert scheduled_state.mining_manager.calls == []
 
 
-def test_early_regime_gap_records_visible_skipped_prerequisite(scheduled_state):
+def test_early_regime_gap_records_visible_skipped_prerequisite(scheduled_state, tmp_path):
     data_dir = scheduled_state.repo.store.data_dir
     regime_path = data_dir / "regime_history" / "part.parquet"
     history = pl.read_parquet(regime_path).sort("date")
     history.slice(1).write_parquet(regime_path)
 
     result = mining_schedule.run_weekly_mining(scheduled_state, now=_friday())
-    manifest = scheduled_state.mining_manager.store.get(result["run_id"])
+    manifest = scheduled_state.mining_manager.store_for(
+        _account_root(tmp_path, ACCOUNT_A)
+    ).get(result["accounts"][0]["run_id"])
 
     assert result["status"] == "skipped_prerequisite"
     assert manifest is not None
@@ -379,9 +463,8 @@ def test_early_regime_gap_records_visible_skipped_prerequisite(scheduled_state):
 
 
 def test_insufficient_data_records_visible_skipped_prerequisite(tmp_path, monkeypatch):
-    repo = FakeRepo(tmp_path)
-    manager = FakeManager(tmp_path)
-    state = SimpleNamespace(repo=repo, mining_manager=manager, strategy_engine=None)
+    state = _scheduled_state(tmp_path, monkeypatch, days=30)
+    manager = state.mining_manager
     monkeypatch.setattr(
         preferences,
         "get_mining_schedule",
@@ -391,16 +474,143 @@ def test_insufficient_data_records_visible_skipped_prerequisite(tmp_path, monkey
             "mining_budget_profile": "strict",
         },
     )
-    _write_prerequisites(tmp_path, repo.latest, days=30)
 
     result = mining_schedule.run_weekly_mining(state, now=_friday())
-    manifest = manager.store.get(result["run_id"])
+    manifest = manager.store_for(_account_root(tmp_path, ACCOUNT_A)).get(
+        result["accounts"][0]["run_id"]
+    )
 
     assert result["status"] == "skipped_prerequisite"
     assert manifest is not None
     assert manifest["status"] == "skipped_prerequisite"
     assert "insufficient" in manifest["error"]
     assert manager.calls == []
+
+
+# ================================================================
+# 双账户: 周度 claim 必须按账户分家
+# ================================================================
+
+def test_two_accounts_each_run_their_own_weekly_mining_for_the_same_week(
+    tmp_path,
+    monkeypatch,
+):
+    """同一 ISO 周内两个账户各自跑一次 —— B 不得拿到 already_claimed。
+
+    这是缺陷的正面证明: claim 此前只由日历推导 (weekly-2026-W33), A 先跑到
+    就占掉整周, B 的调度直接 return already_claimed, 永远跑不了自己的挖掘。
+    """
+    state = _scheduled_state(
+        tmp_path, monkeypatch, account_ids=(ACCOUNT_A, ACCOUNT_B)
+    )
+    manager = state.mining_manager
+
+    result = mining_schedule.run_weekly_mining(state, now=_friday())
+
+    assert [item["account_id"] for item in result["accounts"]] == [ACCOUNT_A, ACCOUNT_B]
+    assert [item["status"] for item in result["accounts"]] == ["enqueued", "enqueued"]
+    assert result["status"] == "enqueued"
+    claim_a = result["accounts"][0]["run_id"]
+    claim_b = result["accounts"][1]["run_id"]
+    assert claim_a == f"weekly-{ACCOUNT_A}-2026-W33"
+    assert claim_b == f"weekly-{ACCOUNT_B}-2026-W33"
+    assert claim_a != claim_b
+    assert len(manager.calls) == 2
+    assert {call["user_root"] for call in manager.calls} == {
+        _account_root(tmp_path, ACCOUNT_A),
+        _account_root(tmp_path, ACCOUNT_B),
+    }
+
+
+def test_two_accounts_second_call_in_same_week_is_claimed_per_account(
+    tmp_path,
+    monkeypatch,
+):
+    state = _scheduled_state(
+        tmp_path, monkeypatch, account_ids=(ACCOUNT_A, ACCOUNT_B)
+    )
+    manager = state.mining_manager
+
+    first = mining_schedule.run_weekly_mining(state, now=_friday())
+    second = mining_schedule.run_weekly_mining(state, now=_friday())
+
+    assert [item["status"] for item in second["accounts"]] == [
+        "already_claimed",
+        "already_claimed",
+    ]
+    assert [item["run_id"] for item in second["accounts"]] == [
+        item["run_id"] for item in first["accounts"]
+    ]
+    assert len(manager.calls) == 2
+
+
+def test_each_account_sees_only_its_own_mining_runs(tmp_path, monkeypatch):
+    """A 的周度运行不得出现在 B 的运行列表里 (含 B 直接猜 claim id 也读不到)。"""
+    state = _scheduled_state(
+        tmp_path, monkeypatch, account_ids=(ACCOUNT_A, ACCOUNT_B)
+    )
+    manager = state.mining_manager
+
+    result = mining_schedule.run_weekly_mining(state, now=_friday())
+    claim_a = result["accounts"][0]["run_id"]
+    claim_b = result["accounts"][1]["run_id"]
+
+    store_a = manager.store_for(_account_root(tmp_path, ACCOUNT_A))
+    store_b = manager.store_for(_account_root(tmp_path, ACCOUNT_B))
+    store_a.create({"factor_names": ["momentum"]}, {"v": 1}, run_id="a_only_run")
+
+    assert {item["run_id"] for item in store_a.list_runs()} == {"a_only_run", claim_a}
+    assert {item["run_id"] for item in store_b.list_runs()} == {claim_b}
+    # 猜 id 也读不到别人的运行: B 的 store 里不存在 A 的 claim
+    assert store_b.get(claim_a) is None
+    assert store_a.get(claim_b) is None
+
+
+def test_two_accounts_run_through_the_real_manager(tmp_path, monkeypatch):
+    """端到端走**生产实现** (schedule_claim → MiningJobManager.store_for →
+    MiningRunStore): 两个账户各自入队, 且各自只看得见自己的运行。
+
+    前面的双账户用例用的是假 manager (隔离 claim 逻辑), 覆盖不到"存储是否真的
+    按账户分家"—— 假 manager 自带正确的分家, 真 manager 退化成单一 store 时
+    它们照样全绿。这条用例就是为了让那种退化**变红**: worker 用桩替掉 (不 spawn
+    子进程), 其余全是生产代码。
+    """
+    from app.services.mining_manager import MiningJobManager
+
+    def task_factory(kind: str, data_dir: Path, payload: dict) -> dict:
+        return {"kind": kind, "data_dir": str(data_dir), "payload": payload}
+
+    def runner(task, progress_cb, cancel_event):
+        return {"status": "succeeded"}
+
+    manager = MiningJobManager(tmp_path, worker_runner=runner, task_factory=task_factory)
+    try:
+        state = _scheduled_state(
+            tmp_path,
+            monkeypatch,
+            account_ids=(ACCOUNT_A, ACCOUNT_B),
+            manager=manager,
+        )
+        result = mining_schedule.run_weekly_mining(state, now=_friday())
+
+        assert [item["account_id"] for item in result["accounts"]] == [
+            ACCOUNT_A,
+            ACCOUNT_B,
+        ]
+        assert [item["status"] for item in result["accounts"]] == [
+            "enqueued",
+            "enqueued",
+        ]
+
+        store_a = manager.store_for(_account_root(tmp_path, ACCOUNT_A))
+        store_b = manager.store_for(_account_root(tmp_path, ACCOUNT_B))
+        assert store_a.runs_root != store_b.runs_root
+        assert store_b.runs_root == _account_root(tmp_path, ACCOUNT_B) / "research" / "mining" / "runs"
+        run_ids = [item["run_id"] for item in result["accounts"]]
+        assert {item["run_id"] for item in store_a.list_runs()} == {run_ids[0]}
+        assert {item["run_id"] for item in store_b.list_runs()} == {run_ids[1]}
+    finally:
+        manager.shutdown()
 
 
 def test_pipeline_failure_does_not_trigger_mining(monkeypatch):

@@ -455,7 +455,7 @@ def test_save_plugin_key_invalid_key_not_persisted(monkeypatch):
     saved: dict = {}
     monkeypatch.setattr(custom_sources, "probe_plugin_key", lambda n, k: (False, "Key 无效"))
     monkeypatch.setattr(
-        settings_api.secrets_store, "save", lambda updates, *a, **k: saved.update(updates) or updates
+        settings_api.secrets_store, "save_deployment", lambda updates, *a, **k: saved.update(updates) or updates
     )
     out = settings_api.save_plugin_key(settings_api.PluginKeyIn(plugin="fuyao", api_key="bad"))
     assert out["ok"] is False and out["reason"] == "invalid"
@@ -470,7 +470,7 @@ def test_save_plugin_key_valid_persists_and_rescans(monkeypatch):
     reloaded = []
     monkeypatch.setattr(custom_sources, "probe_plugin_key", lambda n, k: (True, "ok"))
     monkeypatch.setattr(
-        settings_api.secrets_store, "save", lambda updates, *a, **k: saved.update(updates) or updates
+        settings_api.secrets_store, "save_deployment", lambda updates, *a, **k: saved.update(updates) or updates
     )
     monkeypatch.setattr(
         settings_api.secrets_store, "mask", lambda key, prefix=4, suffix=4: "abcd••••wxyz"
@@ -492,7 +492,7 @@ def test_clear_plugin_key(monkeypatch):
 
     cleared: list = []
     monkeypatch.setattr(custom_sources, "is_builtin", lambda n: n == "fuyao")
-    monkeypatch.setattr(settings_api.secrets_store, "clear", lambda *keys, **kwargs: cleared.extend(keys))
+    monkeypatch.setattr(settings_api.secrets_store, "clear_deployment", lambda *keys, **kwargs: cleared.extend(keys))
     monkeypatch.setattr(custom_sources, "load_all", lambda: None)
     monkeypatch.setattr(
         custom_sources, "list_plugins", lambda: [{"name": "fuyao", "available": False}]

@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from fastapi.testclient import TestClient
 
 from app.services import pipeline_jobs, preferences
 from app.services.pipeline_jobs import JobCancelledError, JobStore
@@ -32,8 +33,13 @@ def _reset_module_globals():
     pipeline_jobs._run_slot_owner = None
 
 
-def _make_running_job(store: JobStore, timeout_s: int) -> str:
-    jid, _ = store.create(timeout_s=timeout_s)
+def _make_running_job(
+    store: JobStore,
+    timeout_s: int,
+    *,
+    owner_account_id: int | None = None,
+) -> str:
+    jid, _ = store.create(owner_account_id=owner_account_id, timeout_s=timeout_s)
     store.start(jid)
     return jid
 
@@ -169,10 +175,48 @@ def test_run_slot_reap_release_prevents_zombie_release():
 
 # ── 手动取消 API 端点契约 (数据页「停止」按钮) ──────────────────────────
 
+def _install_test_identity(app) -> None:
+    """**测试替身**: 补上认证中间件在真实应用里做的那一步 (写 request.state 身份)。
+
+    真实应用从**会话 cookie** 解析身份 (app.main._resolve_identity); 测试只挂了
+    router、没有账号注册表, 因此用一个测试专用请求头告诉替身"这次是谁"。这是测试
+    夹具, 不是生产代码 —— 生产端点的归属判定永远只读 request.state (见
+    app/api/pipeline.py 的 _identity), 绝不接受客户端提交的账户参数。
+    """
+    from app.services import preferences
+
+    @app.middleware("http")
+    async def _identity(request, call_next):
+        raw = request.headers.get("x-test-account")
+        request.state.account_id = int(raw) if raw else None
+        request.state.role = request.headers.get("x-test-role", "user")
+        # 端点在别处还会解析账户私有目录; 一并补上, 免得测试卡在无关的 fail-closed
+        token = preferences.set_current_user_root(None)
+        try:
+            return await call_next(request)
+        finally:
+            preferences.reset_current_user_root(token)
+
+
+class _AsAccount:
+    """以某个账户 (或管理员) 的身份发请求 —— 只改请求头, 无需多开 app。"""
+
+    def __init__(self, client, account_id: int | None, *, role: str = "user") -> None:
+        self._client = client
+        self._headers = {"x-test-role": role}
+        if account_id is not None:
+            self._headers["x-test-account"] = str(account_id)
+
+    def post(self, url: str, **kwargs):
+        return self._client.post(url, headers=self._headers, **kwargs)
+
+    def get(self, url: str, **kwargs):
+        return self._client.get(url, headers=self._headers, **kwargs)
+
+
 def test_manual_cancel_endpoint_contract(monkeypatch, tmp_path):
-    """POST /api/pipeline/jobs/{id}/cancel: running/pending 可停, 终态 400, 未知 404。"""
+    """POST /api/pipeline/jobs/{id}/cancel: 发起者可停, 终态 400, 未知 404。"""
     from fastapi import FastAPI
-    from fastapi.testclient import TestClient
 
     from app.api.pipeline import router
 
@@ -182,13 +226,14 @@ def test_manual_cancel_endpoint_contract(monkeypatch, tmp_path):
 
     app = FastAPI()
     app.include_router(router)
-    client = TestClient(app)
+    _install_test_identity(app)
+    client = _AsAccount(TestClient(app), 7)
 
     # 未知 job → 404
     assert client.post("/api/pipeline/jobs/nope/cancel").status_code == 404
 
     # running → 协作式终止: 标 failed + 置取消标志 + 释放执行槽
-    jid = _make_running_job(store, timeout_s=60)
+    jid = _make_running_job(store, timeout_s=60, owner_account_id=7)
     pipeline_jobs.try_acquire_run_slot(jid)
     resp = client.post(f"/api/pipeline/jobs/{jid}/cancel")
     assert resp.status_code == 200
@@ -203,6 +248,52 @@ def test_manual_cancel_endpoint_contract(monkeypatch, tmp_path):
     assert client.post(f"/api/pipeline/jobs/{jid}/cancel").status_code == 400
 
     # 停止后可再建新任务 (再次拉取走完整管道的单飞基础)
-    jid2, is_new = store.create(timeout_s=60)
+    jid2, is_new = store.create(owner_account_id=7, timeout_s=60)
     assert is_new is True
     assert store.active_id() == jid2
+
+
+def test_cancel_refuses_an_account_that_does_not_own_the_job(monkeypatch, tmp_path):
+    """**归属校验**: 别人的任务不能取消, 无主任务只有管理员能取消。
+
+    数据管道是部署级资源 (一份共享行情 + 一个执行槽), 因此任何已登录账户都能触发
+    全站同步, 单飞复用返回已有任务也是刻意的; 但"停掉全站同步"的效果超出单个账户
+    —— 该端点的权限判据与 /api/data/clear 同类。缺这道校验时, 任何账户都能 set 掉
+    别人 (或调度器) 正在跑的同步任务。
+    """
+    from fastapi import FastAPI
+
+    from app.api.pipeline import router
+
+    monkeypatch.setattr(preferences, "load", lambda: {})
+    store = JobStore(store_dir=tmp_path / "jobs")
+    monkeypatch.setattr("app.api.pipeline.job_store", store)
+
+    app = FastAPI()
+    app.include_router(router)
+    _install_test_identity(app)
+    client = TestClient(app)
+    owner = _AsAccount(client, 7)
+    stranger = _AsAccount(client, 8)
+    admin = _AsAccount(client, 1, role="admin")
+
+    jid = _make_running_job(store, timeout_s=60, owner_account_id=7)
+
+    # B (8 号账户) 不能停 7 号的任务, 且任务必须原封不动
+    resp = stranger.post(f"/api/pipeline/jobs/{jid}/cancel")
+    assert resp.status_code == 403
+    assert store.get(jid)["status"] == "running"
+    assert not pipeline_jobs.is_cancelled(jid)
+
+    # 管理员可以
+    assert admin.post(f"/api/pipeline/jobs/{jid}/cancel").status_code == 200
+    assert store.get(jid)["status"] == "failed"
+
+    # 无主任务 (调度器/系统发起, 代表全站): 普通账户不能停, 管理员可以
+    scheduled = _make_running_job(store, timeout_s=60)
+    assert store.get(scheduled)["owner_account_id"] is None
+    assert stranger.post(f"/api/pipeline/jobs/{scheduled}/cancel").status_code == 403
+    assert owner.post(f"/api/pipeline/jobs/{scheduled}/cancel").status_code == 403
+    assert store.get(scheduled)["status"] == "running"
+    assert admin.post(f"/api/pipeline/jobs/{scheduled}/cancel").status_code == 200
+    assert store.get(scheduled)["status"] == "failed"

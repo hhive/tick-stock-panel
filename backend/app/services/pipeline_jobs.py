@@ -19,7 +19,7 @@ import logging
 import os
 import threading
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, TypeVar
@@ -202,6 +202,7 @@ class JobStore:
         self,
         timeout_s: int | None = None,
         *,
+        owner_account_id: int | None,
         long_running: bool = False,
     ) -> tuple[str, bool]:
         """单飞创建任务。返回 (job_id, is_new)。
@@ -212,6 +213,14 @@ class JobStore:
         _active_id,导致两条全市场拉取同时读改写同一 parquet。纳入 pending 后该窗口关闭。
 
         is_new=False 表示复用了已有活跃任务,调用方**不得**再调度新的后台任务。
+        **注意**: 复用时返回的是**已有任务**的 id,而它的归属可能是别的账户或调度器
+        —— 数据管道是部署级资源 (一份共享行情、一个执行槽), 复用是刻意设计, 但
+        调用方因此不得把复用到的任务当成"自己发起的"。
+
+        owner_account_id: 发起该任务的账户 (None = 系统/调度器)。**必填无默认**:
+        漏传会被静默记成"无主", 而无主任务只有管理员能取消 —— 那会让"谁有权停掉
+        全站同步"取决于漏传而非设计。HTTP 端点传 request.state.account_id,
+        调度器显式传 None。
 
         timeout_s: reap_stale 判定「进度停滞卡死」的阈值。None 时读取用户配置。
         long_running: timeout_s 为 None 时,是否读取长任务配置;普通任务默认
@@ -234,6 +243,9 @@ class JobStore:
             job = {
                 "id": job_id,
                 "status": "pending",
+                # 归属: 谁发起谁可取消 (管理员不受限)。只看服务端记录,
+                # 绝不接受客户端提交的账户参数。
+                "owner_account_id": owner_account_id,
                 "stage": "init",
                 "progress": 0,
                 "stage_pct": 0,
@@ -463,7 +475,39 @@ def _summary(j: dict[str, Any]) -> dict[str, Any]:
         "duration_s": j["duration_s"],
         "result": j["result"],
         "error": j["error"],
+        # 归属随摘要一起出内部投影: API 层据此算 cancel_allowed, 并把原值换成
+        # 客户端可用的布尔量 —— 账户 id 不外发 (面板不向他人暴露账号主键)。
+        "owner_account_id": j.get("owner_account_id"),
     }
+
+
+def may_cancel(
+    job: Mapping[str, Any],
+    *,
+    account_id: int | None,
+    is_admin: bool,
+) -> bool:
+    """判定某账户是否有权取消该任务。
+
+    数据管道是**部署级**资源 —— 一份共享行情、一个执行槽, 所以任何已登录账户都
+    可以触发全站同步, 单飞复用返回已有任务也是刻意的 (见 JobStore.create)。但
+    "停掉全站数据同步"的效果**超出单个账户**, 与 /api/data/clear 同一判据, 因此
+    取消必须按归属授权:
+
+      - 发起者本人;
+      - 管理员 (含单密码应急入口: 它等价 admin 但没有 account_id);
+      - ``owner_account_id is None`` 的任务 (调度器/系统发起, 代表全站) 只能由
+        管理员取消。
+
+    归属只从**服务端记录**读, 不接受任何客户端提交的账户参数。缺失归属字段
+    (本字段上线前落盘的老任务记录) 按"无主"处理 → 仅管理员, fail-closed。
+    """
+    if is_admin:
+        return True
+    owner = job.get("owner_account_id")
+    if isinstance(owner, bool) or not isinstance(owner, int):
+        return False
+    return account_id is not None and owner == account_id
 
 
 def _duration_s(j: dict[str, Any]) -> float | None:

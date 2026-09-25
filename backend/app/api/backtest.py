@@ -14,6 +14,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from app.api.deps import require_account_id
 from app.config import settings
 from app.services.backtest import (
     BacktestConfig,
@@ -434,10 +435,16 @@ import hashlib
 
 
 class _BacktestJob:
-    """单个回测任务的状态, 存模块级供重连使用。"""
-    __slots__ = ("key", "cancel_event", "progress", "result", "error", "done", "finish_ts")
+    """单个回测任务的状态, 存模块级供重连使用。
 
-    def __init__(self, key: str):
+    ``account_id`` 是**任务归属**, 与 ``key`` 一起构成任务表的键 —— 见 _running_jobs。
+    """
+    __slots__ = (
+        "account_id", "key", "cancel_event", "progress", "result", "error", "done", "finish_ts",
+    )
+
+    def __init__(self, account_id: int, key: str):
+        self.account_id = account_id
         self.key = key
         self.cancel_event = threading.Event()
         self.progress: list[dict] = []   # 进度历史 (新连接可回放)
@@ -446,9 +453,22 @@ class _BacktestJob:
         self.done = False
         self.finish_ts: float = 0.0
 
+    @property
+    def registry_key(self) -> tuple[int, str]:
+        """任务表里的键 (账户, job_key)。**所有**查表/删除都必须用它。"""
+        return (self.account_id, self.key)
 
-# 模块级任务表: key -> _BacktestJob
-_running_jobs: dict[str, _BacktestJob] = {}
+
+# 模块级任务表: (account_id, job_key) -> _BacktestJob
+#
+# **账户维度必须在键里**, 不能只用 job_key。job_key 是回测入参的 md5 前缀, 由客户端
+# 原样回传; 它既不含账户信息, 也并非不可猜(入参已知时直接算得出)。共用一把键的后果是:
+#   - 账户 B 用与 A 相同的入参请求 → 命中 A 的任务 → B 订阅 A 的进度与净值/成交结果,
+#     而**自己那份根本没跑**;
+#   - 取消接口按客户端给的 job_key 查表 → 任何账户都能 set 别人的 cancel_event。
+# 把账户并进键后, "查到"与"属于我"在结构上是同一件事: 客户端提供的 job_key 只能在
+# **调用者自己的命名空间**里定位, 因此它永远不能当授权凭据用。
+_running_jobs: dict[tuple[int, str], _BacktestJob] = {}
 _jobs_lock = threading.Lock()
 _JOB_TTL = 300  # 完成后保留 5 分钟
 
@@ -462,6 +482,40 @@ def _cleanup_stale_jobs():
             _running_jobs.pop(k, None)
 
 
+def _get_or_create_job(account_id: int, job_key: str) -> tuple[_BacktestJob, bool]:
+    """取或创建**本账户**的 (account_id, job_key) 任务, 返回 (任务, 是否新建)。
+
+    account_id 必须来自请求身份 (require_account_id), 不得来自任何客户端入参。
+    """
+    with _jobs_lock:
+        job = _running_jobs.get((account_id, job_key))
+        if job is None:
+            job = _BacktestJob(account_id, job_key)
+            _running_jobs[(account_id, job_key)] = job
+            return job, True
+        return job, False
+
+
+def _owned_job(account_id: int, job_key: str) -> _BacktestJob | None:
+    """取**本账户**的任务; 不存在或不属于本账户都返回 None。
+
+    这是取消侧唯一的授权点。job_key 由客户端提供 —— 它是已知入参的 md5, 可被重放/
+    猜测, 因此**不能**当授权凭据; 真正的凭据是 account_id (认证中间件注入的会话,
+    客户端改不了)。键里已经带账户维度, 于是"查到"与"属于我"是同一件事; 下面的显式比对是
+    纵深防御: 若将来有人把键改回不带账户维度的形态, 这里会立刻拒掉并记 error,
+    而不是静默放行(原缺陷正是这样悄悄出现的)。
+    """
+    with _jobs_lock:
+        job = _running_jobs.get((account_id, job_key))
+    if job is not None and job.account_id != account_id:
+        logger.error(
+            "任务表键与任务归属不一致 (account_id=%s, job_key=%r): 疑似账户维度被从键中移除, 拒绝操作",
+            account_id, job_key,
+        )
+        return None
+    return job
+
+
 def _finish_job(job: _BacktestJob, *, result=None, error: str | None = None) -> None:
     """Publish the terminal state and proactively drop the reconnect entry after TTL."""
     finished_at = time.time()
@@ -473,9 +527,9 @@ def _finish_job(job: _BacktestJob, *, result=None, error: str | None = None) -> 
 
     def _expire() -> None:
         with _jobs_lock:
-            current = _running_jobs.get(job.key)
+            current = _running_jobs.get(job.registry_key)
             if current is job and current.done and current.finish_ts == finished_at:
-                _running_jobs.pop(job.key, None)
+                _running_jobs.pop(job.registry_key, None)
 
     timer = threading.Timer(_JOB_TTL, _expire)
     timer.daemon = True
@@ -526,7 +580,8 @@ async def strategy_stream(
 ):
     """SSE 流式策略回测: 实时推送进度, 完成后推送结果, 支持重连 (刷新/切页后恢复)。
 
-    - 相同参数的任务只启动一次, 多次连接订阅同一个任务
+    - 相同参数的任务只启动一次, 多次连接订阅同一个任务 (**同一账户内**;
+      任务表以 (账户, job_key) 为键, 别的账户跑同样的入参不会命中本账户的任务)
     - 断开连接不会取消任务 (除非显式调用 cancel)
     - 结果保留 5 分钟供重连
 
@@ -537,6 +592,9 @@ async def strategy_stream(
     """
     from app.backtest.strategy import StrategyBacktestConfig
     from app.backtest.worker import make_worker_task, run_worker_task
+
+    # 任务按账户分家: 账户身份是任务归属的唯一来源, 且必须在任何建表/查表之前取得。
+    account_id = require_account_id(request)
 
     try:
         end_date = date.fromisoformat(end) if end else date.today()
@@ -570,15 +628,8 @@ async def strategy_stream(
 
     _cleanup_stale_jobs()
 
-    # 获取或创建任务
-    with _jobs_lock:
-        job = _running_jobs.get(job_key)
-        if job is None:
-            job = _BacktestJob(job_key)
-            _running_jobs[job_key] = job
-            is_new = True
-        else:
-            is_new = False
+    # 获取或创建任务 (限本账户命名空间)
+    job, is_new = _get_or_create_job(account_id, job_key)
 
     async def event_generator():
         # 范围保护: 直接报错
@@ -699,7 +750,12 @@ async def strategy_stream(
 
 @router.post("/strategy/cancel")
 async def strategy_cancel(request: Request):
-    """取消正在运行的回测任务 (前端传 query string, 后端算 job_key)。"""
+    """取消正在运行的回测任务 (前端传 query string, 后端算 job_key)。
+
+    只能取消**本账户**的任务: 查表键含账户维度, 命中别人的任务在结构上不可能
+    (详见 _owned_job)。
+    """
+    account_id = require_account_id(request)
     body = await request.json()
     qs = body.get("qs", "")
     # 解析 qs 得到参数
@@ -733,9 +789,7 @@ async def strategy_cancel(request: Request):
         stamp_tax_pct=_get_opt_float("stamp_tax_pct"),
         asset_type=_get("asset_type", "stock"),
     )
-    # 持锁读任务表: 与 _cleanup_stale_jobs 的 pop、stream 的写入互斥
-    with _jobs_lock:
-        job = _running_jobs.get(job_key)
+    job = _owned_job(account_id, job_key)
     if job and not job.done:
         job.cancel_event.set()
         return {"ok": True}
@@ -843,6 +897,9 @@ async def optimize_stream(
     from app.backtest.optimizer import OptimizeConfig
     from app.backtest.worker import make_worker_task, run_worker_task
 
+    # 任务按账户分家 (同 strategy_stream)。
+    account_id = require_account_id(request)
+
     try:
         end_date = date.fromisoformat(end) if end else date.today()
         start_date = date.fromisoformat(start) if start else None
@@ -878,14 +935,7 @@ async def optimize_stream(
     )
 
     _cleanup_stale_jobs()
-    with _jobs_lock:
-        job = _running_jobs.get(job_key)
-        if job is None:
-            job = _BacktestJob(job_key)
-            _running_jobs[job_key] = job
-            is_new = True
-        else:
-            is_new = False
+    job, is_new = _get_or_create_job(account_id, job_key)
 
     async def event_generator():
         # 首个事件回吐 job_key, 前端存下供 cancel 直接引用 (消除两侧重算契约)。
@@ -994,10 +1044,14 @@ async def optimize_cancel(request: Request):
     不再让 cancel 侧重算 job_key: 两侧重算必须逐字段一致的脆弱契约(PR3 C1 / direction
     空串失配都源于此)在此彻底消除。stream 首个 SSE 事件把后端算出的 key 回吐给前端,
     cancel 原样传回即可。
+
+    **回吐的 job_key 不是授权凭据**: 它只是本账户命名空间内的定位串, 归属由会话身份
+    决定 —— 因此拿着别人的 key 也取消不到 (详见 _owned_job)。
     """
+    account_id = require_account_id(request)
     body = await request.json()
     job_key = body.get("job_key", "")
-    job = _running_jobs.get(job_key)
+    job = _owned_job(account_id, job_key)
     if job and not job.done:
         job.cancel_event.set()
         return {"ok": True}
@@ -1065,6 +1119,9 @@ async def walkforward_stream(
     from app.backtest.walkforward import WalkForwardConfig
     from app.backtest.worker import make_worker_task, run_worker_task
 
+    # 任务按账户分家 (同 strategy_stream)。
+    account_id = require_account_id(request)
+
     direction = direction or None
 
     try:
@@ -1105,14 +1162,7 @@ async def walkforward_stream(
     )
 
     _cleanup_stale_jobs()
-    with _jobs_lock:
-        job = _running_jobs.get(job_key)
-        if job is None:
-            job = _BacktestJob(job_key)
-            _running_jobs[job_key] = job
-            is_new = True
-        else:
-            is_new = False
+    job, is_new = _get_or_create_job(account_id, job_key)
 
     async def event_generator():
         yield f"event: job\ndata: {json.dumps({'key': job_key}, ensure_ascii=False)}\n\n"
@@ -1216,10 +1266,14 @@ async def walkforward_stream(
 
 @router.post("/walkforward/cancel")
 async def walkforward_cancel(request: Request):
-    """取消 walk-forward 任务 — 传 stream 首事件回吐的 job_key。"""
+    """取消 walk-forward 任务 — 传 stream 首事件回吐的 job_key。
+
+    只能取消**本账户**的任务; 回吐的 key 是定位串而非授权凭据 (详见 _owned_job)。
+    """
+    account_id = require_account_id(request)
     body = await request.json()
     job_key = body.get("job_key", "")
-    job = _running_jobs.get(job_key)
+    job = _owned_job(account_id, job_key)
     if job and not job.done:
         job.cancel_event.set()
         return {"ok": True}

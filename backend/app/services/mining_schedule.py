@@ -19,7 +19,7 @@ from app.backtest.mining import (
     required_trading_bars,
     validation_config_for_profile,
 )
-from app.services import preferences
+from app.services import preferences, user_paths
 from app.services.mining_preflight import enriched_partition_dates
 from app.services.regime_builder import load_regime_history, regime_path
 
@@ -72,10 +72,17 @@ def build_data_fingerprint(
     repo: Any,
     app_state: Any,
     request: dict[str, Any],
+    *,
+    user_root: Path | None = None,
 ) -> dict[str, Any]:
-    """Hash one stable managed generation plus source metadata."""
+    """Hash one stable managed generation plus source metadata.
+
+    user_root: 账户根 —— 策略覆写值 (user_data/strategy_overrides) 是账户私有数据,
+    指纹必须按账户解析。不传时由上下文解析 (HTTP 路径); 后台/调度器必须显式传
+    (周度调度的 strategy_ids 恒空, 走不到这一步, 但仍显式传以免将来漏掉)。
+    """
     for _attempt in range(2):
-        fingerprint = _build_data_fingerprint_once(repo, app_state, request)
+        fingerprint = _build_data_fingerprint_once(repo, app_state, request, user_root)
         if repo.get_matrix_data_generation(fingerprint["asset_type"]) == fingerprint["generation"]:
             return fingerprint
     raise ValueError("enriched data changed while building the mining fingerprint")
@@ -85,6 +92,7 @@ def _build_data_fingerprint_once(
     repo: Any,
     app_state: Any,
     request: dict[str, Any],
+    user_root: Path | None,
 ) -> dict[str, Any]:
     data_dir = Path(repo.store.data_dir)
     asset_type = str(request.get("asset_type") or "stock")
@@ -108,7 +116,7 @@ def _build_data_fingerprint_once(
         "strategies": _selected_strategy_metadata(
             app_state,
             request.get("strategy_ids") or [],
-            data_dir,
+            user_root,
         ),
     }
     payload = _canonical_json(components)
@@ -118,43 +126,101 @@ def _build_data_fingerprint_once(
     }
 
 
-def schedule_claim(day: date) -> str:
+def schedule_claim(day: date, account_id: int) -> str:
+    """本周该账户的固定 claim (同时用作 run_id)。
+
+    必须带账户: 周度调度开关是**部署级**的 (mining_schedule_enabled 不在
+    preferences.PER_USER_KEYS 里), 一个开关触发的是**每个账户各一次**挖掘, 而
+    挖掘运行本身是账户私有数据。此前的 key 只由日历推导 (``weekly-2026-W39``),
+    于是第一个跑到的账户占掉整周的 claim, 其余账户全部拿到 already_claimed ——
+    它们永远跑不了自己的周度挖掘。key 可猜还让 ``GET /runs/<claim>`` 能读到
+    别人的运行。
+    """
     iso_year, week = iso_week(day)
-    return f"weekly-{iso_year}-W{week:02d}"
+    return f"weekly-{account_id}-{iso_year}-W{week:02d}"
 
 
 def run_weekly_mining(app_state: Any, *, now: datetime | None = None) -> dict[str, Any]:
-    """Check the weekly gate and enqueue mining; never perform mining synchronously."""
+    """检查周度门控并**逐账户**入队挖掘; 永不同步执行挖掘。
+
+    扇出方向: 调度配置 (enabled/weekday/profile) 是部署级的, 运行产物是每账户的,
+    所以「部署级开关」× 「每账户运行」= 遍历全部账户, 每个账户各自 claim 一次。
+
+    返回:
+      ``{"status": <汇总>, "accounts": [{"account_id", "status", "run_id"?, "error"?}]}``
+    汇总状态只服务于日志可读性; **判定一律看 accounts 明细**, 因为各账户的
+    claim/prerequisite 结果可以不同。
+
+    单个账户失败只记日志并把错误写进它自己的条目, 不中断整轮扇出 (与
+    ``iter_user_roots`` 跳过非法账号同一姿态)。
+    """
     config = preferences.get_mining_schedule()
     day = beijing_date(now)
     if not config["mining_schedule_enabled"]:
-        return {"status": "disabled"}
+        return {"status": "disabled", "accounts": []}
     weekday = day.weekday()
     if weekday > 4 or weekday < config["mining_schedule_weekday"]:
-        return {"status": "weekday_mismatch"}
+        return {"status": "weekday_mismatch", "accounts": []}
 
     manager = getattr(app_state, "mining_manager", None)
     repo = getattr(app_state, "repo", None)
     if manager is None or repo is None:
         raise RuntimeError("scheduled mining dependencies are not initialized")
-    store = getattr(manager, "store", None)
-    if store is None:
-        raise RuntimeError("scheduled mining manager has no run store")
 
     request = build_default_request(repo, config["mining_budget_profile"])
+    # 指纹只算一次: 它读的全是**共享**行情数据, 且 build_default_request 的
+    # strategy_ids 恒为空 (不走账户私有覆写)。逐账户重算会重复哈希整棵 enriched
+    # 分区树与全部实现文件, 是纯粹的浪费。
     fingerprint = build_data_fingerprint(repo, app_state, request)
-    claim = schedule_claim(day)
-    fingerprint = {**fingerprint, "source": "scheduled", "source_claim": claim}
+    prerequisite_error = _prerequisite_error(repo, request)
+
+    results: list[dict[str, Any]] = []
+    for account_id, user_root in user_paths.iter_user_roots():
+        try:
+            results.append(
+                _enqueue_weekly_for_account(
+                    manager,
+                    request,
+                    fingerprint,
+                    prerequisite_error,
+                    day,
+                    account_id,
+                    user_root,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("scheduled mining enqueue failed for account %s", account_id)
+            results.append(
+                {"account_id": account_id, "status": "error", "error": str(exc)}
+            )
+    return {"status": _fanout_status(results), "accounts": results}
+
+
+def _enqueue_weekly_for_account(
+    manager: Any,
+    request: dict[str, Any],
+    fingerprint: dict[str, Any],
+    prerequisite_error: str | None,
+    day: date,
+    account_id: int,
+    user_root: Path,
+) -> dict[str, Any]:
+    """为一个账户 claim + (必要时)入队。claim 与查询都走该账户自己的 run store。"""
+    store = manager.store_for(user_root)
+    claim = schedule_claim(day, account_id)
+    claimed_fingerprint = {**fingerprint, "source": "scheduled", "source_claim": claim}
 
     with _CLAIM_LOCK:
         existing = store.get(claim)
         if existing is not None:
-            return {"status": "already_claimed", "run_id": claim}
+            return {"account_id": account_id, "status": "already_claimed", "run_id": claim}
 
-        prerequisite_error = _prerequisite_error(repo, request)
         if prerequisite_error is not None:
-            _record_skipped_prerequisite(store, claim, request, fingerprint, prerequisite_error)
+            _record_skipped_prerequisite(
+                store, claim, request, claimed_fingerprint, prerequisite_error
+            )
             return {
+                "account_id": account_id,
                 "status": "skipped_prerequisite",
                 "run_id": claim,
                 "error": prerequisite_error,
@@ -162,13 +228,28 @@ def run_weekly_mining(app_state: Any, *, now: datetime | None = None) -> dict[st
 
         run = manager.start(
             request,
-            fingerprint,
+            claimed_fingerprint,
+            user_root=user_root,
             force=False,
             source="scheduled",
             run_id=claim,
         )
     run_id = run.get("run_id") if isinstance(run, dict) else getattr(run, "run_id", None)
-    return {"status": "enqueued", "run_id": run_id or claim}
+    return {"account_id": account_id, "status": "enqueued", "run_id": run_id or claim}
+
+
+def _fanout_status(results: list[dict[str, Any]]) -> str:
+    """扇出汇总状态 (仅供日志/可读性, 判定看 accounts 明细)。"""
+    if not results:
+        return "no_accounts"
+    statuses = {item["status"] for item in results}
+    if statuses == {"enqueued"}:
+        return "enqueued"
+    if "enqueued" in statuses:
+        return "partial"
+    if len(statuses) == 1:
+        return next(iter(statuses))
+    return "mixed"
 
 
 def _prerequisite_error(repo: Any, request: dict[str, Any]) -> str | None:
@@ -292,32 +373,43 @@ def _enriched_metadata(root: Path) -> dict[str, Any]:
 def _selected_strategy_metadata(
     app_state: Any,
     strategy_ids: list[str],
-    data_dir: Path,
+    user_root: Path | None,
 ) -> list[dict[str, Any]]:
+    """列入选策略的源码/覆写元数据。
+
+    覆写值 (``user_data/strategy_overrides``) 是**账户私有**数据: 此前这里用共享
+    data_dir 拼路径, 两个账户的同名策略会摘到同一个文件, 指纹因此反映**别人**
+    的覆写 (或干脆摘到迁移前的遗留目录)。此处按账户根解析, 无 strategy_ids 时
+    提前返回 —— 周度调度正是这条路径, 它没有 (也不该有) 账户上下文。
+    """
     if not strategy_ids:
         return []
+    root = user_paths.resolve_user_root(user_root)
     engine = getattr(app_state, "strategy_engine", None)
     if engine is None:
         raise RuntimeError("strategy engine is unavailable for scheduled mining fingerprint")
     metadata: list[dict[str, Any]] = []
     for strategy_id in sorted(strategy_ids):
+        # engine.get() 目前是**部署级**视图 (内置 + 各账户自有策略混在一个扁平表
+        # 里); 引擎按账户化落地后, 这里必须一并带上账户, 否则指纹会摘到别人的
+        # 策略源码。见 docs 的多用户化计划「域 2 策略/回测/挖掘」。
         strategy = engine.get(strategy_id)
         if strategy.execution_backend != "matrix_native":
             raise ValueError(f"scheduled mining strategy is not matrix-native: {strategy_id}")
         source_path = Path(strategy.file_path) if strategy.file_path is not None else None
-        override_path = data_dir / "user_data" / "strategy_overrides" / f"{strategy_id}.json"
+        override_path = root / "user_data" / "strategy_overrides" / f"{strategy_id}.json"
         metadata.append(
             {
                 "strategy_id": strategy_id,
                 "source": _content_metadata(
-                    source_path, root=source_path.parent if source_path else data_dir
+                    source_path, root=source_path.parent if source_path else root
                 ),
                 "source_tree": (
                     _implementation_metadata(source_path.parent)
                     if source_path is not None
                     else None
                 ),
-                "override": _content_metadata(override_path, root=data_dir),
+                "override": _content_metadata(override_path, root=root),
             }
         )
     return metadata

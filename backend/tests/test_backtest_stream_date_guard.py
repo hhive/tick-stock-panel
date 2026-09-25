@@ -28,6 +28,17 @@ BAD_DATES = ["not-a-date", "2026-13-01", "2026/09/04", ""]
 def client() -> TestClient:
     app = FastAPI()
     app.include_router(router)
+
+    # 三个 stream 端点现在是每账户的(任务表以账户为键, 见
+    # app/api/backtest.py 的 _running_jobs), 账户身份只能来自认证中间件注入的
+    # request.state.account_id。线上那个中间件在 app/main.py; 本套件用的是只挂了
+    # backtest router 的裸 app, 因此必须自己补上这一层, 否则端点会在授权处 403,
+    # 测不到日期校验。补的是**身份**, 不改任何与本文件断言相关的行为。
+    @app.middleware("http")
+    async def _inject_account(request, call_next):
+        request.state.account_id = 1
+        return await call_next(request)
+
     # raise_server_exceptions=False: 未捕获异常表现为 500 响应, 与线上行为一致
     return TestClient(app, raise_server_exceptions=False)
 

@@ -456,7 +456,13 @@ def run_mining_runtime(
     )
     if not isinstance(expected_generation, str) or not expected_generation:
         raise ValueError("mining worker payload is missing its data generation")
-    store = MiningRunStore(data_dir)
+    # 运行产物 (manifest/工件) 是**账户私有**数据: 账户根由父进程随载荷显式传下来
+    # —— 子进程是 spawn 出来的, 没有请求上下文, 用 data_dir (共享行情根) 建 store
+    # 会既写错位置又被 resolve_user_root 拒绝 (fail-closed)。
+    user_root = payload.get("user_root")
+    if not isinstance(user_root, str) or not user_root:
+        raise ValueError("mining worker payload is missing its account root")
+    store = MiningRunStore(Path(user_root))
     phase_peak_rss_bytes: dict[str, int] = {}
 
     def start_phase() -> None:

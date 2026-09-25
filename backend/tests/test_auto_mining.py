@@ -129,14 +129,28 @@ def test_screen_window_capped_and_daily_rebalance(monkeypatch: pytest.MonkeyPatc
 
 
 class _FakeManager:
-    def __init__(self, store: Any) -> None:
-        self.store = store
+    """按账户根分家的假 manager (与真 manager 同一接缝)。"""
+
+    def __init__(self, user_root: Any) -> None:
+        from app.services.mining_jobs import MiningRunStore
+
+        self._stores = {user_root: MiningRunStore(user_root)}
         self.start_calls: list[dict[str, Any]] = []
 
-    def start(self, request, fingerprint, force=False, source="manual", run_id=None):
+    def store_for(self, user_root: Any) -> Any:
+        store = self._stores.get(user_root)
+        if store is None:
+            from app.services.mining_jobs import MiningRunStore
+
+            store = MiningRunStore(user_root)
+            self._stores[user_root] = store
+        return store
+
+    def start(self, request, fingerprint, *, user_root, force=False, source="manual",
+              run_id=None):
         self.start_calls.append({"request": request, "fingerprint": fingerprint,
                                  "force": force, "source": source})
-        return self.store.create(request, fingerprint)
+        return self.store_for(user_root).create(request, fingerprint)
 
 
 @pytest.fixture()
@@ -145,15 +159,30 @@ def client(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
     from fastapi.testclient import TestClient
 
     from app.api import mining as mining_api
+    from app.services import preferences
     from app.services.mining_jobs import MiningRunStore
 
-    store = MiningRunStore(tmp_path / "runs")
-    manager = _FakeManager(store)
+    user_root = tmp_path / "runs"
+    store = MiningRunStore(user_root)
+    manager = _FakeManager(user_root)
 
     app = FastAPI()
     app.include_router(mining_api.router)
     app.state.repo = SimpleNamespace(store=SimpleNamespace(data_dir=tmp_path))
     app.state.mining_manager = manager
+
+    @app.middleware("http")
+    async def _inject_account_context(request, call_next):
+        """认证中间件在真实应用里做的就是这一步: 注入当前账户根 (contextvar)。
+
+        少了它, 端点解析账户私有存储会 fail-closed 报错 —— 那正是它该做的;
+        绕开它测试就等于在验证一个生产上不存在的调用形态。
+        """
+        token = preferences.set_current_user_root(user_root)
+        try:
+            return await call_next(request)
+        finally:
+            preferences.reset_current_user_root(token)
 
     monkeypatch.setattr(mining_api, "require_mining_availability", lambda *a, **k: None)
     monkeypatch.setattr(mining_api, "enriched_partition_dates", lambda *a, **k: ["2026-08-31"])

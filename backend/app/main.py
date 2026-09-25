@@ -124,6 +124,11 @@ async def _application_lifespan(app: FastAPI):
         logger.warning("custom factors load failed: %s", exc)
     from app.services.mining_manager import MiningJobManager
 
+    # 传的是**共享行情目录** —— 它只用于喂 worker 子进程 (K线/因子所有人一份)。
+    # 运行产物 (manifest/事件/工件) 是账户私有数据, 由 manager 按账户根解析
+    # (store_for), 启动补录也因此逐账户扇出: 这里**不**持有任何单一 store,
+    # 否则各账户的 list_runs() 会互相看见 (且用共享根建 store 会被
+    # resolve_user_root 直接拒绝)。
     mining_manager = MiningJobManager(store.data_dir)
     recovered_mining_runs = mining_manager.recover_interrupted()
     app.state.mining_manager = mining_manager
@@ -496,16 +501,16 @@ _PUBLIC_READ_EXPENSIVE = (
 # 管理员专属端点(精确匹配)。判断依据与完整理由见 _is_admin_only 的 docstring。
 _ADMIN_ONLY_EXACT = frozenset({
     "/api/data/clear",
-    "/api/strategy/build",
-    "/api/strategy/build/stream",
-    "/api/strategy/ai/test",
-    "/api/strategy/ai/generate",
-    "/api/strategy/ai/iterate",
-    "/api/strategy/ai/save",
-    "/api/strategy/code/validate",
-    "/api/strategy/code/save",
-    "/api/strategy/composite/save",
-    "/api/strategy/reload",
+    "/api/strategies/build",
+    "/api/strategies/build/stream",
+    "/api/strategies/ai/test",
+    "/api/strategies/ai/generate",
+    "/api/strategies/ai/iterate",
+    "/api/strategies/ai/save",
+    "/api/strategies/code/validate",
+    "/api/strategies/code/save",
+    "/api/strategies/composite/save",
+    "/api/strategies/reload",
     # 自定义信号的定义端点。信号是**部署级**的(产出共享 enriched 表的 csg_* 列),
     # 且用户提交的是表达式 —— 与策略创作面同类, 故创作侧仅管理员可用。
     # 只读端点(/options、列表)不门控; /intraday/replay 是回放分析, 不改定义。
@@ -516,20 +521,53 @@ _ADMIN_ONLY_EXACT = frozenset({
     # 它们不落定义。
     "/api/factors/custom",
     "/api/factors/composite",
+    # 写**部署级**凭据的设置端点。这些键喂的是共享行情, 全站一份 —— 普通用户改了
+    # 就是改了所有人的取数路径:
+    #   - /switch_endpoint 写 tickflow_base_url(站点行情**端点**);
+    #   - /tickflow-key 写 tickflow_api_key(POST 保存 / DELETE 清除);
+    #   - /plugin-key 写 {name}_api_key(数据源插件 Key)。
+    # 原先这几个都没有角色门控: 付费档下普通用户可把全站取数端点改指到别处。
+    "/api/settings/switch_endpoint",
+    "/api/settings/tickflow-key",
+    "/api/settings/plugin-key",
 })
 # 带路径参数的端点。**必须按方法分开**:
-#   - `^/api/strategy/[^/]+$` 若对 POST 也生效, 会连 `POST /api/strategy/run`
+#   - `^/api/strategies/[^/]+$` 若对 POST 也生效, 会连 `POST /api/strategies/run`
 #     一起挡掉 —— 那是普通用户的核心功能(用内置策略跑自己的参数), 不能门控。
-#   - DELETE 下它匹配的才是 `DELETE /api/strategy/{id}`(删除策略本体)。
+#   - DELETE 下它匹配的才是 `DELETE /api/strategies/{id}`(删除策略本体)。
 _ADMIN_ONLY_RE_POST = (
-    re.compile(r"^/api/strategy/[^/]+/publish$"),
+    re.compile(r"^/api/strategies/[^/]+/publish$"),
     # 因子定义的新增/更新/状态/分组: /api/factors/custom/{id}/update 等
     re.compile(r"^/api/factors/custom/"),
+    # 扩展表的**写**端点 (建定义; 往共享 parquet 写数据)。定义/数据/凭据三样都只有
+    # 一份且喂所有人的共享计算, 理由见 _is_admin_only。只读端点(列表/行/维度)不门控。
+    # 注意: 不能用 _ADMIN_ONLY_EXACT —— 那个集合**不区分方法**, 会把 GET /api/ext-data
+    # (列表, 普通用户要读) 一起挡掉。
+    re.compile(r"^/api/ext-data$"),                        # 建定义
+    re.compile(r"^/api/ext-data/presets/[^/]+/fetch$"),    # 拉内置预设 → 写共享 parquet
+    re.compile(r"^/api/ext-data/[^/]+/upload$"),
+    re.compile(r"^/api/ext-data/[^/]+/ingest$"),
+    re.compile(r"^/api/ext-data/[^/]+/backfill$"),
+    re.compile(r"^/api/ext-data/[^/]+/fix-symbol$"),
+    re.compile(r"^/api/ext-data/[^/]+/pull/run$"),
+    # 自定义数据源 yaml: 全站只有一份, 且它就是共享行情的取数入口 —— 改它等于改
+    # 全站取数地址/鉴权 (见 _is_admin_only)。`/test` 是纯试拉(不落盘), 不门控。
+    re.compile(r"^/api/settings/data-sources$"),
+)
+_ADMIN_ONLY_RE_PUT = (
+    # 扩展表的定义/拉取配置/部署级 Key 的更新 (同一份共享资源的写面)。
+    re.compile(r"^/api/ext-data/[^/]+$"),
+    re.compile(r"^/api/ext-data/[^/]+/pull$"),
+    re.compile(r"^/api/ext-data/[^/]+/api-key$"),
 )
 _ADMIN_ONLY_RE_DELETE = (
-    re.compile(r"^/api/strategy/[^/]+$"),
+    re.compile(r"^/api/strategies/[^/]+$"),
     re.compile(r"^/api/custom-signals/[^/]+$"),
     re.compile(r"^/api/factors/custom/[^/]+$"),
+    re.compile(r"^/api/ext-data/[^/]+$"),
+    re.compile(r"^/api/settings/data-sources/[^/]+$"),
+    # DELETE /api/settings/plugin-key/{name} —— 清除数据源插件的**部署级** Key
+    re.compile(r"^/api/settings/plugin-key/[^/]+$"),
 )
 
 # 游客限流额度(按 IP, 滑动窗口 60s)。普通只读 / 重算类分开计量。
@@ -595,19 +633,32 @@ def _is_admin_only(method: str, path: str) -> bool:
 
       - `/api/data/clear`: 删光**共享**行情/enriched/financials 与任务表。用户决策
         要求开放注册, 所以任何登录用户都能一次请求毁掉全站数据面。
-      - `/api/strategy/{build,ai/*,code/*,composite/*,reload}` 与
+      - `/api/strategies/{build,ai/*,code/*,composite/*,reload}` 与
         `POST /{id}/publish`、`DELETE /{id}`: 写策略源码, 而源码会被写盘并在
         **服务进程内** import 执行(`strategy/engine.py` spec_from_file_location →
         exec_module)。唯一防护是静态 AST 名单, 面板作者自己在 docstring 里写明
         "不是真正的沙箱"。因此对不可信用户开放该功能等于放弃隔离 —— 用户决策:
         先把自定义 Python 策略对普通用户隐藏, 沙箱化留作后续 P0。
+      - `/api/ext-data` 的**写**端点 (建/改/删定义、上传/落库/回填/修正、拉取配置与
+        拉取 Key): 扩展表是**部署级**资源 —— 配置在 ``<data_dir>/ext_data/<id>/``、
+        数据是那一份共享 parquet、Key 走 ``secrets_store.save_deployment``, 三样都
+        只有一份, 且喂所有人的共享计算(改它要扇出让**每个**账户的策略缓存失效,
+        见 ``user_paths.iter_user_roots``)。因此不存在"各账户各存各的", 保护它的是
+        **角色**而不是按账户的目录。只读端点(列表/行/维度/概览)不门控 —— 与 factors/
+        custom-signals 的分法一致(读开放, 写专属)。
+      - `POST|DELETE /api/settings/data-sources`: 自定义数据源只有一份 yaml, 且它是
+        **全站共享行情**的取数入口 —— 能改它就能把全站的取数与鉴权重定向到任意 URL。
 
     刻意**不**设为 admin 的: `POST /run`、`/run-all`、`PATCH|DELETE /config/{id}`
     —— 用内置策略跑自己的参数、存自己的覆盖值, 是多用户的核心产品功能。
+    同样不门控的: `POST /api/settings/data-sources/test`(纯试拉, 不落盘, 改不了谁)、
+    `/api/ext-data/detect-*`(只探测不落盘)。
     """
     if path in _ADMIN_ONLY_EXACT:
         return True
     if method == "POST" and any(r.match(path) for r in _ADMIN_ONLY_RE_POST):
+        return True
+    if method == "PUT" and any(r.match(path) for r in _ADMIN_ONLY_RE_PUT):
         return True
     if method == "DELETE" and any(r.match(path) for r in _ADMIN_ONLY_RE_DELETE):
         return True

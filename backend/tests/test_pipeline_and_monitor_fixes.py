@@ -21,18 +21,18 @@ def test_create_singleflight_dedupes_pending_window(monkeypatch, tmp_path):
     monkeypatch.setattr(preferences, "load", lambda: {"data_source_job_timeout_s": 3600})
     store = JobStore(store_dir=tmp_path / "jobs")
 
-    jid1, new1 = store.create()
+    jid1, new1 = store.create(owner_account_id=None)
     assert new1 is True
     assert store.get(jid1)["timeout_s"] == 3600
 
     # 尚未 start(), job 仍是 pending —— 旧实现会在此另起新 job(并发双跑根因)
-    jid2, new2 = store.create()
+    jid2, new2 = store.create(owner_account_id=None)
     assert jid2 == jid1
     assert new2 is False
 
     # start() 后仍复用同一活跃 job
     store.start(jid1)
-    jid3, new3 = store.create()
+    jid3, new3 = store.create(owner_account_id=None)
     assert jid3 == jid1
     assert new3 is False
 
@@ -41,18 +41,24 @@ def test_create_new_after_terminal(monkeypatch, tmp_path):
     """job 终态(succeed/fail)后, create() 应给出新 job。"""
     monkeypatch.setattr(preferences, "load", lambda: {"data_source_long_job_timeout_s": 5400})
     store = JobStore(store_dir=tmp_path / "jobs")
-    jid1, _ = store.create(long_running=True)
+    jid1, _ = store.create(owner_account_id=None, long_running=True)
     assert store.get(jid1)["timeout_s"] == 5400
     store.start(jid1)
     store.succeed(jid1, {"ok": True})
 
-    jid2, new2 = store.create()
+    jid2, new2 = store.create(owner_account_id=None)
     assert jid2 != jid1
     assert new2 is True
 
 
 def test_run_slot_is_exclusive():
-    """重任务执行槽同一时刻只允许一个持有者(防僵尸并发)。"""
+    """重任务执行槽同一时刻只允许一个持有者(防僵尸并发)。
+
+    该槽保护的是**共享** parquet 的写者: 全部调用方 (盘后管道 / 小时K全市场同步 /
+    扩展历史 / 数据修正 / 重建 enriched) 都写 settings.data_dir 下同一份行情。所以
+    它是"按资源"加锁, 全局唯一是**设计**, 不是缺陷 —— 两个账户各跑一条全市场拉取
+    会同时读改写同一 parquet。
+    """
     assert pipeline_jobs.try_acquire_run_slot() is True
     try:
         # 已被占用, 第二次获取失败
@@ -64,6 +70,59 @@ def test_run_slot_is_exclusive():
     pipeline_jobs.release_run_slot()
     # 重复释放幂等, 不抛
     pipeline_jobs.release_run_slot()
+
+
+def test_job_registry_is_readable_without_any_account_context(monkeypatch, tmp_path):
+    """任务表是**部署级**资源, 不是每账户私有 —— 这条断言是它的守卫。
+
+    数据管道同步的是共享行情 (一份 parquet、一个执行槽), 单飞复用返回别的账户发起
+    的那条任务是刻意的 (见 JobStore.create 的 docstring): 各账户看到的是同一次全站
+    同步的进度。更要紧的是公开只读端点 GET /api/data/status 会经 _last_finished()
+    读这张表, 而它**没有任何账户上下文** (游客也读它)。把 job_store 改成按账户
+    分家, 这条调用会 fail-closed (MissingUserContextError), 或者被逼出一个项目
+    明令禁止的"回退到共享目录"垫片。
+
+    跨账户要防的不是"看得见", 而是"谁有权停掉全站同步" —— 见 may_cancel 与
+    tests/test_job_stall_and_cancel.py 的归属用例。
+    """
+    from app.api import data as data_api
+
+    store = JobStore(store_dir=tmp_path / "jobs")
+    jid, _ = store.create(owner_account_id=7)
+    store.start(jid)
+    store.succeed(jid, {"daily_days": 3})
+    monkeypatch.setattr(pipeline_jobs, "job_store", store)
+    monkeypatch.setattr(data_api, "_last_finished_cache", None)
+
+    # 显式置为"无账户上下文": 这正是游客/公开只读端点读它时的状态
+    token = preferences.set_current_user_root(None)
+    try:
+        assert data_api._last_finished("pipeline") == store.get(jid)["finished_at"]
+    finally:
+        preferences.reset_current_user_root(token)
+
+
+def test_may_cancel_is_owner_or_admin_only():
+    """归属判据本身: 发起者本人 / 管理员可取消, 其余一律拒绝 (fail-closed)。
+
+    缺失 owner 字段 (本字段上线前落盘的老记录) 按无主处理 → 仅管理员。
+    """
+    owned = {"id": "j1", "owner_account_id": 7}
+    scheduled = {"id": "j2", "owner_account_id": None}
+
+    assert pipeline_jobs.may_cancel(owned, account_id=7, is_admin=False) is True
+    assert pipeline_jobs.may_cancel(owned, account_id=8, is_admin=False) is False
+    assert pipeline_jobs.may_cancel(owned, account_id=None, is_admin=False) is False
+    assert pipeline_jobs.may_cancel(owned, account_id=8, is_admin=True) is True
+
+    assert pipeline_jobs.may_cancel(scheduled, account_id=7, is_admin=False) is False
+    assert pipeline_jobs.may_cancel(scheduled, account_id=None, is_admin=True) is True
+
+    # 老记录 (无该字段) 与非法值 (bool 是 int 子类, 必须挡掉) → 仅管理员
+    assert pipeline_jobs.may_cancel({"id": "j3"}, account_id=7, is_admin=False) is False
+    assert pipeline_jobs.may_cancel(
+        {"id": "j4", "owner_account_id": True}, account_id=1, is_admin=False
+    ) is False
 
 
 # ── 监控 sector fail-closed ──────────────────────────────────────────────

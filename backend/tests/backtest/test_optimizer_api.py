@@ -32,20 +32,26 @@ def test_cancel_looks_up_job_by_echoed_key():
     """重构后: cancel 直接用 stream 回吐的 job_key 查表, 不再重算参数。
 
     这消除了'两侧重算必须逐字段一致'的脆弱契约 (PR3 C1 / direction 空串失配的根因)。
+
+    任务表以 (账户, job_key) 为键, 账户身份读 request.state.account_id (线上由认证
+    中间件注入)。因此**别的账户**拿着同一把回吐的 key 也取消不到 —— 见下面 account 2
+    的那两行 (回吐的 key 是定位串, 不是授权凭据)。
     """
     import asyncio
+    from types import SimpleNamespace
 
     from app.api.backtest import _BacktestJob, _running_jobs, optimize_cancel
 
     class _Req:
-        def __init__(self, body):
+        def __init__(self, body, account_id=1):
             self._body = body
+            self.state = SimpleNamespace(account_id=account_id)
         async def json(self):
             return self._body
 
     key = "optkey_test_1"
-    job = _BacktestJob(key)
-    _running_jobs[key] = job
+    job = _BacktestJob(1, key)
+    _running_jobs[(1, key)] = job
     try:
         # 用回吐的 key 取消 → 命中并 set cancel_event
         res = asyncio.run(optimize_cancel(_Req({"job_key": key})))
@@ -60,8 +66,15 @@ def test_cancel_looks_up_job_by_echoed_key():
         # 未知 key → ok False, 不抛异常
         res3 = asyncio.run(optimize_cancel(_Req({"job_key": "nonexistent"})))
         assert res3["ok"] is False
+
+        # 跨账户: 另一账户拿同一把 key → 拒, 且**不**碰别人的 cancel_event
+        job.done = False
+        job.cancel_event.clear()
+        res4 = asyncio.run(optimize_cancel(_Req({"job_key": key}, account_id=2)))
+        assert res4["ok"] is False
+        assert not job.cancel_event.is_set()
     finally:
-        _running_jobs.pop(key, None)
+        _running_jobs.pop((1, key), None)
 
 
 def test_finished_job_is_proactively_removed_after_ttl(monkeypatch):
@@ -78,11 +91,11 @@ def test_finished_job_is_proactively_removed_after_ttl(monkeypatch):
             self.callback()
 
     monkeypatch.setattr(api.threading, "Timer", _ImmediateTimer)
-    job = api._BacktestJob("finished-job")
-    api._running_jobs[job.key] = job
+    job = api._BacktestJob(1, "finished-job")
+    api._running_jobs[job.registry_key] = job
 
     api._finish_job(job, result={"ok": True})
 
     assert job.done is True
     assert job.result == {"ok": True}
-    assert job.key not in api._running_jobs
+    assert job.registry_key not in api._running_jobs

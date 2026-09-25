@@ -183,7 +183,7 @@ def list_runs(
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     status: Annotated[list[str] | None, Query()] = None,
 ) -> dict[str, Any]:
-    manager = _manager(request)
+    store = _store(request)
     statuses = None
     if status:
         unknown = sorted(set(status) - RUN_STATUSES)
@@ -191,8 +191,9 @@ def list_runs(
             raise HTTPException(status_code=400, detail=f"unsupported mining statuses: {unknown}")
         statuses = status
     try:
-        manifests = manager.store.list_runs(limit=limit, statuses=statuses)
-        return {"items": [_project_run(manager.store, item) for item in manifests]}
+        manifests = store.list_runs(limit=limit, statuses=statuses)
+        # list_runs 只扫**本账户**的 runs 根, 因此这里不可能列出别人的运行。
+        return {"items": [_project_run(store, item) for item in manifests]}
     except MiningRunValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except MiningRunStoreError as exc:
@@ -202,6 +203,8 @@ def list_runs(
 @router.post("/runs")
 def start_run(payload: MiningStartRequest, request: Request) -> dict[str, Any]:
     manager = _manager(request)
+    user_root = _user_root(request)
+    store = manager.store_for(user_root)
     worker_request = payload.model_dump(mode="json", exclude={"force"})
     try:
         _validate_selected_strategies(
@@ -220,6 +223,7 @@ def start_run(payload: MiningStartRequest, request: Request) -> dict[str, Any]:
             request.app.state.repo,
             request.app.state,
             worker_request,
+            user_root=user_root,
         )
         existing = None
         if not payload.force:
@@ -230,17 +234,18 @@ def start_run(payload: MiningStartRequest, request: Request) -> dict[str, Any]:
             )
 
             signature = compute_run_signature(worker_request, fingerprint)
-            existing = manager.store.find_by_signature(
+            existing = store.find_by_signature(
                 signature,
                 statuses=ACTIVE_RUN_STATUSES | SUCCESS_RUN_STATUSES,
             )
         manifest = manager.start(
             worker_request,
             fingerprint,
+            user_root=user_root,
             force=payload.force,
             source="manual",
         )
-        projected = _project_run(manager.store, manifest)
+        projected = _project_run(store, manifest)
         projected["reused"] = existing is not None
         return projected
     except (MiningRunValidationError, ValueError) as exc:
@@ -258,15 +263,19 @@ def start_run(payload: MiningStartRequest, request: Request) -> dict[str, Any]:
 
 @router.get("/runs/{run_id}")
 def get_run(run_id: str, request: Request) -> dict[str, Any]:
-    store = _manager(request).store
+    store = _store(request)
     return _project_run(store, _required_manifest(store, run_id))
 
 
 @router.post("/runs/{run_id}/cancel")
 def cancel_run(run_id: str, request: Request) -> dict[str, Any]:
     manager = _manager(request)
+    user_root = _user_root(request)
     try:
-        return _project_run(manager.store, manager.cancel(run_id))
+        return _project_run(
+            manager.store_for(user_root),
+            manager.cancel(run_id, user_root=user_root),
+        )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="mining run not found") from exc
     except MiningRunValidationError as exc:
@@ -283,6 +292,8 @@ def start_auto_run(payload: MiningAutoStartRequest, request: Request) -> dict[st
     from app.services.auto_mining import screen_all_factors
 
     manager = _manager(request)
+    user_root = _user_root(request)
+    store = manager.store_for(user_root)
     data_dir = request.app.state.repo.store.data_dir
     try:
         require_mining_availability(
@@ -341,10 +352,12 @@ def start_auto_run(payload: MiningAutoStartRequest, request: Request) -> dict[st
             request.app.state.repo,
             request.app.state,
             worker_request,
+            user_root=user_root,
         )
         manifest = manager.start(
             worker_request,
             fingerprint,
+            user_root=user_root,
             force=payload.force,
             source="auto",
         )
@@ -357,12 +370,12 @@ def start_auto_run(payload: MiningAutoStartRequest, request: Request) -> dict[st
         ) from exc
     except MiningRunStoreError as exc:
         raise HTTPException(status_code=500, detail="failed to persist mining run") from exc
-    return {"started": True, "run": _project_run(manager.store, manifest), "screening": screening}
+    return {"started": True, "run": _project_run(store, manifest), "screening": screening}
 
 
 @router.get("/runs/{run_id}/result")
 def get_result(run_id: str, request: Request) -> dict[str, Any]:
-    store = _manager(request).store
+    store = _store(request)
     manifest = _required_manifest(store, run_id)
     status = str(manifest["status"])
     if status not in SUCCESS_RUN_STATUSES:
@@ -396,7 +409,7 @@ def stream_events(
     request: Request,
     last_event_id: str | None = Header(None, alias="Last-Event-ID"),
 ) -> EventSourceResponse:
-    store = _manager(request).store
+    store = _store(request)
     _required_manifest(store, run_id)
     cursor = _event_cursor(last_event_id)
 
@@ -513,6 +526,26 @@ def _manager(request: Request):
     return manager
 
 
+def _store(request: Request) -> MiningRunStore:
+    """返回**当前账户**的运行存储。
+
+    账户根只从请求上下文解析 (认证中间件注入), **不接受任何客户端参数** ——
+    挖掘运行是账户私有数据, 客户端提交的 run_id 只能在本人账户的 store 里查到。
+    manager 是进程级单例 (它持有线程/取消表), 但存储按账户根分家, 见
+    ``MiningJobManager.store_for``。
+    """
+    from app.services.user_paths import resolve_user_root
+
+    return _manager(request).store_for(resolve_user_root())
+
+
+def _user_root(request: Request) -> Path:
+    """当前请求的账户根 (同样只从上下文解析, 用于账户私有存储的显式传参)。"""
+    from app.services.user_paths import resolve_user_root
+
+    return resolve_user_root()
+
+
 def _candidate_service(request: Request):
     """返回**当前账户**的候选服务。
 
@@ -522,9 +555,8 @@ def _candidate_service(request: Request):
     """
     from app.backtest.candidates import CandidateStore
     from app.services.mining_candidates import MiningCandidateService
-    from app.services.user_paths import resolve_user_root
 
-    user_root = resolve_user_root()
+    user_root = _user_root(request)
     cache: dict[Path, MiningCandidateService] = getattr(
         request.app.state, "mining_candidate_services", None
     )
@@ -539,7 +571,7 @@ def _candidate_service(request: Request):
     monitor_engine = getattr(request.app.state, "monitor_engine", None)
     service = MiningCandidateService(
         user_root,
-        manager.store,
+        manager.store_for(user_root),
         CandidateStore(user_root),
         request.app.state.strategy_engine,
         monitor_state_invalidator=(

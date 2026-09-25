@@ -9,8 +9,46 @@ from typing import Any
 import pytest
 
 import app.services.mining_manager as mining_manager_module
+from app import config as app_config
+from app.services import user_paths
 from app.services.heavy_job_limiter import HeavyJobLimiter
+from app.services.mining_jobs import MiningRunStore
 from app.services.mining_manager import MiningJobManager
+from app.services.user_paths import InvalidAccountIdError
+
+
+class _AccountManager:
+    """把**一个账户根**钉在 manager 上的薄壳 (仅测试用)。
+
+    manager 是进程级单例 (``data_dir`` 只喂 worker 子进程), 而运行产物按账户根
+    分家: 每个 ``start``/``cancel``/``store_for`` 都必须带账户。壳把测试账户根
+    固定下来, 于是用例主体仍走**真** manager 方法, 却不必每处重复传根 ——
+    同时双账户用例可以再建第二个壳, 证明两边互不可见。
+    """
+
+    def __init__(self, manager: MiningJobManager, user_root: Path) -> None:
+        self._manager = manager
+        self.user_root = user_root
+
+    @property
+    def store(self) -> MiningRunStore:
+        return self._manager.store_for(self.user_root)
+
+    def start(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        # 默认本账户根; 用例可以显式传别的根 (负面用例: 传共享目录必须报错)。
+        kwargs.setdefault("user_root", self.user_root)
+        return self._manager.start(*args, **kwargs)
+
+    def cancel(self, run_id: str, **kwargs: Any) -> dict[str, Any]:
+        kwargs.setdefault("user_root", self.user_root)
+        return self._manager.cancel(run_id, **kwargs)
+
+    def for_account(self, account_id: int) -> _AccountManager:
+        """同一 manager 上的**另一个**账户壳 —— 跨账户用例用它证明互不可见。"""
+        return _AccountManager(self._manager, user_paths.user_root(account_id))
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._manager, name)
 
 
 def _task_factory(kind: str, data_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
@@ -22,7 +60,7 @@ def _task_factory(kind: str, data_dir: Path, payload: dict[str, Any]) -> dict[st
 
 
 def _wait_for_status(
-    manager: MiningJobManager,
+    manager: _AccountManager,
     run_id: str,
     status: str,
     *,
@@ -39,7 +77,7 @@ def _wait_for_status(
 
 
 def _wait_for_event_types(
-    manager: MiningJobManager,
+    manager: _AccountManager,
     run_id: str,
     expected: list[str],
     *,
@@ -71,7 +109,11 @@ def isolated_limiter(monkeypatch: pytest.MonkeyPatch) -> HeavyJobLimiter:
 def make_manager(
     tmp_path: Path,
     isolated_limiter: HeavyJobLimiter,
+    monkeypatch: pytest.MonkeyPatch,
 ):
+    # data_dir 指向 tmp_path: 账户根随之变成 tmp_path/users/<id>, 与部署布局一致
+    # (共享行情在 data_dir 顶层, 账户私有数据在 users/<id> 之下)。
+    monkeypatch.setattr(app_config.settings, "data_dir", tmp_path)
     managers: list[MiningJobManager] = []
 
     def factory(
@@ -79,14 +121,16 @@ def make_manager(
             [dict[str, Any], Callable[[dict[str, Any]], None], threading.Event],
             dict[str, Any],
         ],
-    ) -> MiningJobManager:
+        *,
+        account_id: int = 1,
+    ) -> _AccountManager:
         manager = MiningJobManager(
             tmp_path,
             worker_runner=runner,
             task_factory=_task_factory,
         )
         managers.append(manager)
-        return manager
+        return _AccountManager(manager, user_paths.user_root(account_id))
 
     yield factory
 
@@ -135,6 +179,9 @@ def test_start_records_states_events_progress_and_worker_payload(
                 "request": request,
                 "data_fingerprint": {"daily": "v1"},
                 "source": "scheduled",
+                # worker 是 spawn 出的独立进程: 账户根必须随载荷传下去,
+                # 否则子进程写不到本账户的 runs 目录 (且无法解析账户根)。
+                "user_root": str(user_paths.user_root(1)),
             },
         }
     ]
@@ -321,11 +368,16 @@ def test_budget_exhausted_result_uses_distinct_success_status(make_manager) -> N
     )
 
 
-def test_recover_interrupted_delegates_to_store(make_manager) -> None:
+def test_recover_interrupted_delegates_to_store(
+    make_manager,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     def runner(task, progress_cb, cancel_event):
         return {"status": "succeeded"}
 
     manager = make_manager(runner)
+    _point_fanout_at(monkeypatch, tmp_path, (1,))
     manager.store.create({}, "v1", run_id="running_before_restart")
     manager.store.transition_status("running_before_restart", "running")
     manager.store.create({}, "v1", run_id="cancelling_before_restart")
@@ -336,6 +388,65 @@ def test_recover_interrupted_delegates_to_store(make_manager) -> None:
     assert manager.store.get("running_before_restart")["status"] == "interrupted"  # type: ignore[index]
     assert manager.store.get("cancelling_before_restart")["status"] == "interrupted"  # type: ignore[index]
     assert manager.store.get("queued_before_restart")["status"] == "interrupted"  # type: ignore[index]
+
+
+def test_recover_interrupted_fans_out_over_every_account(
+    make_manager,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """启动补录逐账户扫描: 旧实现只有一个 (共享根) store, 只能看到第一个目录。"""
+
+    def runner(task, progress_cb, cancel_event):
+        return {"status": "succeeded"}
+
+    account_a = make_manager(runner)
+    account_b = account_a.for_account(2)
+    _point_fanout_at(monkeypatch, tmp_path, (1, 2))
+    account_a.store.create({}, "v1", run_id="a_running")
+    account_a.store.transition_status("a_running", "running")
+    account_b.store.create({}, "v1", run_id="b_queued")
+
+    assert account_a.recover_interrupted() == 2
+    assert account_a.store.get("a_running")["status"] == "interrupted"  # type: ignore[index]
+    assert account_b.store.get("b_queued")["status"] == "interrupted"  # type: ignore[index]
+
+
+def test_store_for_refuses_the_shared_data_dir(
+    make_manager,
+    tmp_path: Path,
+) -> None:
+    """共享行情根不得当作账户根 —— 这正是"启动期用共享根建 store"这个缺陷的闸门。
+
+    真 manager 此前有 self._store = MiningRunStore(data_dir), 那不仅是"内存里看得见
+    别人的运行", 而是启动即抛 InvalidAccountIdError; store_for 必须把这个错误显式
+    暴露出来, 而不是悄悄退化成所有人共读一个 store。
+    """
+
+    def runner(task, progress_cb, cancel_event):
+        return {"status": "succeeded"}
+
+    manager = make_manager(runner)
+
+    with pytest.raises(InvalidAccountIdError):
+        manager.store_for(tmp_path)
+    with pytest.raises(InvalidAccountIdError):
+        manager.start({"factor_names": ["value"]}, "data-v1", user_root=tmp_path)
+
+
+def _point_fanout_at(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    account_ids: tuple[int, ...],
+) -> None:
+    """把 manager 的账户扇出指向测试账户 (真实现读的是部署账号注册表)。"""
+    monkeypatch.setattr(
+        mining_manager_module,
+        "iter_user_roots",
+        lambda: [
+            (account_id, user_paths.user_root(account_id)) for account_id in account_ids
+        ],
+    )
 
 
 def test_shutdown_sets_cancel_uses_bounded_join_and_keeps_history(

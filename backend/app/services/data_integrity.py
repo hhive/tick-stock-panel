@@ -318,7 +318,10 @@ def launch_integrity_repair(app_state, start_date: date, reason: str) -> tuple[s
     )
     from app.services.repair_daily import run_repair_daily
 
-    job_id, is_new = job_store.create()
+    # 自动修复任务按"系统发起"记归属 (owner=None ⇒ 只有管理员能取消), 因为它的
+    # 两个触发点都不是"某个用户要求同步数据": 一是启动期的完整性检查, 二是用户
+    # 开启实时行情时被门禁拦下后**自动**补建。保守地记成无主而不是猜一个账户。
+    job_id, is_new = job_store.create(owner_account_id=None)
     if not is_new:
         return job_id, False
 
