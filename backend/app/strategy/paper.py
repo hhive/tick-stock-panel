@@ -9,10 +9,19 @@
 (app/backtest/engine.py) 同名同默认值: commission_pct 双边佣金 / stamp_tax_pct
 卖出印花税 / slippage_bps 滑点。
 
-多账户 (V2): 数据目录 data/paper/accounts/{account_id}/, 账户间完全隔离
+多账户 (V2): 数据目录 <user_root>/paper/accounts/{account_id}/, 账户间完全隔离
 (订单/台账/持仓/净值/自动规则均按账户存放)。所有域函数带 account_id 参数
-(默认 "default", 即迁移前的单账户)。旧版 data/paper/ 单账户布局首次访问时
+(默认 "default", 即迁移前的单账户)。旧版 <user_root>/paper/ 单账户布局首次访问时
 自动迁移到 accounts/default/, 一次性且幂等。
+
+**两个 account_id 不是一回事** (命名相近, 命名空间不同, 永远不要互相传递):
+  - 面板账户 = user_paths 的整数主键, 它只决定**外层的 user_root**
+    (``data/users/<account_id>/``) —— 即数据属于谁;
+  - 本模块的 account_id = 校验过的**字符串账户名** (``validate_account_id``),
+    它是 user_root 内部的子目录 —— 即同一个人的哪个模拟账户。
+  私有路径一律经 ``user_paths.resolve_user_root()`` 解析 (请求路径走认证中间件
+  注入的 contextvar; 后台线程/调度器必须显式传 ``user_root=``), 本模块不再
+  自己读 ``settings.data_dir``; 共享行情 (日K/指数/除权因子) 仍从 ``data_dir`` 读。
 
 撮合规则:
   - 即时单: 盘中由行情轮询钩子按最新快照价成交 (evaluate_intraday);
@@ -40,6 +49,7 @@ import polars as pl
 
 from app.market_time import cn_now, cn_today
 from app.services.fs_utils import atomic_write_text
+from app.services.user_paths import resolve_user_root
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +68,8 @@ MAX_POSITION_SYMBOLS = 50          # 持仓标的数上限 (防误操作)
 DEFAULT_ACCOUNT_ID = "default"
 _ACCOUNT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 
-_MIGRATION_DONE = False
+# 旧布局迁移按账户根目录各做一次 (根目录不同 => 不是同一批数据, 不能共用一个标志位)
+_MIGRATED_ROOTS: set[Path] = set()
 
 
 # ── 路径与账户目录 ──────────────────────────────────────
@@ -69,18 +80,19 @@ def validate_account_id(account_id: str) -> str:
     return account_id
 
 
-def accounts_base(data_dir: Path) -> Path:
-    return Path(data_dir) / "paper" / "accounts"
+def accounts_base(root: Path) -> Path:
+    """账户目录基址 (root 已经是**本账户**的根目录, 见 resolve_user_root)。"""
+    return Path(root) / "paper" / "accounts"
 
 
-def _migrate_legacy(data_dir: Path) -> None:
-    """旧单账户布局 data/paper/* → data/paper/accounts/default/* (一次性, 幂等)。
+def _migrate_legacy(root: Path) -> None:
+    """旧单账户布局 <root>/paper/* → <root>/paper/accounts/default/* (一次性, 幂等)。
 
     仅当旧 account.json 存在且 accounts/ 尚不存在时迁移; 移动失败只留痕不阻断
     (下次访问重试), 避免迁移异常导致模拟盘整体不可用。
     """
-    legacy = Path(data_dir) / "paper"
-    base = accounts_base(data_dir)
+    legacy = Path(root) / "paper"
+    base = accounts_base(root)
     if not (legacy / "account.json").exists() or base.exists():
         return
     dest = base / DEFAULT_ACCOUNT_ID
@@ -103,24 +115,24 @@ def _migrate_legacy(data_dir: Path) -> None:
             pass
 
 
-def _root(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> Path:
-    global _MIGRATION_DONE
-    if not _MIGRATION_DONE:
-        _migrate_legacy(data_dir)
-        _MIGRATION_DONE = True
-    d = accounts_base(data_dir) / validate_account_id(account_id)
+def _root(root: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> Path:
+    """本账户的模拟盘子目录 <root>/paper/accounts/{account_id} (按需创建)。"""
+    if root not in _MIGRATED_ROOTS:
+        _migrate_legacy(root)
+        _MIGRATED_ROOTS.add(root)
+    d = accounts_base(root) / validate_account_id(account_id)
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
-def _orders_dir(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> Path:
-    d = _root(data_dir, account_id) / "orders"
+def _orders_dir(root: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> Path:
+    d = _root(root, account_id) / "orders"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
-def _nav_dir(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> Path:
-    d = _root(data_dir, account_id) / "nav"
+def _nav_dir(root: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> Path:
+    d = _root(root, account_id) / "nav"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -139,8 +151,8 @@ def _order_sort_key(order: dict) -> tuple:
 
 
 # ── 账户 ────────────────────────────────────────────────
-def get_account(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> dict | None:
-    p = _root(data_dir, account_id) / "account.json"
+def get_account(account_id: str = DEFAULT_ACCOUNT_ID, user_root: Path | None = None) -> dict | None:
+    p = _root(resolve_user_root(user_root), account_id) / "account.json"
     if not p.exists():
         return None
     try:
@@ -151,7 +163,6 @@ def get_account(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> dict | 
 
 
 def create_account(
-    data_dir: Path,
     initial_cash: float,
     *,
     account_id: str = DEFAULT_ACCOUNT_ID,
@@ -160,11 +171,13 @@ def create_account(
     stamp_tax_pct: float = DEFAULT_STAMP_TAX_PCT,
     slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
     queue_limit_orders: bool = False,
+    user_root: Path | None = None,
 ) -> dict:
     """创建账户 (同 id 已存在则原样返回, 不覆盖 — 幂等)。"""
     validate_account_id(account_id)
+    root = resolve_user_root(user_root)
     with PAPER_LOCK:
-        existing = get_account(data_dir, account_id)
+        existing = get_account(account_id, user_root=root)
         if existing is not None:
             return existing
         if isinstance(initial_cash, bool) or not isinstance(initial_cash, (int, float)) or initial_cash <= 0:
@@ -181,20 +194,20 @@ def create_account(
             "status": "active",  # active / frozen
             "created_at": _now_iso(),
         }
-        atomic_write_text(_root(data_dir, account_id) / "account.json", json.dumps(acc, ensure_ascii=False, indent=2))
+        atomic_write_text(_root(root, account_id) / "account.json", json.dumps(acc, ensure_ascii=False, indent=2))
         return acc
 
 
-def save_account(data_dir: Path, acc: dict, account_id: str = DEFAULT_ACCOUNT_ID) -> None:
+def save_account(acc: dict, account_id: str = DEFAULT_ACCOUNT_ID, user_root: Path | None = None) -> None:
     atomic_write_text(
-        _root(data_dir, account_id) / "account.json",
+        _root(resolve_user_root(user_root), account_id) / "account.json",
         json.dumps(acc, ensure_ascii=False, indent=2),
     )
 
 
-def list_account_ids(data_dir: Path) -> list[str]:
-    """全部账户 id (按创建时间; 供钩子/结算遍历)。"""
-    base = accounts_base(data_dir)
+def list_account_ids(user_root: Path | None = None) -> list[str]:
+    """**当前账户**的全部模拟盘账户 id (按创建时间; 供钩子/结算遍历)。"""
+    base = accounts_base(resolve_user_root(user_root))
     if not base.exists():
         return []
     out: list[tuple[str, str]] = []
@@ -207,14 +220,15 @@ def list_account_ids(data_dir: Path) -> list[str]:
     return [aid for _, aid in sorted(out)]
 
 
-def list_accounts(data_dir: Path) -> list[dict]:
-    """账户列表 (带最新净值摘要, 供切换器展示)。"""
+def list_accounts(user_root: Path | None = None) -> list[dict]:
+    """本账户的模拟盘账户列表 (带最新净值摘要, 供切换器展示)。"""
+    root = resolve_user_root(user_root)
     out: list[dict] = []
-    for aid in list_account_ids(data_dir):
-        acc = get_account(data_dir, aid)
+    for aid in list_account_ids(root):
+        acc = get_account(aid, user_root=root)
         if acc is None:
             continue
-        nav = load_nav(data_dir, aid)
+        nav = load_nav(aid, user_root=root)
         out.append({
             "id": acc["id"],
             "name": acc.get("name", acc["id"]),
@@ -227,15 +241,20 @@ def list_accounts(data_dir: Path) -> list[dict]:
     return out
 
 
-def update_settings(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID, **fields) -> dict:
+def update_settings(
+    account_id: str = DEFAULT_ACCOUNT_ID,
+    user_root: Path | None = None,
+    **fields,
+) -> dict:
     """更新账户设置 (当前仅 queue_limit_orders); 未知字段忽略。返回更新后账户。"""
+    root = resolve_user_root(user_root)
     with PAPER_LOCK:
-        acc = get_account(data_dir, account_id)
+        acc = get_account(account_id, user_root=root)
         if acc is None:
             raise ValueError("尚未创建模拟账户")
         if "queue_limit_orders" in fields and fields["queue_limit_orders"] is not None:
             acc["queue_limit_orders"] = bool(fields["queue_limit_orders"])
-        save_account(data_dir, acc, account_id)
+        save_account(acc, account_id, user_root=root)
         return acc
 
 
@@ -291,9 +310,9 @@ def qty_from_amount(amount: float, ref_price: float) -> int:
 
 
 # ── 订单 ────────────────────────────────────────────────
-def load_orders(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> list[dict]:
+def load_orders(account_id: str = DEFAULT_ACCOUNT_ID, user_root: Path | None = None) -> list[dict]:
     out: list[dict] = []
-    for f in sorted(_orders_dir(data_dir, account_id).glob("order_*.json")):
+    for f in sorted(_orders_dir(resolve_user_root(user_root), account_id).glob("order_*.json")):
         try:
             out.append(json.loads(f.read_text(encoding="utf-8")))
         except Exception as e:
@@ -301,13 +320,13 @@ def load_orders(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> list[di
     return out
 
 
-def save_order(data_dir: Path, order: dict, account_id: str = DEFAULT_ACCOUNT_ID) -> None:
-    p = _orders_dir(data_dir, account_id) / f"{order['id']}.json"
+def save_order(order: dict, account_id: str = DEFAULT_ACCOUNT_ID, user_root: Path | None = None) -> None:
+    p = _orders_dir(resolve_user_root(user_root), account_id) / f"{order['id']}.json"
     atomic_write_text(p, json.dumps(order, ensure_ascii=False, indent=2))
 
 
-def get_order(data_dir: Path, order_id: str, account_id: str = DEFAULT_ACCOUNT_ID) -> dict | None:
-    p = _orders_dir(data_dir, account_id) / f"{order_id}.json"
+def get_order(order_id: str, account_id: str = DEFAULT_ACCOUNT_ID, user_root: Path | None = None) -> dict | None:
+    p = _orders_dir(resolve_user_root(user_root), account_id) / f"{order_id}.json"
     if not p.exists():
         return None
     try:
@@ -317,7 +336,6 @@ def get_order(data_dir: Path, order_id: str, account_id: str = DEFAULT_ACCOUNT_I
 
 
 def create_order(
-    data_dir: Path,
     symbol: str,
     side: str,
     *,
@@ -328,6 +346,7 @@ def create_order(
     asset_type: str | None = None,
     ref_price: float | None = None,
     source: str = "manual",
+    user_root: Path | None = None,
 ) -> tuple[dict | None, str | None]:
     """创建订单并校验。qty 与 amount 二选一 (amount 按参考价折算百股)。
 
@@ -335,8 +354,9 @@ def create_order(
     ETF 即时单自动转 next_open (盘中钩子只喂股票快照)。
     返回 (order, None) 或 (None, 错误信息)。
     """
+    root = resolve_user_root(user_root)
     with PAPER_LOCK:
-        acc = get_account(data_dir, account_id)
+        acc = get_account(account_id, user_root=root)
         if acc is None:
             raise ValueError("尚未创建模拟账户")
         if acc.get("status") != "active":
@@ -374,7 +394,7 @@ def create_order(
             if est_price > 0 and qty * est_price * (1 + acc["slippage_bps"] / 10000) + buy_fee(qty, est_price, acc["commission_pct"]) > acc_cash:
                 return None, f"可用资金不足 (需约 {qty * est_price:.0f}, 可用 {acc_cash:.0f})"
         else:
-            pos = load_positions(data_dir, account_id).get(symbol)
+            pos = load_positions(account_id, user_root=root).get(symbol)
             if pos is None or pos["qty"] <= 0:
                 return None, f"无 {symbol} 持仓, 不能卖出"
             if qty > pos["available_qty"]:
@@ -382,7 +402,7 @@ def create_order(
             # 超卖防护: pending 卖出单占用可卖额度 — 同 symbol 的 pending 卖出合计
             # 不得超过可卖数量, 否则多张单各自通过校验、成交时逐张扣减会超额
             pending_sell = sum(
-                int(o["qty"]) for o in load_orders(data_dir, account_id)
+                int(o["qty"]) for o in load_orders(account_id, user_root=root)
                 if o["status"] == "pending" and o["side"] == "sell" and o["symbol"] == symbol
             )
             if pending_sell + qty > pos["available_qty"]:
@@ -392,7 +412,7 @@ def create_order(
                 )
 
         # 持仓标的数上限 (仅新开仓的买入; 加仓已有持仓不受限)
-        positions = load_positions(data_dir, account_id)
+        positions = load_positions(account_id, user_root=root)
         if (
             side == "buy"
             and symbol not in positions
@@ -417,31 +437,36 @@ def create_order(
             "fees": None,
             "reason": None,
         }
-        save_order(data_dir, order, account_id)
+        save_order(order, account_id, user_root=root)
         return order, None
 
 
-def cancel_order(data_dir: Path, order_id: str, account_id: str = DEFAULT_ACCOUNT_ID) -> tuple[dict | None, str | None]:
+def cancel_order(
+    order_id: str,
+    account_id: str = DEFAULT_ACCOUNT_ID,
+    user_root: Path | None = None,
+) -> tuple[dict | None, str | None]:
     """撤销 pending 订单; 已成交/已过期不可撤。"""
+    root = resolve_user_root(user_root)
     with PAPER_LOCK:
-        order = get_order(data_dir, order_id, account_id)
+        order = get_order(order_id, account_id, user_root=root)
         if order is None:
             return None, f"订单不存在: {order_id}"
         if order["status"] != "pending":
             return None, f"订单状态为 {order['status']}, 不可撤销"
         order["status"] = "cancelled"
         order["reason"] = "manual cancel"
-        save_order(data_dir, order, account_id)
+        save_order(order, account_id, user_root=root)
         return order, None
 
 
 # ── 成交台账与持仓 ──────────────────────────────────────
-def _fills_path(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> Path:
-    return _root(data_dir, account_id) / "fills.jsonl"
+def _fills_path(root: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> Path:
+    return _root(root, account_id) / "fills.jsonl"
 
 
-def load_fills(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> list[dict]:
-    p = _fills_path(data_dir, account_id)
+def load_fills(account_id: str = DEFAULT_ACCOUNT_ID, user_root: Path | None = None) -> list[dict]:
+    p = _fills_path(resolve_user_root(user_root), account_id)
     if not p.exists():
         return []
     out: list[dict] = []
@@ -456,22 +481,23 @@ def load_fills(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> list[dic
     return out
 
 
-def load_positions(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> dict[str, dict]:
+def load_positions(account_id: str = DEFAULT_ACCOUNT_ID, user_root: Path | None = None) -> dict[str, dict]:
     """读物化持仓 (无文件时从台账重建)。"""
-    p = _root(data_dir, account_id) / "positions.json"
+    root = resolve_user_root(user_root)
+    p = _root(root, account_id) / "positions.json"
     if p.exists():
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
             return data.get("positions", {})
         except Exception as e:
             logger.warning("paper positions load failed, rebuilding: %s", e)
-    return replay_positions(data_dir, account_id=account_id)[0]
+    return replay_positions(fills=None, account_id=account_id, user_root=root)[0]
 
 
 def replay_positions(
-    data_dir: Path,
     fills: list[dict] | None = None,
     account_id: str = DEFAULT_ACCOUNT_ID,
+    user_root: Path | None = None,
 ) -> tuple[dict[str, dict], float]:
     """由台账重放推导 (持仓, 现金)。纯函数 — 重建与校验的唯一权威实现。
 
@@ -479,10 +505,11 @@ def replay_positions(
                         lots: [{date: 'YYYY-MM-DD', qty}]}}
     corp_action 行: 数量乘 factor、成本除以 factor、日期归属保持原 buy_date。
     """
-    acc = get_account(data_dir, account_id)
+    root = resolve_user_root(user_root)
+    acc = get_account(account_id, user_root=root)
     cash = float(acc["initial_cash"]) if acc else 0.0
     positions: dict[str, dict] = {}
-    for f in fills if fills is not None else load_fills(data_dir, account_id):
+    for f in fills if fills is not None else load_fills(account_id, user_root=root):
         kind = f.get("kind", "fill")
         symbol = f["symbol"]
         if kind == "corp_action":
@@ -539,52 +566,62 @@ def _available_of(pos: dict, today: str | None = None) -> int:
     return int(sum(lot["qty"] for lot in pos["lots"] if lot["date"] < today))
 
 
-def _append_fill(data_dir: Path, fill: dict, account_id: str = DEFAULT_ACCOUNT_ID) -> None:
-    p = _fills_path(data_dir, account_id)
+def _append_fill(root: Path, fill: dict, account_id: str = DEFAULT_ACCOUNT_ID) -> None:
+    p = _fills_path(root, account_id)
     with PAPER_LOCK, p.open("a", encoding="utf-8") as f:
         f.write(json.dumps(fill, ensure_ascii=False) + "\n")
 
 
-def _materialize(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> None:
+def _materialize(root: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> None:
     """由台账重建 positions.json (每次成交后调用, 保持物化缓存与台账一致)。"""
-    positions, _cash = replay_positions(data_dir, account_id=account_id)
-    acc = get_account(data_dir, account_id)
+    positions, _cash = replay_positions(account_id=account_id, user_root=root)
+    acc = get_account(account_id, user_root=root)
     if acc is not None:
         today = cn_today().isoformat()
         for pos in positions.values():
             pos["available_qty"] = _available_of(pos, today)
     atomic_write_text(
-        _root(data_dir, account_id) / "positions.json",
+        _root(root, account_id) / "positions.json",
         json.dumps({"updated_at": _now_iso(), "positions": positions}, ensure_ascii=False, indent=2),
     )
 
 
-def rebuild_positions(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> dict[str, dict]:
+def rebuild_positions(account_id: str = DEFAULT_ACCOUNT_ID, user_root: Path | None = None) -> dict[str, dict]:
     """修复兜底: 强制由台账重建物化持仓。"""
+    root = resolve_user_root(user_root)
     with PAPER_LOCK:
-        positions, cash = replay_positions(data_dir, account_id=account_id)
-        acc = get_account(data_dir, account_id)
+        positions, cash = replay_positions(account_id=account_id, user_root=root)
+        acc = get_account(account_id, user_root=root)
         if acc is not None:
             acc["cash"] = cash
-            save_account(data_dir, acc, account_id)
+            save_account(acc, account_id, user_root=root)
         today = cn_today().isoformat()
         for pos in positions.values():
             pos["available_qty"] = _available_of(pos, today)
         atomic_write_text(
-            _root(data_dir, account_id) / "positions.json",
+            _root(root, account_id) / "positions.json",
             json.dumps({"updated_at": _now_iso(), "positions": positions}, ensure_ascii=False, indent=2),
         )
         return positions
 
 
 # ── 撮合 ────────────────────────────────────────────────
-def _fill_order(data_dir: Path, order: dict, raw_price: float, day: str, account_id: str = DEFAULT_ACCOUNT_ID) -> dict | None:
+def _fill_order(
+    data_dir: Path,
+    root: Path,
+    order: dict,
+    raw_price: float,
+    day: str,
+    account_id: str = DEFAULT_ACCOUNT_ID,
+) -> dict | None:
     """按指定 raw 价成交一笔订单 (费用/滑点/资金与持仓校验), 返回 fill 或 None。
 
-    调用方持锁。涨跌停按账户 queue_limit_orders 开关: 关 → expired 留痕;
-    开 → 转 next_open 排队次日重试 (计顺延, 超限过期)。资金/可卖不足直接过期。
+    ``data_dir`` 只用于读共享行情 (涨跌停基准的前收盘); 账户数据一律走 ``root``
+    (调用方已解析好的账户根目录)。调用方持锁。涨跌停按账户 queue_limit_orders
+    开关: 关 → expired 留痕; 开 → 转 next_open 排队次日重试 (计顺延, 超限过期)。
+    资金/可卖不足直接过期。
     """
-    acc = get_account(data_dir, account_id)
+    acc = get_account(account_id, user_root=root)
     symbol, side, qty = order["symbol"], order["side"], int(order["qty"])
     asset_type = order.get("asset_type", "stock")
     price = apply_slippage(raw_price, side, float(acc["slippage_bps"]))
@@ -594,47 +631,47 @@ def _fill_order(data_dir: Path, order: dict, raw_price: float, day: str, account
     if prev is not None:
         up, down = limit_prices(prev, symbol, asset_type)
         if side == "buy" and price >= up:
-            _queue_or_expire(data_dir, order, acc, f"触及涨停 {up} 买不进 (模拟)", account_id)
+            _queue_or_expire(root, order, acc, f"触及涨停 {up} 买不进 (模拟)", account_id)
             return None
         if side == "sell" and price <= down:
-            _queue_or_expire(data_dir, order, acc, f"触及跌停 {down} 卖不出 (模拟)", account_id)
+            _queue_or_expire(root, order, acc, f"触及跌停 {down} 卖不出 (模拟)", account_id)
             return None
 
     fee = buy_fee(qty, price, acc["commission_pct"]) if side == "buy" else sell_fee(qty, price, acc["commission_pct"], acc["stamp_tax_pct"])
     gross = qty * price
     if side == "buy":
         if gross + fee > float(acc["cash"]) + 1e-6:
-            _expire(data_dir, order, f"资金不足 (需 {gross + fee:.2f}, 可用 {acc['cash']:.2f})", account_id)
+            _expire(root, order, f"资金不足 (需 {gross + fee:.2f}, 可用 {acc['cash']:.2f})", account_id)
             return None
         # 资金占用兜底: 只计入 created_at 早于本单的其他 pending 买入 (先到先得,
         # 早单优先成交, 晚单不占早单的额度) — 防止多张 pending 买入各自通过预检、
         # 成交时逐张扣现金而穿透。
         earlier_cash = sum(
             int(o["qty"]) * float(o["ref_price"] or 0)
-            for o in load_orders(data_dir, account_id)
+            for o in load_orders(account_id, user_root=root)
             if o["status"] == "pending" and o["side"] == "buy"
             and o["id"] != order["id"]
             and _order_sort_key(o) < _order_sort_key(order)
         )
         if earlier_cash and gross + fee + earlier_cash > float(acc["cash"]) + 1e-6:
-            _expire(data_dir, order, f"资金被更早的待成交买入单占用 (约 {earlier_cash:.0f}, 可用 {acc['cash']:.0f})", account_id)
+            _expire(root, order, f"资金被更早的待成交买入单占用 (约 {earlier_cash:.0f}, 可用 {acc['cash']:.0f})", account_id)
             return None
     if side == "sell":
-        pos = load_positions(data_dir, account_id).get(symbol)
+        pos = load_positions(account_id, user_root=root).get(symbol)
         avail = _available_of(pos, day) if pos else 0
         if pos is None or pos["qty"] < qty or avail < qty:
-            _expire(data_dir, order, f"可卖数量不足 (T+1): 可卖 {avail}", account_id)
+            _expire(root, order, f"可卖数量不足 (T+1): 可卖 {avail}", account_id)
             return None
         # 超卖防护 (撮合侧兜底): 只计入 created_at 早于本单的其他 pending 卖出 —
         # 先到先得, 早单优先成交; 剩余额度不足则本单拒 (而非成交出负持仓)。
         pending_sell = sum(
-            int(o["qty"]) for o in load_orders(data_dir, account_id)
+            int(o["qty"]) for o in load_orders(account_id, user_root=root)
             if o["status"] == "pending" and o["side"] == "sell" and o["symbol"] == symbol
             and o["id"] != order["id"]
             and _order_sort_key(o) < _order_sort_key(order)
         )
         if pending_sell + qty > avail:
-            _expire(data_dir, order, f"可卖数量被更早的待成交卖出单占用: 可卖 {avail}, 先到 {pending_sell}", account_id)
+            _expire(root, order, f"可卖数量被更早的待成交卖出单占用: 可卖 {avail}, 先到 {pending_sell}", account_id)
             return None
 
     fill = {
@@ -650,19 +687,19 @@ def _fill_order(data_dir: Path, order: dict, raw_price: float, day: str, account
         "fee": fee,
         "kind": "fill",
     }
-    _append_fill(data_dir, fill, account_id)
+    _append_fill(root, fill, account_id)
 
     order["status"] = "filled"
     order["filled_at"] = fill["ts"]
     order["fill_price"] = price
     order["fees"] = fee
-    save_order(data_dir, order, account_id)
+    save_order(order, account_id, user_root=root)
 
     # 现金按台账重放结果定版 (重放是权威, 避免双写不一致)
-    _cash = replay_positions(data_dir, account_id=account_id)[1]
+    _cash = replay_positions(account_id=account_id, user_root=root)[1]
     acc["cash"] = _cash
-    save_account(data_dir, acc, account_id)
-    _materialize(data_dir, account_id)
+    save_account(acc, account_id, user_root=root)
+    _materialize(root, account_id)
 
     # 成交落告警记录 (监控中心触发历史可见; source=paper 走前端通用渲染)
     try:
@@ -692,14 +729,14 @@ def _fill_order(data_dir: Path, order: dict, raw_price: float, day: str, account
     return fill
 
 
-def _expire(data_dir: Path, order: dict, reason: str, account_id: str = DEFAULT_ACCOUNT_ID) -> None:
+def _expire(root: Path, order: dict, reason: str, account_id: str = DEFAULT_ACCOUNT_ID) -> None:
     """拒单置 expired 并立即落盘 (撮合拒绝必须留痕, 不允许静默丢弃)。"""
     order["status"] = "expired"
     order["reason"] = reason
-    save_order(data_dir, order, account_id)
+    save_order(order, account_id, user_root=root)
 
 
-def _queue_or_expire(data_dir: Path, order: dict, acc: dict, reason: str, account_id: str = DEFAULT_ACCOUNT_ID) -> None:
+def _queue_or_expire(root: Path, order: dict, acc: dict, reason: str, account_id: str = DEFAULT_ACCOUNT_ID) -> None:
     """涨跌停拒单处理: 排队开启 → 转 next_open 次日重试 (计顺延, 超限过期); 关 → 过期。"""
     postponed = int(order.get("postponed", 0))
     if acc.get("queue_limit_orders"):
@@ -707,21 +744,21 @@ def _queue_or_expire(data_dir: Path, order: dict, acc: dict, reason: str, accoun
             order["order_type"] = "next_open"
             order["postponed"] = postponed + 1
             order["reason"] = f"{reason}; 排队次日重试 ({postponed + 1}/{MAX_POSTPONE_DAYS})"
-            save_order(data_dir, order, account_id)
+            save_order(order, account_id, user_root=root)
             return
         reason = f"{reason}; 排队 {MAX_POSTPONE_DAYS} 日未成交, 过期"
-    _expire(data_dir, order, reason, account_id)
+    _expire(root, order, reason, account_id)
 
 
-def day_fill_events(data_dir: Path, day: str, account_id: str = DEFAULT_ACCOUNT_ID) -> list[dict]:
-    """指定交易日的全部成交 → 推送事件。
+def day_fill_events(day: str, account_id: str = DEFAULT_ACCOUNT_ID, user_root: Path | None = None) -> list[dict]:
+    """**本账户**指定交易日的全部成交 → 推送事件。
 
     盘后结算路径 (daily_pipeline paper_settle) 用它把结算成交留痕到告警中心;
     盘中即时成交走 evaluate_intraday 返回值, 不经过本函数。
     """
     return [
         _fill_event(f, account_id)
-        for f in load_fills(data_dir, account_id)
+        for f in load_fills(account_id, user_root=user_root)
         if f.get("date") == day and f.get("kind") == "fill"
     ]
 
@@ -746,25 +783,31 @@ def _fill_event(fill: dict, account_id: str) -> dict:
     }
 
 
-def evaluate_intraday(data_dir: Path, snapshot: dict[str, float], account_id: str = DEFAULT_ACCOUNT_ID) -> list[dict]:
+def evaluate_intraday(
+    data_dir: Path,
+    snapshot: dict[str, float],
+    account_id: str = DEFAULT_ACCOUNT_ID,
+    user_root: Path | None = None,
+) -> list[dict]:
     """盘中钩子: 用最新快照价撮合 pending 即时单。返回本次成交事件列表。
 
     snapshot: {symbol: raw 最新价} (来自 enriched raw_close)。仅处理 market 单;
     调用方 (quote_service) 已保证交易时段。ETF 不在快照内自然顺延。
     事件由调用方广播 (SSE/语音/系统通知/留痕/Webhook), 域模块只产出不投递。
     """
+    root = resolve_user_root(user_root)
     events: list[dict] = []
     with PAPER_LOCK:
         today = cn_today().isoformat()
         pending_orders = sorted(
-            (o for o in load_orders(data_dir, account_id) if o["status"] == "pending" and o["order_type"] == "market"),
+            (o for o in load_orders(account_id, user_root=root) if o["status"] == "pending" and o["order_type"] == "market"),
             key=_order_sort_key,
         )
         for order in pending_orders:
             price = snapshot.get(order["symbol"])
             if price is None or price <= 0:
                 continue  # 无快照顺延
-            fill = _fill_order(data_dir, order, float(price), today, account_id)
+            fill = _fill_order(data_dir, root, order, float(price), today, account_id)
             if fill is not None:
                 events.append(_fill_event(fill, account_id))
     return events
@@ -860,19 +903,25 @@ def _factor_on(data_dir: Path, symbol: str, asset_type: str, day: str) -> float 
 
 
 # ── 盘后结算 ────────────────────────────────────────────
-def settle_day(data_dir: Path, day: str, account_id: str = DEFAULT_ACCOUNT_ID) -> dict:
+def settle_day(
+    data_dir: Path,
+    day: str,
+    account_id: str = DEFAULT_ACCOUNT_ID,
+    user_root: Path | None = None,
+) -> dict:
     """盘后管道阶段: 撮合顺延单 → 除权调整 → 定版净值。幂等 (重跑同日安全)。
 
     撮合顺序: close 单用 raw_close; next_open 单用 raw_open; 仍 pending 的
     market 单 (当日无快照) 也按 raw_close 兜底成交 — 避免停牌外无限顺延。
     """
+    root = resolve_user_root(user_root)
     summary = {"filled": 0, "expired": 0, "corp_actions": 0, "nav": None, "account": account_id}
     with PAPER_LOCK:
-        acc = get_account(data_dir, account_id)
+        acc = get_account(account_id, user_root=root)
         if acc is None:
             return summary
         pending_orders = sorted(
-            (o for o in load_orders(data_dir, account_id) if o["status"] == "pending"),
+            (o for o in load_orders(account_id, user_root=root) if o["status"] == "pending"),
             key=_order_sort_key,
         )
         for order in pending_orders:
@@ -882,24 +931,24 @@ def settle_day(data_dir: Path, day: str, account_id: str = DEFAULT_ACCOUNT_ID) -
                 if order["postponed"] > MAX_POSTPONE_DAYS:
                     order["status"] = "expired"
                     order["reason"] = f"连续 {MAX_POSTPONE_DAYS} 个交易日无行情, 自动过期"
-                    save_order(data_dir, order, account_id)
+                    save_order(order, account_id, user_root=root)
                     summary["expired"] += 1
                 else:
-                    save_order(data_dir, order, account_id)
+                    save_order(order, account_id, user_root=root)
                 continue
             # next_open 用开盘价; close 与 market 兜底用收盘价
             raw = bar["open"] if order["order_type"] == "next_open" else bar["close"]
             before = order["status"]
-            if _fill_order(data_dir, order, raw, day, account_id) is not None:
+            if _fill_order(data_dir, root, order, raw, day, account_id) is not None:
                 summary["filled"] += 1
             elif before == "pending" and order["status"] == "expired":
                 summary["expired"] += 1
 
         # 除权调整 (仅持仓标的; 幂等: 同一 symbol 同日只应用一次 — 重跑结算不二次乘因子)
-        positions = load_positions(data_dir, account_id)
+        positions = load_positions(account_id, user_root=root)
         applied = {
             (f["symbol"], f["date"])
-            for f in load_fills(data_dir, account_id)
+            for f in load_fills(account_id, user_root=root)
             if f.get("kind") == "corp_action"
         }
         for symbol, pos in positions.items():
@@ -909,7 +958,7 @@ def settle_day(data_dir: Path, day: str, account_id: str = DEFAULT_ACCOUNT_ID) -
             if factor is None or factor == 1.0 or (symbol, day) in applied:
                 continue
             before_qty, before_cost = pos["qty"], pos["avg_cost"]
-            _append_fill(data_dir, {
+            _append_fill(root, {
                 "seq": int(datetime.now().timestamp() * 1000),
                 "ts": _now_iso(),
                 "date": day,
@@ -924,24 +973,29 @@ def settle_day(data_dir: Path, day: str, account_id: str = DEFAULT_ACCOUNT_ID) -
             }, account_id)
             summary["corp_actions"] += 1
         if summary["corp_actions"]:
-            _materialize(data_dir, account_id)
+            _materialize(root, account_id)
 
         # 定版净值 (幂等: 重写当日行); 顺带记录沪深300 收盘作基准对比
-        nav = daily_nav(data_dir, day, account_id=account_id)
+        nav = daily_nav(data_dir, day, account_id=account_id, user_root=root)
         if nav is not None:
             benchmark = _index_close(data_dir, day)
             if benchmark is not None:
                 nav["benchmark_close"] = benchmark
-            _write_nav_line(data_dir, day, nav, account_id)
+            _write_nav_line(root, day, nav, account_id)
             summary["nav"] = nav
     return summary
 
 
 # ── 净值与总览 ──────────────────────────────────────────
-def latest_prices_from_daily(data_dir: Path, day: str, account_id: str = DEFAULT_ACCOUNT_ID) -> dict[str, float]:
-    """day 收盘后各持仓标的 raw_close (定版用)。"""
+def latest_prices_from_daily(
+    data_dir: Path,
+    day: str,
+    account_id: str = DEFAULT_ACCOUNT_ID,
+    user_root: Path | None = None,
+) -> dict[str, float]:
+    """day 收盘后**本账户**各持仓标的 raw_close (定版用)。"""
     out: dict[str, float] = {}
-    for symbol, pos in load_positions(data_dir, account_id).items():
+    for symbol, pos in load_positions(account_id, user_root=user_root).items():
         if pos["qty"] <= 0:
             continue
         bar = read_daily_bar(data_dir, symbol, pos.get("asset_type", "stock"), day)
@@ -955,13 +1009,19 @@ def daily_nav(
     day: str,
     price_map: dict[str, float] | None = None,
     account_id: str = DEFAULT_ACCOUNT_ID,
+    user_root: Path | None = None,
 ) -> dict | None:
     """某日定版净值 {date, cash, mv, nav}; 缺行情的持仓按成本计 (保守, 留痕调用方)。"""
-    acc = get_account(data_dir, account_id)
+    root = resolve_user_root(user_root)
+    acc = get_account(account_id, user_root=root)
     if acc is None:
         return None
-    positions = load_positions(data_dir, account_id)
-    prices = price_map if price_map is not None else latest_prices_from_daily(data_dir, day, account_id)
+    positions = load_positions(account_id, user_root=root)
+    prices = (
+        price_map
+        if price_map is not None
+        else latest_prices_from_daily(data_dir, day, account_id, user_root=root)
+    )
     missing = [s for s, p in positions.items() if p["qty"] > 0 and s not in prices]
     if missing:
         logger.warning("paper nav %s: 缺行情按成本计: %s", day, missing)
@@ -974,8 +1034,8 @@ def daily_nav(
     return {"date": day, "cash": round(float(acc["cash"]), 2), "mv": round(mv, 2), "nav": round(float(acc["cash"]) + mv, 2)}
 
 
-def _write_nav_line(data_dir: Path, day: str, nav: dict, account_id: str = DEFAULT_ACCOUNT_ID) -> None:
-    p = _nav_dir(data_dir, account_id) / "daily.jsonl"
+def _write_nav_line(root: Path, day: str, nav: dict, account_id: str = DEFAULT_ACCOUNT_ID) -> None:
+    p = _nav_dir(root, account_id) / "daily.jsonl"
     lines: list[str] = []
     if p.exists():
         for line in p.read_text(encoding="utf-8").splitlines():
@@ -989,8 +1049,8 @@ def _write_nav_line(data_dir: Path, day: str, nav: dict, account_id: str = DEFAU
     atomic_write_text(p, "\n".join(lines) + "\n")
 
 
-def load_nav(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> list[dict]:
-    p = _nav_dir(data_dir, account_id) / "daily.jsonl"
+def load_nav(account_id: str = DEFAULT_ACCOUNT_ID, user_root: Path | None = None) -> list[dict]:
+    p = _nav_dir(resolve_user_root(user_root), account_id) / "daily.jsonl"
     if not p.exists():
         return []
     out: list[dict] = []
@@ -1002,12 +1062,17 @@ def load_nav(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> list[dict]
     return out
 
 
-def overview(data_dir: Path, price_map: dict[str, float] | None = None, account_id: str = DEFAULT_ACCOUNT_ID) -> dict:
+def overview(
+    price_map: dict[str, float] | None = None,
+    account_id: str = DEFAULT_ACCOUNT_ID,
+    user_root: Path | None = None,
+) -> dict:
     """总览 (盘中实时估算): 现金 + 持仓市值 + 估算净值。"""
-    acc = get_account(data_dir, account_id)
+    root = resolve_user_root(user_root)
+    acc = get_account(account_id, user_root=root)
     if acc is None:
         return {"initialized": False}
-    positions = load_positions(data_dir, account_id)
+    positions = load_positions(account_id, user_root=root)
     today = cn_today().isoformat()
     holdings = []
     mv = 0.0
@@ -1045,9 +1110,9 @@ def overview(data_dir: Path, price_map: dict[str, float] | None = None, account_
 
 
 # ── 回合统计 (FIFO) ─────────────────────────────────────
-def round_trips(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> list[dict]:
+def round_trips(account_id: str = DEFAULT_ACCOUNT_ID, user_root: Path | None = None) -> list[dict]:
     """FIFO 配对的开→平回合: 入场价含买入费, 出场净额扣卖出费。"""
-    fills = [f for f in load_fills(data_dir, account_id) if f.get("kind", "fill") == "fill"]
+    fills = [f for f in load_fills(account_id, user_root=user_root) if f.get("kind", "fill") == "fill"]
     lots: dict[str, list[dict]] = {}
     rounds: list[dict] = []
     for f in fills:
@@ -1096,14 +1161,14 @@ def max_drawdown(nav_values: list[float]) -> float | None:
     return mdd
 
 
-def stats(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> dict:
+def stats(account_id: str = DEFAULT_ACCOUNT_ID, user_root: Path | None = None) -> dict:
     """回合汇总: 胜率/盈亏比/平均持有天数/已实现盈亏/最大回撤(定版净值)。"""
-    rounds = round_trips(data_dir, account_id)
+    rounds = round_trips(account_id, user_root=user_root)
     wins = [r for r in rounds if r["pnl"] > 0]
     losses = [r for r in rounds if r["pnl"] <= 0]
     avg_win = sum(r["pnl"] for r in wins) / len(wins) if wins else 0.0
     avg_loss = abs(sum(r["pnl"] for r in losses) / len(losses)) if losses else 0.0
-    mdd = max_drawdown([n["nav"] for n in load_nav(data_dir, account_id)])
+    mdd = max_drawdown([n["nav"] for n in load_nav(account_id, user_root=user_root)])
     return {
         "rounds": len(rounds),
         "win_rate": round(len(wins) / len(rounds) * 100, 2) if rounds else 0.0,

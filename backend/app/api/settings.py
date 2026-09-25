@@ -162,7 +162,7 @@ def save_tickflow_key(req: TickflowKeyIn, request: Request) -> dict:
     # ===== 2) 判定为无效 key(连单只日K都拿不到)→ 不存,清除 =====
     if is_invalid_key() or base_tier_name() == "none":
         # 无效 key:清除刚存的,避免乱填被持久化;退回 none 档
-        secrets_store.clear("tickflow_api_key", "tickflow_base_url")
+        secrets_store.clear_deployment("tickflow_api_key", "tickflow_base_url")
         tf_client.reset_clients()
         capset = detect_capabilities(force=True)
         request.app.state.capabilities = capset
@@ -218,7 +218,7 @@ def clear_tickflow_key(request: Request) -> dict:
     同时清除 tickflow_base_url(测速切换的自定义端点),使客户端走 free-api
     服务器取历史日K;档位标签为 None(无档)。
     """
-    secrets_store.clear("tickflow_api_key", "tickflow_base_url")
+    secrets_store.clear_deployment("tickflow_api_key", "tickflow_base_url")
     tf_client.reset_clients()
 
     capset = detect_capabilities(force=True)
@@ -1085,19 +1085,18 @@ def update_realtime_monitor_config(req: RealtimeMonitorConfigIn, request: Reques
     if req.strategy_monitor_ids is not None or req.strategy_monitor_enabled is not None:
         monitor_engine = getattr(request.app.state, "monitor_engine", None)
         strategy_engine = getattr(request.app.state, "strategy_engine", None)
-        data_dir = request.app.state.repo.store.data_dir
         if monitor_engine is not None and strategy_engine is not None:
             from app.strategy import monitor_rules as mr_store
             try:
                 if preferences.get_strategy_monitor_enabled():
                     ids = preferences.get_strategy_monitor_ids()
                     names = {s.id: s.name for s in strategy_engine.list_strategies()}
-                    mr_store.migrate_strategy_monitors(data_dir, ids, names)
+                    mr_store.migrate_strategy_monitors(ids, names)
                 else:
                     # 关闭策略监控: 停用所有策略规则
-                    mr_store.migrate_strategy_monitors(data_dir, [], {})
+                    mr_store.migrate_strategy_monitors([], {})
                 # reload 规则到引擎
-                monitor_engine.set_rules(mr_store.load_all(data_dir))
+                monitor_engine.set_rules(mr_store.load_all())
             except Exception:
                 pass
 

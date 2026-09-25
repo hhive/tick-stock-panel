@@ -158,7 +158,7 @@ async def test_get_watchlist_merges_etf_and_index_prices(monkeypatch: pytest.Mon
 async def test_get_lots_merges_etf_price(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     from app.strategy import lots as lots_module
 
-    def fake_load_all(data_dir) -> list[dict[str, Any]]:
+    def fake_load_all(user_root=None) -> list[dict[str, Any]]:
         return [{"symbol": "510300.SH", "qty": 1000, "cost_price": 3.95, "buy_date": "2026-09-01"}]
 
     monkeypatch.setattr(lots_module, "load_all", fake_load_all)

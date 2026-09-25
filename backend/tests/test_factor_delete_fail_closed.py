@@ -19,6 +19,22 @@ from app.api.factors import router
 FACTOR_ID = "uf_orphan_delete_guard"
 
 
+@pytest.fixture(autouse=True)
+def _user_ctx(tmp_path, monkeypatch):
+    """每用户存储 (密钥/报告/因子/模拟盘…) 没有共享回退, 需要账户上下文。
+
+    真实请求由认证中间件注入 user_root; 这里的裸 app 没有中间件, 因此显式设置
+    上下文 —— tmp_path 既是本用例的共享数据目录, 也是该账户的根目录。
+    """
+    from app import config as app_config
+    from app.services import preferences
+
+    monkeypatch.setattr(app_config.settings, "data_dir", tmp_path)
+    token = preferences.set_current_user_root(tmp_path)
+    yield tmp_path
+    preferences.reset_current_user_root(token)
+
+
 @pytest.fixture()
 def env(tmp_path):
     """磁盘上有一个未注册的自定义因子, 且被一个策略引用。"""

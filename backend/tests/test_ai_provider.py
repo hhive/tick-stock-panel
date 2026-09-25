@@ -18,6 +18,22 @@ from app.services.ai_provider import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _user_ctx(tmp_path, monkeypatch):
+    """凭据按账户分家: 每用户存储没有共享回退, 需要账户上下文。
+
+    真实请求由认证中间件注入 user_root; 这里是进程内单测, 显式设为 tmp_path,
+    凭据文件落在空目录 (等效于「未配置」), 与旧行为一致且不再依赖真实 data/。
+    """
+    from app import config as app_config
+    from app.services import preferences
+
+    monkeypatch.setattr(app_config.settings, "data_dir", tmp_path)
+    token = preferences.set_current_user_root(tmp_path)
+    yield tmp_path
+    preferences.reset_current_user_root(token)
+
+
 def test_normalize_openai_base_url_adds_v1_for_root_gateway():
     assert normalize_openai_base_url("http://ai.zedbox.cn:8080") == "http://ai.zedbox.cn:8080/v1"
 
@@ -240,7 +256,7 @@ def test_is_temperature_rejected_false_for_non_400():
 
 def test_openai_kwargs_include_configured_reasoning_effort(monkeypatch):
     stored = {"ai_provider": "openai_compat"}
-    monkeypatch.setattr(secrets_store, "load", lambda: stored)
+    monkeypatch.setattr(secrets_store, "load", lambda *a, **k: stored)
 
     assert "reasoning_effort" not in ai_provider._openai_kwargs(temperature=None, max_tokens=1000)
 
@@ -288,16 +304,16 @@ def test_ai_settings_keep_provider_models_separate(monkeypatch):
         "ai_model": "custom-api-model",
     }
 
-    def save(updates: dict) -> dict:
+    def save(updates: dict, *args, **kwargs) -> dict:
         stored.update(updates)
         return stored
 
-    def clear(*keys: str) -> dict:
+    def clear(*keys: str, **kwargs) -> dict:
         for key in keys:
             stored.pop(key, None)
         return stored
 
-    monkeypatch.setattr(secrets_store, "load", lambda: stored)
+    monkeypatch.setattr(secrets_store, "load", lambda *a, **k: stored)
     monkeypatch.setattr(secrets_store, "save", save)
     monkeypatch.setattr(secrets_store, "clear", clear)
     monkeypatch.setattr(ai_provider, "ai_configured", lambda provider=None: True)
@@ -431,8 +447,8 @@ def test_save_ai_settings_persists_token_sizes(monkeypatch):
     from app.config import settings as app_settings
 
     saved: dict = {}
-    monkeypatch.setattr(settings_api.secrets_store, "save", lambda updates: saved.update(updates))
-    monkeypatch.setattr(settings_api.secrets_store, "load", lambda: saved)
+    monkeypatch.setattr(settings_api.secrets_store, "save", lambda updates, *a, **k: saved.update(updates))
+    monkeypatch.setattr(settings_api.secrets_store, "load", lambda *a, **k: saved)
     original_output = app_settings.ai_max_output_tokens
     original_window = app_settings.ai_context_window
     try:

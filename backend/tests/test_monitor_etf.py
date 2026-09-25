@@ -140,12 +140,18 @@ def test_reconcile_asset_type_resolve_error_keeps_stock():
     assert _reconcile_index_asset_type(rule, _Boom())["asset_type"] == "stock"
 
 
-def test_api_save_persists_reconciled_etf_asset_type(tmp_path):
+def test_api_save_persists_reconciled_etf_asset_type(tmp_path, request):
     """点位提醒 POST 默认 asset_type=stock: 保存后磁盘与返回值都是 etf。"""
     from types import SimpleNamespace
     from unittest.mock import MagicMock
 
     from app.api import monitor_rules as monitor_rules_api
+    from app.services import preferences
+
+    # 规则按账户存储: 注入账户根目录 (真实请求由认证中间件注入同一 contextvar);
+    # 用 finalizer 复位, 否则 contextvar 会泄漏到同模块后续用例。
+    token = preferences.set_current_user_root(tmp_path)
+    request.addfinalizer(lambda: preferences.reset_current_user_root(token))
 
     repo = MagicMock()
     repo.store.data_dir = tmp_path
@@ -160,5 +166,5 @@ def test_api_save_persists_reconciled_etf_asset_type(tmp_path):
     )
     resp = monitor_rules_api.save_rule(model, req)
     assert resp["rule"]["asset_type"] == "etf"
-    saved = monitor_rules.load_one(tmp_path, "etf_px")
+    saved = monitor_rules.load_one("etf_px")
     assert saved["asset_type"] == "etf"

@@ -110,11 +110,13 @@ async def _application_lifespan(app: FastAPI):
     repo = KlineRepository(store)
     app.state.datastore = store
     app.state.repo = repo
-    # 自定义/复合因子载入注册表 (P3); 单个失败只跳过该因子 (fail-隔离)
+    # 自定义/复合因子载入注册表 (P3); 单个失败只跳过该因子 (fail-隔离)。
+    # 因子已按账户存放, 启动期没有账户上下文 —— **不回退**到共享目录 (那会把某个
+    # 账户的因子读成所有人的), 这里只留痕; 每账户扇出补齐后再显式传 user_root。
     from app.factors.store import load_into_registry
 
     try:
-        loaded_factors = load_into_registry(store.data_dir)
+        loaded_factors = load_into_registry()
         if loaded_factors:
             logger.info("custom factors loaded: %s", len(loaded_factors))
     except Exception as exc:  # noqa: BLE001
@@ -263,7 +265,8 @@ async def _application_lifespan(app: FastAPI):
     ]
     strategy_engine = StrategyEngine(
         strategy_dirs=strategy_dirs,
-        override_loader=lambda sid: strategy_config.load_override(store.data_dir, sid),
+        # TODO(multiuser): 引擎启动加载仍用共享 data_dir, 需改为按账户扇出 (S3)。
+        override_loader=lambda sid: strategy_config.load_override(sid, user_root=store.data_dir),
     )
     app.state.strategy_engine = strategy_engine
     logger.info("strategy engine loaded: %d strategies", len(strategy_engine.list_strategies()))

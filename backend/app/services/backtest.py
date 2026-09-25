@@ -9,14 +9,15 @@ import math
 import uuid
 from dataclasses import dataclass, field
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Literal
 
 import numpy as np
 import pandas as pd
 import polars as pl
 
-from app.config import settings
 from app.parquet import scan_enriched_parquet
+from app.services.user_paths import resolve_user_root
 from app.tickflow.repository import KlineRepository
 
 logger = logging.getLogger(__name__)
@@ -149,8 +150,12 @@ def _build_max_hold_exits(entries: pd.DataFrame, max_hold_days: int) -> pd.DataF
 
 
 class BacktestService:
-    def __init__(self, repo: KlineRepository) -> None:
+    def __init__(self, repo: KlineRepository, user_root: Path | None = None) -> None:
         self.repo = repo
+        # 回测结果落盘到该账户私有目录; None 表示延迟到写入时按请求上下文解析
+        # (构造点通常已在请求里, 但显式传更稳: 结果可能在队列/工作线程里才落盘,
+        # 那时 contextvar 已经丢了)。
+        self._user_root = user_root
 
     def _load_panel(
         self,
@@ -393,7 +398,8 @@ class BacktestService:
         return result
 
     def _persist(self, result: BacktestResult) -> None:
-        out_dir = settings.data_dir / "backtest_results"
+        # 结果按账户分家: 回测用到的行情是共享的, 但 run_id 结果文件属于发起人。
+        out_dir = resolve_user_root(self._user_root) / "backtest_results"
         out_dir.mkdir(parents=True, exist_ok=True)
         # 用 polars 写一份汇总
         summary = pl.DataFrame({

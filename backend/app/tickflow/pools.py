@@ -4,6 +4,12 @@ Phase 1 实现:
   - 常用指数成份(沪深 300 / 中证 500 / 上证 50)用 TickFlow `quote.pool` 端点拉取并缓存
   - 全 A 通过 instruments.batch 获取
   - 自选池 = 用户的 watchlist
+
+归属: 除 ``watchlist`` 外, 所有池都是**共享**行情构件 —— 同一份指数成份/全 A 名单
+对每个账户都一样, 缓存文件仍在 ``settings.data_dir/pools/`` 下, 且**不需要**账户上下文。
+唯独 ``pool_id == "watchlist"`` 是每账户私有数据(读的是该账户的自选),
+必须按 ``user_root`` 解析 (请求路径走 contextvar, 后台线程显式传参), 见
+``_load_watchlist``。
 """
 from __future__ import annotations
 
@@ -15,6 +21,7 @@ from typing import Literal
 import polars as pl
 
 from app.config import settings
+from app.services.user_paths import resolve_user_root
 from app.tickflow.client import get_client
 
 logger = logging.getLogger(__name__)
@@ -52,10 +59,16 @@ def _pool_cache_path(pool_id: str) -> Path:
     return settings.data_dir / "pools" / f"{pool_id}.parquet"
 
 
-def get_pool(pool_id: PoolId, refresh: bool = False) -> list[str]:
-    """返回标的池里的 symbol 列表。"""
+def get_pool(
+    pool_id: PoolId, refresh: bool = False, user_root: Path | None = None,
+) -> list[str]:
+    """返回标的池里的 symbol 列表。
+
+    ``user_root`` 仅对每账户私有的 ``"watchlist"`` 池有意义; 其余池是共享行情构件,
+    读取它们**不会**解析账户根目录 —— 后台调度器拉指数成份/全 A 时无需账户上下文。
+    """
     if pool_id == "watchlist":
-        return _load_watchlist()
+        return _load_watchlist(user_root)
 
     cache = _pool_cache_path(pool_id)
     if cache.exists() and not refresh:
@@ -135,9 +148,14 @@ def _fetch_pool(pool_id: PoolId) -> list[str]:
     return []
 
 
-def _load_watchlist() -> list[str]:
-    """读取用户自选(由 watchlist service 维护)。"""
-    path = settings.data_dir / "user_data" / "watchlist.parquet"
+def _load_watchlist(user_root: Path | None = None) -> list[str]:
+    """读取**当前账户**的自选(由 watchlist service 维护)。
+
+    这里直接读文件而不调 watchlist service: 池解析只关心 symbol 列, 不校验分组,
+    也不希望首次读池就创建目录骨架。路径口径与 ``watchlist._path`` 保持一致
+    (``<user_root>/user_data/watchlist.parquet``)。
+    """
+    path = resolve_user_root(user_root) / "user_data" / "watchlist.parquet"
     if not path.exists():
         return []
     df = pl.read_parquet(path)

@@ -37,6 +37,7 @@ from app.market_time import CN_TZ, cn_now, cn_today
 from app.parquet import scan_daily_parquet
 from app.polars_guard import guarded_collect
 from app.services.index_const import CORE_INDEX_SYMBOLS
+from app.services.user_paths import MissingUserContextError
 from app.strategy.intraday_signals import IntradaySignalEvaluator
 from app.strategy.monitor import format_alert_quote
 
@@ -70,6 +71,20 @@ def _body_with_quote(body: str, ev: dict) -> str:
     return f"{body} · {quote_tail}"
 
 logger = logging.getLogger(__name__)
+
+# 模拟盘钩子在无账户上下文时只告警一次 —— 行情轮询是高频循环, 每轮告警会淹掉日志
+_paper_scope_warned = False
+
+
+def _warn_paper_scope_once() -> None:
+    """后台线程没有账户上下文时提示一次: 模拟盘盘中撮合/自动跟单暂不执行 (待每账户扇出)。"""
+    global _paper_scope_warned
+    if not _paper_scope_warned:
+        _paper_scope_warned = True
+        logger.warning(
+            "模拟盘盘中钩子跳过: 后台线程无账户上下文, 待每账户扇出 (S3); "
+            "此前会读写共享目录, 现已 fail-closed。"
+        )
 
 # Webhook(飞书等)投递专用线程池 —— 与行情轮询线程隔离。
 # send_feishu 内置重试(最坏 ~3×5s 超时 + 退避), 若在 _poll_loop 上同步投递,
@@ -1334,11 +1349,21 @@ class QuoteService:
                         strict=False,
                     ))
                     paper_events: list[dict] = []
-                    for acc_id in paper_trading.list_account_ids(data_dir):
+                    # 账户数据按面板账户分家 (data/users/<面板账户>/paper/...): 本线程
+                    # 是**后台线程**, 没有请求上下文, 必须按账户扇出并显式传 user_root=。
+                    # 扇出落地前这里拿不到账户 → 跳过并留痕一次 (每轮都告警会刷屏);
+                    # 刻意不传 data_dir 充数: 那等于把共享目录当账户目录读写, 会把
+                    # 账户 A 的订单当成人人可见的数据。
+                    try:
+                        account_ids = paper_trading.list_account_ids()
+                    except MissingUserContextError:
+                        _warn_paper_scope_once()
+                        account_ids = []
+                    for acc_id in account_ids:
                         paper_events.extend(
                             paper_trading.evaluate_intraday(data_dir, snapshot, account_id=acc_id))
                         if rule_events:
-                            created = paper_auto.on_rule_events(data_dir, rule_events, account_id=acc_id)
+                            created = paper_auto.on_rule_events(rule_events, account_id=acc_id)
                             paper_events.extend(paper_auto.auto_order_events(created, account_id=acc_id))
                     # 成交/自动跟单下单推送 (V3): 复用监控中心既有管道 —— SSE toast /
                     # 语音 (前端按 source 拼文案) / 系统通知 / alert_store 留痕 /

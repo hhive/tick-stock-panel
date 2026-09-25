@@ -18,9 +18,16 @@ CN_TZ = timezone(timedelta(hours=8))
 
 @pytest.fixture
 def store(tmp_path, monkeypatch):
-    s = JsonReportStore("ai_reports.json", 20, id_prefix="rpt")
-    monkeypatch.setattr(s, "_path", lambda: tmp_path / "ai_reports.json")
-    return s
+    from app import config as app_config
+    from app.services import preferences
+
+    monkeypatch.setattr(app_config.settings, "data_dir", tmp_path)
+    # 每用户存储没有共享回退, 需要账户上下文 (真实请求由认证中间件注入)
+    token = preferences.set_current_user_root(tmp_path)
+    try:
+        yield JsonReportStore("ai_reports.json", 20, id_prefix="rpt")
+    finally:
+        preferences.reset_current_user_root(token)
 
 
 def test_created_at_follows_beijing_clock(store):

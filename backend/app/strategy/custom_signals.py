@@ -1,11 +1,16 @@
 """自定义信号 — 用户用「字段 + 运算符 + 值」组合出的布尔信号。
 
 职责:
-  - 从 data/user_data/custom_signals/*.json 加载信号定义
+  - 从 ``<user_root>/user_data/custom_signals/*.json`` 加载信号定义 (**每账户一份**)
   - 把每个信号的 conditions 编译成一条 Polars 布尔表达式（AND 组合）
   - 供 pipeline 在 compute_signals / compute_enriched_today 末尾注入为列
 
 不知道: 引擎、AI、API、回测、监控。纯函数 + 模块级缓存。
+
+账户隔离: user_root 由 ``user_paths.resolve_user_root()`` 解析 (请求路径走认证中间件
+注入的 contextvar, 后台线程必须显式传 ``user_root=``)。本模块的两处指纹缓存
+(``_intraday_cache`` / ``_names_cache``) 以**解析后的账户根**为键 —— 键跟着账户走,
+A 的信号定义不会被 B 命中。
 
 设计:
   - 信号列名加前缀 ``csg_`` 避免与内置 ``signal_`` 列冲突。
@@ -23,6 +28,7 @@ from pathlib import Path
 import polars as pl
 
 from app.services.fs_utils import atomic_write_text
+from app.services.user_paths import resolve_user_root
 
 logger = logging.getLogger(__name__)
 
@@ -130,19 +136,19 @@ def materialize_factor_columns(
 
 
 # ── 持久化（镜像 strategy/config.py 的写法）──────────────
-def _dir(data_dir: Path) -> Path:
-    d = data_dir / "user_data" / "custom_signals"
+def _dir(user_root: Path | None = None) -> Path:
+    d = resolve_user_root(user_root) / "user_data" / "custom_signals"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
-def _path(data_dir: Path, signal_id: str) -> Path:
-    return _dir(data_dir) / f"{signal_id}.json"
+def _path(user_root: Path | None, signal_id: str) -> Path:
+    return _dir(user_root) / f"{signal_id}.json"
 
 
-def load_all(data_dir: Path) -> list[dict]:
-    """读取全部自定义信号定义。损坏的文件被跳过。"""
-    d = _dir(data_dir)
+def load_all(user_root: Path | None = None) -> list[dict]:
+    """读取**当前账户**全部自定义信号定义。损坏的文件被跳过。"""
+    d = _dir(user_root)
     out: list[dict] = []
     for f in sorted(d.glob("*.json")):
         try:
@@ -152,14 +158,14 @@ def load_all(data_dir: Path) -> list[dict]:
     return out
 
 
-def save_one(data_dir: Path, sig: dict) -> None:
-    p = _path(data_dir, sig["id"])
+def save_one(sig: dict, user_root: Path | None = None) -> None:
+    p = _path(user_root, sig["id"])
     p.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(p, json.dumps(sig, ensure_ascii=False, indent=2))
 
 
-def delete_one(data_dir: Path, signal_id: str) -> bool:
-    p = _path(data_dir, signal_id)
+def delete_one(signal_id: str, user_root: Path | None = None) -> bool:
+    p = _path(user_root, signal_id)
     if p.exists():
         p.unlink()
         return True
@@ -516,22 +522,26 @@ def _dir_fingerprint(d: Path) -> tuple:
         return ()
 
 
-def load_intraday_all(data_dir: Path) -> list[dict]:
-    """读取全部启用的盘中信号定义(带缓存)。
+def load_intraday_all(user_root: Path | None = None) -> list[dict]:
+    """读取**当前账户**全部启用的盘中信号定义(带缓存)。
 
     盘中评估与引擎注入每分钟执行, 不宜每次全量读盘; save/delete 端点
     调用 invalidate_intraday_cache() 主动失效。
+
+    缓存键用**解析后的账户根** —— 不能直接用入参: 走 contextvar 时入参是 None,
+    所有账户会共用同一个键, A 的信号定义就被 B 读到了。
     """
-    d = _dir(data_dir)
+    root = resolve_user_root(user_root)
+    d = _dir(root)
     fp = _dir_fingerprint(d)
-    cached = _intraday_cache.get(data_dir)
+    cached = _intraday_cache.get(root)
     if cached is not None and cached[0] == fp:
         return cached[1]
     sigs = [
-        s for s in load_all(data_dir)
+        s for s in load_all(root)
         if s.get("timeframe") == TIMEFRAME_INTRADAY and s.get("enabled") is not False
     ]
-    _intraday_cache[data_dir] = (fp, sigs)
+    _intraday_cache[root] = (fp, sigs)
     return sigs
 
 
@@ -543,21 +553,23 @@ def invalidate_intraday_cache() -> None:
 _names_cache: dict[Path, tuple[object, dict[str, str]]] = {}
 
 
-def signal_names(data_dir: Path) -> dict[str, str]:
-    """自定义信号列名 (csg_/csgi_) → 用户命名的映射, 带目录指纹缓存。
+def signal_names(user_root: Path | None = None) -> dict[str, str]:
+    """**当前账户**自定义信号列名 (csg_/csgi_) → 用户命名的映射, 带目录指纹缓存。
 
     指纹含文件名 + mtime, 保存/删除信号后自动失效重载, 调用方无需配合失效。
+    缓存键用解析后的账户根, 理由同 ``load_intraday_all``。
     """
-    d = _dir(data_dir)
+    root = resolve_user_root(user_root)
+    d = _dir(root)
     fp = _dir_fingerprint(d)
-    cached = _names_cache.get(data_dir)
+    cached = _names_cache.get(root)
     if cached is not None and cached[0] == fp:
         return cached[1]
     names: dict[str, str] = {}
-    for s in load_all(data_dir):
+    for s in load_all(root):
         sid, name = s.get("id"), s.get("name")
         if sid and name:
             names[column_name(sid)] = name
             names[intraday_column_name(sid)] = name
-    _names_cache[data_dir] = (fp, names)
+    _names_cache[root] = (fp, names)
     return names

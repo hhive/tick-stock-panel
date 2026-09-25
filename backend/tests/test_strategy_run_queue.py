@@ -15,8 +15,8 @@ def test_order_strategy_ids_fast_first_unknown_last():
 
 def test_run_timings_record_merge_and_load(tmp_path):
     assert q.load_run_timings(tmp_path) == {}
-    q.record_run_timings(tmp_path, {"a": 100.0})
-    q.record_run_timings(tmp_path, {"b": 200.0, "a": 50.0})
+    q.record_run_timings({"a": 100.0}, user_root=tmp_path)
+    q.record_run_timings({"b": 200.0, "a": 50.0}, user_root=tmp_path)
     assert q.load_run_timings(tmp_path) == {"a": 50.0, "b": 200.0}
 
 
@@ -25,7 +25,7 @@ def test_run_timings_survives_corrupt_file(tmp_path):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("not json", encoding="utf-8")
     assert q.load_run_timings(tmp_path) == {}
-    q.record_run_timings(tmp_path, {"a": 1.0})
+    q.record_run_timings({"a": 1.0}, user_root=tmp_path)
     assert q.load_run_timings(tmp_path) == {"a": 1.0}
 
 

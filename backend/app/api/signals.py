@@ -15,8 +15,15 @@ from app.strategy.intraday_features import INTRADAY_FEATURES
 router = APIRouter(prefix="/api/custom-signals", tags=["custom-signals"])
 
 
-def _data_dir(request: Request) -> Path:
-    return request.app.state.repo.store.data_dir
+def _user_root(request: Request) -> Path:
+    """**当前账户**私有数据根 (自定义信号定义属于账户资产)。
+
+    解析走 user_paths 的统一接缝 (认证中间件已按账户设好 contextvar);
+    刻意无"回退到共享目录"的分支 —— 那会让 A 的信号出现在 B 的信号集里。
+    """
+    from app.services.user_paths import resolve_user_root
+
+    return resolve_user_root()
 
 
 def _invalidate(request: Request) -> None:
@@ -31,7 +38,7 @@ def _invalidate(request: Request) -> None:
     from app.indicators.pipeline import invalidate_custom_signals
     invalidate_custom_signals()
     from app.services import strategy_cache
-    strategy_cache.clear_cache(_data_dir(request))
+    strategy_cache.clear_cache(_user_root(request))
     repo = request.app.state.repo
     if hasattr(repo, "clear_cache"):
         repo.clear_cache()
@@ -162,7 +169,7 @@ def get_options():
 
 @router.get("")
 def list_signals(request: Request):
-    sigs = custom_signals.load_all(_data_dir(request))
+    sigs = custom_signals.load_all(_user_root(request))
     return {"signals": sigs}
 
 
@@ -176,7 +183,7 @@ def save_signal(req: SignalModel, request: Request):
         custom_signals.validate(sig)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    custom_signals.save_one(_data_dir(request), sig)
+    custom_signals.save_one(sig, user_root=_user_root(request))
     _invalidate(request)
     return {"ok": True, "signal": sig}
 
@@ -223,7 +230,7 @@ async def ai_generate_signal(req: AIGenerateRequest):
 def delete_signal(signal_id: str, request: Request):
     if not custom_signals.ID_RE.match(signal_id):
         raise HTTPException(status_code=400, detail="信号 id 非法")
-    deleted = custom_signals.delete_one(_data_dir(request), signal_id)
+    deleted = custom_signals.delete_one(signal_id, user_root=_user_root(request))
     if not deleted:
         raise HTTPException(status_code=404, detail="信号不存在")
     _invalidate(request)
@@ -263,7 +270,7 @@ def intraday_replay(req: IntradayReplayRequest, request: Request):
 
     # 信号定义必须存在且为盘中类型
     sig = next(
-        (s for s in custom_signals.load_all(_data_dir(request)) if s.get("id") == req.signal_id),
+        (s for s in custom_signals.load_all(_user_root(request)) if s.get("id") == req.signal_id),
         None,
     )
     if sig is None:

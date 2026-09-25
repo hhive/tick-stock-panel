@@ -257,7 +257,7 @@ def test_iterate_full_flow(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         result = asyncio.run(
             AIStrategyIterator(max_rounds=2).iterate(
-                "做一个均线多头策略", engine=engine, data_dir=tmp,
+                "做一个均线多头策略", engine=engine, data_dir=tmp, user_root=tmp,
             )
         )
         draft_id = result["draft_strategy_id"]
@@ -303,7 +303,7 @@ def test_iterate_validation_failure_breaks(monkeypatch):
     engine = _FakeEngine()
     with tempfile.TemporaryDirectory() as tmp:
         result = asyncio.run(
-            AIStrategyIterator(max_rounds=2).iterate("p", engine=engine, data_dir=tmp)
+            AIStrategyIterator(max_rounds=2).iterate("p", engine=engine, data_dir=tmp, user_root=tmp)
         )
     assert len(result["rounds"]) == 1
     assert "校验失败" in result["rounds"][0]["change_summary"]
@@ -324,7 +324,7 @@ def test_iterate_final_backtest_appended(monkeypatch):
     engine = _FakeEngine()
     with tempfile.TemporaryDirectory() as tmp:
         result = asyncio.run(
-            AIStrategyIterator(max_rounds=1).iterate("p", engine=engine, data_dir=tmp)
+            AIStrategyIterator(max_rounds=1).iterate("p", engine=engine, data_dir=tmp, user_root=tmp)
         )
 
     # 1 轮改进 + 1 行最终版回测

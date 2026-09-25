@@ -29,6 +29,8 @@ logger = logging.getLogger(__name__)
 # 迁移后同一份数据按账号分家。新增私有目录时必须同步登记到这里。
 USER_SUBDIRS: tuple[str, ...] = (
     "user_data",
+    "user_data/lots",            # 手数批次 (strategy.lots)
+    "user_data/custom_factors",  # 自定义/复合因子 (factors.store)
     "strategies/custom",
     "strategies/ai",
     "strategies/composite",
@@ -44,6 +46,39 @@ _DECIMAL_RE = re.compile(r"[0-9]+")
 
 class InvalidAccountIdError(ValueError):
     """账号 ID 非法 (非正整数 / 非法十进制字符串)。"""
+
+
+class MissingUserContextError(RuntimeError):
+    """无法解析账户根目录: 既无显式 user_root, 也无请求上下文。
+
+    刻意**不**提供"回退到某个共享目录"的行为。静默回退有两条严重后果, 都比报错更糟:
+      - 写入落到所有人共享的文件 ⇒ A 的改动覆盖 B 的;
+      - 后台读取拿到别人(或默认)的数据 ⇒ 跨用户串号。
+    所以这里 fail-closed: 调用方要么在请求路径上(中间件已设上下文), 要么显式传参。
+    """
+
+
+def resolve_user_root(explicit: Path | None = None) -> Path:
+    """解析**当前账户**的数据根目录。
+
+    这是全部每用户存储的统一接缝。优先级:
+      1. 显式传入的 ``explicit`` —— 后台线程/调度器**必须**用这条;
+      2. 请求上下文(contextvar, 由认证中间件设置);
+      3. 都没有 → 抛 MissingUserContextError。
+
+    第 3 条是刻意的 fail-closed, 理由见 MissingUserContextError 的 docstring。
+    """
+    if explicit is not None:
+        return Path(explicit)
+    from app.services import preferences  # 惰性导入: 避免与本模块形成导入环
+
+    root = preferences.current_user_root()
+    if root is None:
+        raise MissingUserContextError(
+            "无法解析账户根目录: 既未显式传 user_root, 也没有请求上下文。"
+            "后台线程/调度器必须显式传 user_root=。"
+        )
+    return Path(root)
 
 
 def validate_account_id(raw: object) -> int:

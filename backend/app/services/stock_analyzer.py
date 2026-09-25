@@ -361,11 +361,13 @@ async def analyze_stock_stream(
 
         # 虚拟持仓上下文 (V3): 逐账户 (V2 多账户) 收集持有该标的的持仓注入
         # (任何异常静默跳过, 不影响分析)。
+        # 模拟盘持仓按面板账户分家: paper 域自己解析 user_root (本生成器在请求
+        # 上下文内运行, contextvar 可见), 与共享行情目录无关。
         paper_positions: list[dict] = []
         try:
             from app.strategy import paper as paper_trading
-            for acc_id in paper_trading.list_account_ids(data_dir):
-                pos = paper_trading.load_positions(data_dir, account_id=acc_id).get(symbol)
+            for acc_id in paper_trading.list_account_ids():
+                pos = paper_trading.load_positions(account_id=acc_id).get(symbol)
                 if pos and (pos.get("qty") or 0) > 0:
                     paper_positions.append({"account_id": acc_id, **pos})
         except Exception as e:  # noqa: BLE001

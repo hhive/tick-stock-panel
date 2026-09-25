@@ -12,6 +12,21 @@ from app.strategy import monitor_rules
 from app.strategy.engine import StrategyEngine
 
 
+@pytest.fixture(autouse=True)
+def _user_ctx(tmp_path, monkeypatch):
+    """策略/监控规则按账户分家: 测试把账户根目录设为 tmp_path (旧 data_dir 布局)。
+
+    真实请求由认证中间件注入 user_root; 这里手工注入同一 contextvar,
+    否则 delete_strategy 的清理路径会因为拿不到账户根目录而 fail-closed。
+    """
+    from app import config as app_config
+
+    monkeypatch.setattr(app_config.settings, "data_dir", tmp_path)
+    token = preferences.set_current_user_root(tmp_path)
+    yield tmp_path
+    preferences.reset_current_user_root(token)
+
+
 def _strategy_code(strategy_id: str) -> str:
     return f'''import polars as pl
 META = {{
@@ -71,7 +86,7 @@ def test_delete_strategy_is_not_blocked_by_another_broken_file(monkeypatch, tmp_
         "scope": "all",
         "conditions": [],
     })
-    monitor_rules.save_one(tmp_path, rule)
+    monitor_rules.save_one(rule)
 
     preference_updates: list[dict] = []
     monkeypatch.setattr(preferences, "get_strategy_monitor_ids", lambda: ["target", "other"])
@@ -91,7 +106,7 @@ def test_delete_strategy_is_not_blocked_by_another_broken_file(monkeypatch, tmp_
     assert not override_path.exists()
     assert not cache_path.exists()
     assert preference_updates == [{"strategy_monitor_ids": ["other"]}]
-    saved_rule = monitor_rules.load_one(tmp_path, "mr_target")
+    saved_rule = monitor_rules.load_one("mr_target")
     assert saved_rule is not None and saved_rule["enabled"] is False
     assert monitor.invalidations == 1
     assert monitor.rules and monitor.rules[0]["enabled"] is False

@@ -435,10 +435,14 @@ def delete_config(request: Request, config_id: str):
     store = _store(request)
     if not store.delete(config_id):
         raise HTTPException(404, f"配置 '{config_id}' 不存在")
-    # 同步清掉 secrets.json 里残留的拉取 API Key, 避免同名重建配置时误用旧 Key
+    # 同步清掉残留的拉取 API Key, 避免同名重建配置时误用旧 Key。
+    # 必须走**部署级**清除: 该 Key 与 set_pull_api_key 的写入侧(save_deployment)
+    # 同作用域 —— 它是喂共享行情的部署级凭据。用 clear() 会去请求方的每用户
+    # secrets.json 里删(那里根本没有这个键), 部署级文件里的旧 Key 原封不动,
+    # 于是同 id 重建配置会静默复用旧 Key, 正是本行要防的事。
     from app import secrets_store
 
-    secrets_store.clear(ext_api_key_field(config_id))
+    secrets_store.clear_deployment(ext_api_key_field(config_id))
     _refresh_views(request)
     return {"status": "deleted"}
 
@@ -948,9 +952,11 @@ def set_pull_api_key(request: Request, config_id: str, body: ApiKeyReq):
 
     value = body.key.strip()
     if value:
-        secrets_store.save({ext_api_key_field(config_id): value})
+        # 扩展数据配置的 Key 喂的是**共享行情**, 属部署级; 且键名是动态生成的,
+        # 无法用静态 DEPLOYMENT_KEYS 覆盖 → 显式走部署级写入。
+        secrets_store.save_deployment({ext_api_key_field(config_id): value})
     else:
-        secrets_store.clear(ext_api_key_field(config_id))
+        secrets_store.clear_deployment(ext_api_key_field(config_id))
     return {"status": "ok", "key_set": bool(value), "masked_key": secrets_store.mask(value) if value else ""}
 
 

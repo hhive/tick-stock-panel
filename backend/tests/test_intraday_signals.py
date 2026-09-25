@@ -17,6 +17,22 @@ from app.strategy import custom_signals
 from app.strategy.intraday_features import build_feature_frame
 from app.strategy.intraday_signals import IntradaySignalEvaluator, uses_intraday_signals
 
+@pytest.fixture(autouse=True)
+def _current_user_context(tmp_path):
+    """把「当前账户根」设为本次用例的临时目录。
+
+    HTTP handler 通过 user_paths 的统一接缝解析账户私有目录 (真实请求里由认证
+    中间件注入 contextvar); 这里直接调用 handler 或只挂了 router 的 TestClient,
+    必须自己注入, 否则 fail-closed 抛 MissingUserContextError。
+    data_dir 与 user_root 同取 tmp_path: 用例只关心"落到哪个根", 不区分共享/私有。
+    """
+    from app.services import preferences
+
+    token = preferences.set_current_user_root(tmp_path)
+    yield tmp_path
+    preferences.reset_current_user_root(token)
+
+
 SYMBOL = "000001.SZ"
 DAY = date(2026, 9, 4)
 

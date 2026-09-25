@@ -194,12 +194,20 @@ def _worker_entry(task: dict[str, Any], event_queue, cancel_event) -> None:
         # 子进程不继承主进程的因子注册表; 自定义/复合因子 (uf_/cf_) 在任何
         # 涉及因子物化的 worker 任务里都依赖注册表, 启动时从存储加载。
         # 单个加载失败只跳过 (fail-open 跳过该因子), 与主进程启动行为一致。
+        # 因子已按账户存放: 子进程没有请求上下文, 只能由任务载荷显式带 user_root
+        # (make_worker_task)。载荷里没有时**不回退**共享目录 —— 跨账户读取比缺少
+        # 自定义因子严重得多; 上层每账户扇出补齐 user_root 后本路径自动生效。
         from app.factors.store import load_into_registry
+        from app.services.user_paths import MissingUserContextError
 
-        load_into_registry(data_dir)
+        try:
+            load_into_registry(user_root=task.get("user_root"))
+        except MissingUserContextError as exc:
+            logger.warning("worker 任务未带 user_root, 跳过自定义因子注册: %s", exc)
         strategy_engine = StrategyEngine(
             strategy_dirs=_strategy_dirs(data_dir),
-            override_loader=lambda sid: strategy_config.load_override(data_dir, sid),
+            # worker 子进程没有请求上下文: 仍用共享 data_dir, 需改为按账户扇出。
+            override_loader=lambda sid: strategy_config.load_override(sid, user_root=data_dir),
         )
         service = StrategyBacktestService(BacktestEngine(repo), strategy_engine)
 

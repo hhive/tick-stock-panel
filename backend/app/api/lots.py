@@ -65,7 +65,6 @@ def sync_lot(request: Request, lot: dict) -> None:
     """
     from app.services import preferences
 
-    data_dir = _data_dir(request)
     with _write_lock:
         default_channels = preferences.get_webhook_default_channels()
         # ETF/指数等资产类型解析 (止盈止损价格规则须走对应资产监控轮才会触发)
@@ -80,7 +79,7 @@ def sync_lot(request: Request, lot: dict) -> None:
             rule["asset_type"] = asset_type
             rule.setdefault("webhook_channels", list(default_channels))
             # 保留旧 created_at, 避免编辑批次后派生规则在监控中心列表跳位
-            existing = monitor_rules.load_one(data_dir, rid)
+            existing = monitor_rules.load_one(rid)
             if existing and existing.get("created_at"):
                 rule["created_at"] = existing["created_at"]
             try:
@@ -88,17 +87,17 @@ def sync_lot(request: Request, lot: dict) -> None:
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e)) from e
             rules_to_write.append(monitor_rules.normalize(rule))
-        lots_domain.save_one(data_dir, lot)
+        lots_domain.save_one(lot)
         for rid in rules_to_delete:
-            monitor_rules.delete_one(data_dir, rid)
+            monitor_rules.delete_one(rid)
         for rule in rules_to_write:
-            monitor_rules.save_one(data_dir, rule)
+            monitor_rules.save_one(rule)
     _reload_engine(request)
 
 
 @router.get("")
 def list_lots(request: Request):
-    return {"lots": lots_domain.load_all(_data_dir(request))}
+    return {"lots": lots_domain.load_all()}
 
 
 @router.post("")
@@ -120,12 +119,11 @@ def upsert_lot(lot_in: LotModel, request: Request):
 def delete_lot(lot_id: str, request: Request):
     if not monitor_rules.ID_RE.match(lot_id):
         raise HTTPException(status_code=400, detail="批次 id 非法")
-    data_dir = _data_dir(request)
     with _write_lock:
-        deleted = lots_domain.delete_one(data_dir, lot_id)
+        deleted = lots_domain.delete_one(lot_id)
         # 两条派生规则都要删 (用 or 会短路跳过第二条)
-        deleted_p = monitor_rules.delete_one(data_dir, f"{lot_id}_p")
-        deleted_d = monitor_rules.delete_one(data_dir, f"{lot_id}_d")
+        deleted_p = monitor_rules.delete_one(f"{lot_id}_p")
+        deleted_d = monitor_rules.delete_one(f"{lot_id}_d")
     if deleted or deleted_p or deleted_d:
         _reload_engine(request)
     return {"ok": True}

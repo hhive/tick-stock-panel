@@ -11,6 +11,21 @@ from app.config import settings
 from app.services import watchlist
 
 
+@pytest.fixture(autouse=True)
+def _user_ctx(tmp_path, monkeypatch):
+    """自选按账户分家: 测试把账户根目录设为 tmp_path (等价于旧的 data_dir 布局)。
+
+    自选/分组存储没有共享回退, 拿不到账户根目录就 fail-closed; 真实请求由认证
+    中间件注入该 contextvar, 这里手工注入同一路。
+    """
+    from app.services import preferences
+
+    monkeypatch.setattr(settings, "data_dir", tmp_path)
+    token = preferences.set_current_user_root(tmp_path)
+    yield tmp_path
+    preferences.reset_current_user_root(token)
+
+
 def _request():
     repo = MagicMock()
     repo.get_name_map.return_value = {}

@@ -22,6 +22,7 @@ from app.backtest.candidates import CandidateStore
 from app.backtest.factor import FACTOR_COLUMNS
 from app.backtest.mining import compute_candidate_signature, evaluate_candidate_gate
 from app.services.mining_jobs import SUCCESS_RUN_STATUSES, MiningRunStore
+from app.services.user_paths import resolve_user_root
 from app.strategy.ai_generator import AIStrategyGenerator
 from app.strategy.engine import StrategyEngine
 
@@ -61,7 +62,7 @@ _LOCK = threading.RLock()
 class MiningCandidateService:
     def __init__(
         self,
-        data_dir: Path | str,
+        user_root: Path | str | None,
         run_store: MiningRunStore,
         candidate_store: CandidateStore,
         strategy_engine: StrategyEngine,
@@ -69,7 +70,11 @@ class MiningCandidateService:
         strategy_cache_invalidator: Callable[[Path], None] | None = None,
         monitor_state_invalidator: Callable[[], None] | None = None,
     ) -> None:
-        self.data_dir = Path(data_dir).resolve()
+        # user_root 是该账户私有数据根 (策略源码目录 / 策略缓存 / 候选池) —— 本类
+        # 不需要共享行情根: 运行产物与工件一律经 run_store 读取 (它自己绑定账户)。
+        # 传 None 时按请求上下文解析 (fail-closed: 解析不到就报错, 不回退共享目录)。
+        explicit = Path(user_root) if user_root is not None else None
+        self.user_root = resolve_user_root(explicit).resolve()
         self.run_store = run_store
         self.candidate_store = candidate_store
         self.strategy_engine = strategy_engine
@@ -160,7 +165,7 @@ class MiningCandidateService:
                 asset_type,
             )
             try:
-                self._strategy_cache_invalidator(self.data_dir)
+                self._strategy_cache_invalidator(self.user_root)
                 if self._monitor_state_invalidator is not None:
                     self._monitor_state_invalidator()
             except Exception as exc:
@@ -538,13 +543,13 @@ class MiningCandidateService:
             raise ValueError("candidate publication backlink is inconsistent")
 
     def _custom_strategy_path(self, strategy_id: str) -> Path:
-        unresolved_root = self.data_dir / "strategies" / "custom"
+        unresolved_root = self.user_root / "strategies" / "custom"
         unresolved_root.mkdir(parents=True, exist_ok=True)
         if unresolved_root.is_symlink():
             raise ValueError("custom strategy directory must not be a symlink")
         root = unresolved_root.resolve()
-        if not root.is_relative_to(self.data_dir):
-            raise ValueError("custom strategy directory escapes data_dir")
+        if not root.is_relative_to(self.user_root):
+            raise ValueError("custom strategy directory escapes user_root")
         path = (root / f"{strategy_id}.py").resolve(strict=False)
         if path.parent != root:
             raise ValueError("strategy publication path escapes custom directory")

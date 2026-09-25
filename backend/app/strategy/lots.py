@@ -13,6 +13,7 @@ from datetime import date as _date
 from pathlib import Path
 
 from app.services.fs_utils import atomic_write_text
+from app.services.user_paths import resolve_user_root
 from app.strategy import monitor_rules
 from app.strategy.monitor import MonitorRuleEngine  # 复用条件文本拼装 (静态方法)
 
@@ -23,14 +24,14 @@ _ID = monitor_rules.ID_RE
 _MAX_ID_LEN = 40 - 2  # 派生规则 id 后缀 "_p" / "_d"
 
 
-def _dir(data_dir: Path) -> Path:
-    d = data_dir / "user_data" / "lots"
+def _dir(user_root: Path | None = None) -> Path:
+    d = resolve_user_root(user_root) / "user_data" / "lots"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
-def _path(data_dir: Path, lot_id: str) -> Path:
-    return _dir(data_dir) / f"{lot_id}.json"
+def _path(user_root: Path | None, lot_id: str) -> Path:
+    return _dir(user_root) / f"{lot_id}.json"
 
 
 def _now_iso() -> str:
@@ -84,10 +85,10 @@ def normalize_lot(lot: dict) -> dict:
 
 
 # ── 持久化 ─────────────────────────────────────────────
-def load_all(data_dir: Path) -> list[dict]:
-    """读取全部批次。损坏的文件被跳过。"""
+def load_all(user_root: Path | None = None) -> list[dict]:
+    """读取**当前账户**的全部批次。损坏的文件被跳过。"""
     out: list[dict] = []
-    for f in sorted(_dir(data_dir).glob("lot_*.json")):
+    for f in sorted(_dir(user_root).glob("lot_*.json")):
         try:
             out.append(normalize_lot(json.loads(f.read_text(encoding="utf-8"))))
         except Exception as e:
@@ -95,14 +96,14 @@ def load_all(data_dir: Path) -> list[dict]:
     return out
 
 
-def save_one(data_dir: Path, lot: dict) -> None:
-    p = _path(data_dir, lot["id"])
+def save_one(lot: dict, user_root: Path | None = None) -> None:
+    p = _path(user_root, lot["id"])
     p.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(p, json.dumps(lot, ensure_ascii=False, indent=2))
 
 
-def delete_one(data_dir: Path, lot_id: str) -> bool:
-    p = _path(data_dir, lot_id)
+def delete_one(lot_id: str, user_root: Path | None = None) -> bool:
+    p = _path(user_root, lot_id)
     if p.exists():
         p.unlink()
         return True

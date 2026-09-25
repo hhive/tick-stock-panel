@@ -18,6 +18,21 @@ from app.strategy import monitor_rules
 from app.strategy.monitor import MonitorRuleEngine
 
 
+@pytest.fixture(autouse=True)
+def _user_ctx(tmp_path, monkeypatch):
+    """自选/监控规则按账户分家: 测试把账户根目录设为 tmp_path (旧 data_dir 布局)。
+
+    真实请求由认证中间件注入 contextvar, 这里手工注入同一路; 没有它存储会
+    fail-closed 而不是回退到共享目录。
+    """
+    from app.services import preferences
+
+    monkeypatch.setattr(settings, "data_dir", tmp_path)
+    token = preferences.set_current_user_root(tmp_path)
+    yield tmp_path
+    preferences.reset_current_user_root(token)
+
+
 def _group_rule(rid="r_grp", group_id="g1", **overrides):
     rule = {
         "id": rid, "name": rid, "type": "signal", "asset_type": "stock",

@@ -12,6 +12,22 @@ from app.api.strategy import (
 )
 from app.strategy.engine import StrategyEngine
 
+@pytest.fixture(autouse=True)
+def _current_user_context(tmp_path):
+    """把「当前账户根」设为本次用例的临时目录。
+
+    HTTP handler 通过 user_paths 的统一接缝解析账户私有目录 (真实请求里由认证
+    中间件注入 contextvar); 这里直接调用 handler 或只挂了 router 的 TestClient,
+    必须自己注入, 否则 fail-closed 抛 MissingUserContextError。
+    data_dir 与 user_root 同取 tmp_path: 用例只关心"落到哪个根", 不区分共享/私有。
+    """
+    from app.services import preferences
+
+    token = preferences.set_current_user_root(tmp_path)
+    yield tmp_path
+    preferences.reset_current_user_root(token)
+
+
 
 def _code(strategy_id: str, name: str = "测试策略") -> str:
     return f'''"""测试策略"""
@@ -166,7 +182,7 @@ def test_save_strategy_code_ok_when_custom_signal_defined(tmp_path):
     """信号已定义时, 引用它的策略可以正常保存。"""
     from app.strategy import custom_signals
 
-    custom_signals.save_one(tmp_path, {
+    custom_signals.save_one({
         "id": "oversold_macd_about_to_golden",
         "name": "超跌接近金叉",
         "kind": "entry",
@@ -175,7 +191,7 @@ def test_save_strategy_code_ok_when_custom_signal_defined(tmp_path):
              "leftDays": 0, "rightDays": 0},
         ],
         "enabled": True,
-    })
+    }, user_root=tmp_path)
     request = _request(tmp_path)
     code = _code("custom_with_sig") + (
         '\nREQUIRED_FEATURES = {"csg_oversold_macd_about_to_golden"}\n'

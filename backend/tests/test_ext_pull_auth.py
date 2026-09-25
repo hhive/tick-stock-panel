@@ -39,6 +39,19 @@ def _auth_config(auth: dict | None, **pull_kwargs) -> ExtConfig:
     )
 
 
+@pytest.fixture(autouse=True)
+def _creds_in_tmp(tmp_path, monkeypatch):
+    """拉取 Key 是**部署级**凭据: 落在 ``<data_dir>/deployment_secrets.json``。
+
+    data_dir 必须重定向到 tmp_path: 否则任何未被 monkeypatch 覆盖的写路径都会把
+    测试用的假 Key 写进仓库真实数据目录, 并被同目录其它测试读回。账户上下文不参与
+    —— 该 Key 喂共享行情, 取数路径没有账户上下文。
+    """
+    from app import config as app_config
+
+    monkeypatch.setattr(app_config.settings, "data_dir", tmp_path)
+
+
 # ---------------------------------------------------------------------------
 # PullConfig.auth 序列化
 # ---------------------------------------------------------------------------
@@ -60,7 +73,10 @@ def test_pull_config_without_auth_field_reads_as_none() -> None:
 # ---------------------------------------------------------------------------
 
 def _seed_key(monkeypatch, key: str) -> None:
-    monkeypatch.setattr("app.secrets_store.load", lambda: {ext_api_key_field("demo"): key})
+    """预置 demo 数据源的拉取 Key (部署级凭据文件), 并断掉环境变量兜底。"""
+    monkeypatch.setattr(
+        "app.secrets_store.load_deployment", lambda *a, **k: {ext_api_key_field("demo"): key}
+    )
     monkeypatch.delenv("EXT_DEMO_API_KEY", raising=False)
 
 
@@ -170,12 +186,17 @@ def _make_config(tmp_path) -> ExtConfigStore:
 def test_api_key_set_get_and_clear(monkeypatch, tmp_path) -> None:
     _make_config(tmp_path)
     req = _request(tmp_path)
+    monkeypatch.delenv("EXT_DEMO_API_KEY", raising=False)
+    # 假扮部署级凭据文件: 写入/读取/清除都落在这一个 dict 上
     written: dict = {}
-    monkeypatch.setattr("app.secrets_store.save", lambda updates: written.update(updates) or updates)
-    monkeypatch.setattr("app.secrets_store.load", lambda: written)
     monkeypatch.setattr(
-        "app.secrets_store.clear",
-        lambda *keys: [written.pop(k, None) for k in keys] or {},
+        "app.secrets_store.save_deployment",
+        lambda updates, *a, **k: written.update(updates) or dict(written),
+    )
+    monkeypatch.setattr("app.secrets_store.load_deployment", lambda *a, **k: dict(written))
+    monkeypatch.setattr(
+        "app.secrets_store.clear_deployment",
+        lambda *keys, **kwargs: [written.pop(k, None) for k in keys] or {},
     )
 
     result = set_pull_api_key(req, "demo", ApiKeyReq(key="sk-12345678"))
@@ -223,19 +244,31 @@ def test_configure_pull_omitted_auth_preserves_existing(monkeypatch, tmp_path) -
 
 
 def test_delete_config_clears_residual_key(monkeypatch, tmp_path) -> None:
+    """删除配置必须真清掉**部署级**的拉取 Key, 否则同 id 重建会静默复用旧 Key。
+
+    这条测试原先把 secrets_store.clear 换成替身、再断言它的入参形状 —— 于是
+    **无论生产代码清的是哪个文件, 它都通过**, 并因此掩盖了一个真实缺陷:
+    清除走的是每用户 clear()(该键根本不在那里), 部署级文件里的 Key 原封不动。
+
+    现在改为断言**真实文件状态**: 写入 → 删除 → 该键必须消失。
+    """
+    from app import secrets_store
     from app.api.ext_data import delete_config
+    from app.services.ext_data import ext_api_key_field
 
     _make_config(tmp_path)
     req = _request(tmp_path)
     monkeypatch.setattr("app.api.ext_data._refresh_views", lambda request: None)
-    cleared: list[str] = []
-    monkeypatch.setattr("app.secrets_store.clear", lambda *keys: cleared.extend(keys) or {})
+
+    field = ext_api_key_field("demo")
+    secrets_store.save_deployment({field: "sk-12345678"})
+    assert field in secrets_store.load_deployment(), "前置: Key 应已写入部署级文件"
 
     assert delete_config(req, "demo") == {"status": "deleted"}
-    assert cleared == ["ext_demo_api_key"]
+    assert field not in secrets_store.load_deployment(), "删除配置后部署级 Key 必须被清除"
 
 
 def test_get_ext_api_key_env_fallback(monkeypatch) -> None:
-    monkeypatch.setattr("app.secrets_store.load", lambda: {})
+    monkeypatch.setattr("app.secrets_store.load_deployment", lambda *a, **k: {})
     monkeypatch.setenv("EXT_DEMO_API_KEY", "env-key-123456")
     assert get_ext_api_key("demo") == "env-key-123456"

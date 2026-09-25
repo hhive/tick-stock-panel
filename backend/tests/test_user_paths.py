@@ -11,7 +11,9 @@ from app import config as app_config
 from app.services.user_paths import (
     USER_SUBDIRS,
     InvalidAccountIdError,
+    MissingUserContextError,
     ensure_user_dirs,
+    resolve_user_root,
     user_root,
     validate_account_id,
 )
@@ -172,6 +174,8 @@ def test_ensure_subdirs_are_nested_where_declared(_isolated):
     assert (root / "strategies" / "composite").is_dir()
     assert (root / "research" / "mining" / "runs").is_dir()
     assert (root / "paper" / "accounts").is_dir()
+    assert (root / "user_data" / "lots").is_dir()
+    assert (root / "user_data" / "custom_factors").is_dir()
 
 
 def test_ensure_is_idempotent(_isolated):
@@ -213,3 +217,47 @@ def test_skeleton_is_resolvable_relative_to_user_root(_isolated):
     for sub in USER_SUBDIRS:
         assert (root / sub).resolve().is_relative_to(root.resolve())
         assert ".." not in sub.split("/")
+
+
+# ================================================================
+# resolve_user_root: 全部每用户存储的统一接缝
+# ================================================================
+
+def test_resolve_prefers_explicit_argument(_isolated):
+    """后台线程用显式参数 —— 必须压过请求上下文。"""
+    from app.services import preferences
+
+    explicit = _isolated / "users" / "2"
+    token = preferences.set_current_user_root(_isolated / "users" / "9")
+    try:
+        assert resolve_user_root(explicit) == explicit
+    finally:
+        preferences.reset_current_user_root(token)
+
+
+def test_resolve_uses_request_context(_isolated):
+    from app.services import preferences
+
+    ctx = _isolated / "users" / "3"
+    token = preferences.set_current_user_root(ctx)
+    try:
+        assert resolve_user_root() == ctx
+    finally:
+        preferences.reset_current_user_root(token)
+
+
+def test_resolve_fails_closed_without_any_context(_isolated):
+    """两者都没有时必须抛错, **不得**静默回退到某个共享目录。
+
+    静默回退的后果是跨用户串号: A 的写入落进所有人共享的文件, 或后台读到别人的
+    数据 —— 比功能报错严重得多, 且不留下任何线索。这是本设计的 fail-closed 底线。
+    """
+    from app.services import preferences
+
+    token = preferences.set_current_user_root(None)
+    try:
+        assert preferences.current_user_root() is None
+        with pytest.raises(MissingUserContextError):
+            resolve_user_root()
+    finally:
+        preferences.reset_current_user_root(token)

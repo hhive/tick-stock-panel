@@ -50,7 +50,7 @@ def _sync_engine(request: Request) -> None:
         repo = request.app.state.repo
         rules = [
             _reconcile_index_asset_type(r, repo)
-            for r in monitor_rules.load_all(_data_dir(request))
+            for r in monitor_rules.load_all()
         ]
         engine.set_rules(rules)
 
@@ -207,7 +207,7 @@ def list_rules(request: Request):
     repo = request.app.state.repo
     rules = [
         _reconcile_index_asset_type(r, repo)
-        for r in monitor_rules.load_all(_data_dir(request))
+        for r in monitor_rules.load_all()
     ]
     from app.services.kline_sync import intraday_monitor_support
 
@@ -294,7 +294,7 @@ def save_rule(req: RuleModel, request: Request):
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
     # 编辑现有规则时, 保留原 created_at (避免按时间排序时位置跳动)
-    existing = monitor_rules.load_one(_data_dir(request), rule["id"])
+    existing = monitor_rules.load_one(rule["id"])
     # 批次派生规则由「持仓提醒」页托管, 监控中心只读 (启停/改/删均回持仓页)
     if existing and existing.get("lot_id"):
         raise HTTPException(status_code=409, detail="该规则由「持仓提醒」页托管, 请在持仓提醒页修改")
@@ -331,7 +331,7 @@ def save_rule(req: RuleModel, request: Request):
         if not support["available"]:
             raise HTTPException(status_code=403, detail=str(support["reason"]))
         symbols = set(str(symbol) for symbol in rule.get("symbols", []) if symbol)
-        for saved in monitor_rules.load_all(_data_dir(request)):
+        for saved in monitor_rules.load_all():
             if (
                 saved.get("id") != rule.get("id")
                 and saved.get("enabled", True)
@@ -344,7 +344,7 @@ def save_rule(req: RuleModel, request: Request):
                 status_code=400,
                 detail=f"当前分时数据能力最多监听 {max_symbols} 只标的,当前规则合计 {len(symbols)} 只",
             )
-    monitor_rules.save_one(_data_dir(request), rule)
+    monitor_rules.save_one(rule)
     _sync_engine(request)
     return {"ok": True, "rule": rule}
 
@@ -355,10 +355,10 @@ def delete_rule(rule_id: str, request: Request):
     if not monitor_rules.ID_RE.match(rule_id):
         raise HTTPException(status_code=400, detail="规则 id 非法")
     # 批次派生规则由「持仓提醒」页托管, 删除需在持仓页操作 (级联清理派生规则)
-    existing = monitor_rules.load_one(_data_dir(request), rule_id)
+    existing = monitor_rules.load_one(rule_id)
     if existing and existing.get("lot_id"):
         raise HTTPException(status_code=409, detail="该规则由「持仓提醒」页托管, 请在持仓提醒页删除批次")
-    deleted = monitor_rules.delete_one(_data_dir(request), rule_id)
+    deleted = monitor_rules.delete_one(rule_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="规则不存在")
     _sync_engine(request)
@@ -429,7 +429,7 @@ def seed_demo_rules(request: Request):
     for (name, rtype, scope, symbols, conditions, logic, severity, sev) in _DEMO_RULES_TEMPLATE:
         rule_id = f"demo_{ts}_{i}"
         rule = _demo_rule(rule_id, name, rtype, scope, symbols, conditions, logic, 3600, sev)
-        monitor_rules.save_one(_data_dir(request), rule)
+        monitor_rules.save_one(rule)
         created.append(rule_id)
         i += 1
     # 策略类型规则
@@ -439,7 +439,7 @@ def seed_demo_rules(request: Request):
             rule_id, sr["name"], "strategy", "all", [], [], "and", 3600, "info",
             strategy_id=sr["strategy_id"], direction=sr.get("direction", "entry"),
         )
-        monitor_rules.save_one(_data_dir(request), rule)
+        monitor_rules.save_one(rule)
         created.append(rule_id)
         i += 1
     _sync_engine(request)
@@ -663,7 +663,7 @@ def trigger_ladder(request: Request):
 
     # 1. 落盘到 alerts.jsonl
     try:
-        alert_store.append_many(repo.store.data_dir, rule_events)
+        alert_store.append_many(rule_events)
     except Exception:  # noqa: BLE001
         pass  # 落盘失败不阻断推送
 

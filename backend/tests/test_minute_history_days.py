@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from app.api import settings
 from app.services import preferences
 
@@ -52,6 +54,22 @@ def test_history_days_none_when_resolver_fails(monkeypatch):
     _mock_resolver(monkeypatch, None, True, err="registry broken")
     monkeypatch.setattr(preferences, "get_minute_data_provider", lambda: "stocksdk")
     assert settings._minute_history_days() is None
+
+
+@pytest.fixture(autouse=True)
+def _user_ctx(tmp_path, monkeypatch):
+    """每用户存储 (密钥/报告/因子…) 没有共享回退, 需要账户上下文。
+
+    真实请求由认证中间件注入 user_root; 进程内单测显式设置, 并让凭据落在空目录
+    (等效「未配置」), 不依赖真实 data/。
+    """
+    from app import config as app_config
+    from app.services import preferences
+
+    monkeypatch.setattr(app_config.settings, "data_dir", tmp_path)
+    token = preferences.set_current_user_root(tmp_path)
+    yield tmp_path
+    preferences.reset_current_user_root(token)
 
 
 def test_preferences_get_includes_history_days(monkeypatch):

@@ -7,6 +7,7 @@ import logging
 import threading
 from dataclasses import asdict
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request
@@ -32,6 +33,13 @@ BACKTEST_SERVER_GUARD_MESSAGE = (
     "当前服务器内存约 1.8GB，回测区间最多支持 6 个月；"
     "更长周期容易触发 OOM，建议在 8GB 以上内存环境或本机运行。"
 )
+
+
+def _user_root(request: Request) -> Path:
+    """**当前账户**私有数据根 (回测结果 / 研究候选池)。"""
+    from app.services.user_paths import resolve_user_root
+
+    return resolve_user_root()
 
 
 def _get_engine(request: Request):
@@ -94,7 +102,8 @@ class BacktestRequest(BaseModel):
 def run(req: BacktestRequest, request: Request):
     """信号回测 — 现有接口，向后兼容。"""
     repo = request.app.state.repo
-    svc = BacktestService(repo)
+    # 结果文件属于发起人: 行情面板仍是共享的, 但 run_id=*.parquet 按账户分家。
+    svc = BacktestService(repo, user_root=_user_root(request))
     end = req.end or date.today()
     start = req.start or (end - timedelta(days=365 * 3))
 
@@ -257,10 +266,12 @@ class CandidateUpdateRequest(BaseModel):
     status: Literal["pending", "validated", "rejected"] | None = None
 
 
-def _candidate_store():
+def _candidate_store(request: Request):
+    """候选池属于**当前账户** (研究产物是账户私有数据, 不是共享行情)。"""
     from app.backtest.candidates import CandidateStore
+    from app.services.user_paths import resolve_user_root
 
-    return CandidateStore(settings.data_dir)
+    return CandidateStore(resolve_user_root())
 
 
 def _raise_candidate_error(exc: Exception) -> None:
@@ -271,17 +282,17 @@ def _raise_candidate_error(exc: Exception) -> None:
 
 
 @router.get("/candidates")
-def candidates_list():
+def candidates_list(request: Request):
     try:
-        return {"items": _candidate_store().list()}
+        return {"items": _candidate_store(request).list()}
     except Exception as exc:
         _raise_candidate_error(exc)
 
 
 @router.post("/candidates")
-def candidate_create(req: CandidateCreateRequest):
+def candidate_create(req: CandidateCreateRequest, request: Request):
     try:
-        return _candidate_store().create(
+        return _candidate_store(request).create(
             kind=req.kind,
             name=req.name,
             source_id=req.source_id,
@@ -295,11 +306,11 @@ def candidate_create(req: CandidateCreateRequest):
 
 
 @router.patch("/candidates/{candidate_id}")
-def candidate_update(candidate_id: str, req: CandidateUpdateRequest):
+def candidate_update(candidate_id: str, req: CandidateUpdateRequest, request: Request):
     if req.name is None and req.status is None:
         raise HTTPException(status_code=400, detail="至少提供一个需要更新的字段")
     try:
-        return _candidate_store().update(candidate_id, name=req.name, status=req.status)
+        return _candidate_store(request).update(candidate_id, name=req.name, status=req.status)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="候选方案不存在") from exc
     except Exception as exc:
@@ -307,9 +318,9 @@ def candidate_update(candidate_id: str, req: CandidateUpdateRequest):
 
 
 @router.delete("/candidates/{candidate_id}")
-def candidate_delete(candidate_id: str):
+def candidate_delete(candidate_id: str, request: Request):
     try:
-        _candidate_store().delete(candidate_id)
+        _candidate_store(request).delete(candidate_id)
         return {"ok": True}
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="候选方案不存在") from exc

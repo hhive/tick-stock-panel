@@ -6,6 +6,7 @@ import json
 import math
 from collections.abc import AsyncIterator, Mapping, Sequence
 from datetime import date
+from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import polars as pl
@@ -513,19 +514,33 @@ def _manager(request: Request):
 
 
 def _candidate_service(request: Request):
-    service = getattr(request.app.state, "mining_candidate_service", None)
-    if service is not None:
-        return service
+    """返回**当前账户**的候选服务。
+
+    按账户根缓存 (而不是单个进程级实例): 服务内部绑定该账户的候选池与策略目录,
+    跨账户复用 = B 能看到/发布到 A 的候选与策略。缓存键就是用户根路径, 账户之间
+    天然分开。
+    """
     from app.backtest.candidates import CandidateStore
     from app.services.mining_candidates import MiningCandidateService
+    from app.services.user_paths import resolve_user_root
+
+    user_root = resolve_user_root()
+    cache: dict[Path, MiningCandidateService] = getattr(
+        request.app.state, "mining_candidate_services", None
+    )
+    if cache is None:
+        cache = {}
+        request.app.state.mining_candidate_services = cache
+    service = cache.get(user_root)
+    if service is not None:
+        return service
 
     manager = _manager(request)
-    data_dir = request.app.state.repo.store.data_dir
     monitor_engine = getattr(request.app.state, "monitor_engine", None)
     service = MiningCandidateService(
-        data_dir,
+        user_root,
         manager.store,
-        CandidateStore(data_dir),
+        CandidateStore(user_root),
         request.app.state.strategy_engine,
         monitor_state_invalidator=(
             monitor_engine.invalidate_strategy_state
@@ -533,7 +548,7 @@ def _candidate_service(request: Request):
             else None
         ),
     )
-    request.app.state.mining_candidate_service = service
+    cache[user_root] = service
     return service
 
 

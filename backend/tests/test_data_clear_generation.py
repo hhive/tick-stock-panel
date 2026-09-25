@@ -47,7 +47,7 @@ def _stub_clear_side_effects(monkeypatch: pytest.MonkeyPatch) -> None:
     from app.services.screener import ScreenerService
 
     monkeypatch.setattr(job_store, "clear", lambda: None)
-    monkeypatch.setattr(alert_store, "clear", lambda _data_dir: None)
+    monkeypatch.setattr(alert_store, "clear", lambda *a, **k: None)
     monkeypatch.setattr(ScreenerService, "clear_history_cache", lambda: None)
     monkeypatch.setattr(overview, "invalidate_overview_cache", lambda: None)
     monkeypatch.setattr(data_api, "invalidate_data_cache", lambda _table=None: None)

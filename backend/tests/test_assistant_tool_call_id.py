@@ -16,6 +16,22 @@ from app.custom.assistant import chat_service
 from app.custom.assistant import tools as assistant_tools
 
 
+@pytest.fixture(autouse=True)
+def _user_ctx(tmp_path, monkeypatch):
+    """每用户存储 (密钥/报告/因子…) 没有共享回退, 需要账户上下文。
+
+    真实请求由认证中间件注入 user_root; 进程内单测显式设置, 并让凭据落在空目录
+    (等效「未配置」), 不依赖真实 data/。
+    """
+    from app import config as app_config
+    from app.services import preferences
+
+    monkeypatch.setattr(app_config.settings, "data_dir", tmp_path)
+    token = preferences.set_current_user_root(tmp_path)
+    yield tmp_path
+    preferences.reset_current_user_root(token)
+
+
 def _script_round(script: list[dict[str, Any]], capture: list[list[dict[str, Any]]]):
     async def fake_round(messages, tool_schemas, *, temperature=0.3, timeout=240.0):
         capture.append([dict(m) for m in messages])

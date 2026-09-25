@@ -9,7 +9,13 @@
     "updated_at": 1705324800000  # Unix ms
   }
 
-文件路径: data/user_data/strategy_cache.json
+文件路径: ``<user_root>/user_data/strategy_cache.json`` —— **每账户一份**。
+user_root 由 ``user_paths.resolve_user_root()`` 解析 (请求路径走认证中间件注入的
+contextvar, 后台线程/worker 必须显式传 ``user_root=``)。
+
+缓存键是"文件路径"而不是策略 ID, 所以账户隔离完全落在路径上: 一旦 user_root 分家,
+A 的缓存就不可能被 B 读到。唯独 ``enriched_mtime`` 这一字段读的是**共享行情数据**
+(``kline_daily_enriched``), 与账户无关, 故仍取 ``settings.data_dir``。
 """
 from __future__ import annotations
 
@@ -21,6 +27,8 @@ import time
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
+
+from app.services.user_paths import resolve_user_root
 
 
 def _json_default(obj: Any) -> Any:
@@ -42,26 +50,28 @@ _CACHE_FILENAME = "strategy_cache.json"
 _file_lock = threading.Lock()
 
 
-def _cache_path(data_dir: Path) -> Path:
-    return data_dir / "user_data" / _CACHE_FILENAME
+def _cache_path(user_root: Path) -> Path:
+    return user_root / "user_data" / _CACHE_FILENAME
 
 
-def _enriched_parquet_path(data_dir: Path, as_of: str) -> Path:
-    """返回 enriched parquet 文件路径。"""
-    return data_dir / "kline_daily_enriched" / f"date={as_of}" / "part.parquet"
+def _enriched_parquet_path(as_of: str) -> Path:
+    """返回 enriched parquet 文件路径 (**共享行情数据**, 不随账户变化)。"""
+    from app.config import settings
+
+    return settings.data_dir / "kline_daily_enriched" / f"date={as_of}" / "part.parquet"
 
 
-def _get_enriched_mtime(data_dir: Path, as_of: str) -> float | None:
+def _get_enriched_mtime(as_of: str) -> float | None:
     """返回 enriched parquet 文件的 mtime (秒)。文件不存在返回 None。"""
-    p = _enriched_parquet_path(data_dir, as_of)
+    p = _enriched_parquet_path(as_of)
     try:
         return p.stat().st_mtime
     except FileNotFoundError:
         return None
 
 
-def read_cache(data_dir: Path) -> dict | None:
-    """读取策略缓存文件。返回 None 表示无缓存或读取失败。
+def read_cache(user_root: Path | None = None) -> dict | None:
+    """读取**当前账户**的策略缓存文件。返回 None 表示无缓存或读取失败。
 
     说明: 原先有 enriched mtime 过期校验 (数据文件变化 → 判过期返回 None),
     但在有实时行情的系统里, enriched parquet 每轮被刷新 → mtime 必然变化 →
@@ -70,11 +80,11 @@ def read_cache(data_dir: Path) -> dict | None:
     端点叠加监控引擎的内存实时结果 (latest_strategy_results) 来保证。
     """
     with _file_lock:
-        return _read_cache_unlocked(data_dir)
+        return _read_cache_unlocked(resolve_user_root(user_root))
 
 
-def clear_cache(data_dir: Path) -> None:
-    """删除策略结果缓存；策略代码 reload 后避免继续展示旧公式结果。"""
+def clear_cache(user_root: Path | None = None) -> None:
+    """删除**当前账户**的策略结果缓存；策略代码 reload 后避免继续展示旧公式结果。"""
     import traceback
 
     # 运维可见性: 策略页依赖本缓存秒加载, 被清空即整页回退到全量重算。
@@ -84,15 +94,15 @@ def clear_cache(data_dir: Path) -> None:
         f"{f.filename.rsplit('/', 1)[-1]}:{f.lineno}:{f.name}" for f in frames[-5:]
     )
     logger.warning("策略缓存被清除, 调用链: %s", chain)
-    path = _cache_path(data_dir)
+    path = _cache_path(resolve_user_root(user_root))
     with _file_lock:
         path.unlink(missing_ok=True)
         path.with_name(path.name + ".tmp").unlink(missing_ok=True)
 
 
-def _read_cache_unlocked(data_dir: Path) -> dict | None:
-    """实际读取逻辑 (不持锁)。供 read_cache 与 write_cache 复用, 避免重入死锁。"""
-    path = _cache_path(data_dir)
+def _read_cache_unlocked(resolved_root: Path) -> dict | None:
+    """实际读取逻辑 (不持锁, 且已解析过的账户根)。供 read_cache 与 write_cache 复用, 避免重入死锁。"""
+    path = _cache_path(resolved_root)
     if not path.exists():
         return None
     try:
@@ -118,32 +128,35 @@ def _rows_to_symbol_map(rows: list[dict]) -> dict[str, dict]:
 
 
 def write_cache(
-    data_dir: Path,
     as_of: str,
     results: dict[str, Any],
+    user_root: Path | None = None,
 ) -> None:
-    """将策略结果写入缓存文件，同时更新今日曾命中集合。
+    """将策略结果写入**当前账户**的缓存文件，同时更新今日曾命中集合。
 
     - 日期变更时重置 today_ever_matched 和 today_ever_rows
     - 同一天内合并 (并集) 之前曾命中的 symbol，并用最新行数据更新
     """
-    path = _cache_path(data_dir)
+    # 解析一次并向下传, 避免同一写路径里两次解析拿到不同账户 (contextvar 理论上是稳定的,
+    # 但显式传下去也省掉重复解析)。
+    resolved_root = resolve_user_root(user_root)
+    path = _cache_path(resolved_root)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # 整个 read-modify-write 持锁: 避免并发 write 丢更新, 也避免与 read_cache 撕裂
     with _file_lock:
-        _write_cache_locked(path, data_dir, as_of, results)
+        _write_cache_locked(path, resolved_root, as_of, results)
 
 
 def _write_cache_locked(
     path: Path,
-    data_dir: Path,
+    resolved_root: Path,
     as_of: str,
     results: dict[str, Any],
 ) -> None:
     """持 _file_lock 后的实际写入逻辑 (read-merge-write + 原子替换)。"""
     # 读取旧缓存 (已持锁, 走不重入的 _read_cache_unlocked)
-    old = _read_cache_unlocked(data_dir)
+    old = _read_cache_unlocked(resolved_root)
     old_as_of = old.get("as_of") if old else None
     old_ever_rows: dict[str, dict[str, dict]] = old.get("today_ever_rows", {}) if old else {}
 
@@ -177,7 +190,7 @@ def _write_cache_locked(
 
     # enriched_mtime: 盘后缓存写入时记录 (向后兼容旧字段)。read_cache 已不再用它
     # 做过期校验, 实时新鲜度改由 /cached 端点叠加监控引擎内存结果保证。
-    enriched_mtime = _get_enriched_mtime(data_dir, as_of)
+    enriched_mtime = _get_enriched_mtime(as_of)
 
     payload = {
         "as_of": as_of,

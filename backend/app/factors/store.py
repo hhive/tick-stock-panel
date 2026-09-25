@@ -1,4 +1,8 @@
-"""自定义/复合因子存储 (P3) — data/user_data/custom_factors/*.json。
+"""自定义/复合因子存储 (P3) — `<user_root>/user_data/custom_factors/*.json`。
+
+**每账户一份**: user_root 由 ``user_paths.resolve_user_root()`` 解析 (请求路径走认证
+中间件注入的 contextvar, 后台线程/子进程必须显式传 user_root=), 因此自定义因子不会
+跨账户互见。
 
 镜像 custom_signals 的持久化写法; 单文件损坏只禁用该因子并告警, 不影响启动
 (对齐 CONTRIBUTING 第 4 节插件隔离要求)。生命周期状态: draft → active →
@@ -15,6 +19,7 @@ from pathlib import Path
 from app.factors.dsl import compile_formula
 from app.factors.registry import FactorSpec, factor_dependencies, get_factor, register_factor
 from app.services.fs_utils import atomic_write_text
+from app.services.user_paths import resolve_user_root
 
 logger = logging.getLogger(__name__)
 
@@ -24,20 +29,20 @@ MAX_COMPOSITE_MEMBERS = 8
 STATUSES = frozenset({"draft", "active", "watch", "retired"})
 
 
-def _dir(data_dir: Path) -> Path:
-    directory = data_dir / "user_data" / "custom_factors"
+def _dir(user_root: Path | None = None) -> Path:
+    directory = resolve_user_root(user_root) / "user_data" / "custom_factors"
     directory.mkdir(parents=True, exist_ok=True)
     return directory
 
 
-def _path(data_dir: Path, factor_id: str) -> Path:
-    return _dir(data_dir) / f"{factor_id}.json"
+def _path(user_root: Path | None, factor_id: str) -> Path:
+    return _dir(user_root) / f"{factor_id}.json"
 
 
-def load_all(data_dir: Path) -> list[dict]:
-    """读取全部自定义/复合因子定义; 损坏文件跳过。"""
+def load_all(user_root: Path | None = None) -> list[dict]:
+    """读取**当前账户**的全部自定义/复合因子定义; 损坏文件跳过。"""
     out: list[dict] = []
-    for file in sorted(_dir(data_dir).glob("*.json")):
+    for file in sorted(_dir(user_root).glob("*.json")):
         try:
             out.append(json.loads(file.read_text(encoding="utf-8")))
         except Exception as exc:
@@ -45,14 +50,14 @@ def load_all(data_dir: Path) -> list[dict]:
     return out
 
 
-def save_one(data_dir: Path, definition: dict) -> None:
-    target = _path(data_dir, str(definition["id"]))
+def save_one(definition: dict, user_root: Path | None = None) -> None:
+    target = _path(user_root, str(definition["id"]))
     target.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(target, json.dumps(definition, ensure_ascii=False, indent=2))
 
 
-def delete_one(data_dir: Path, factor_id: str) -> bool:
-    target = _path(data_dir, factor_id)
+def delete_one(factor_id: str, user_root: Path | None = None) -> bool:
+    target = _path(user_root, factor_id)
     if target.exists():
         target.unlink()
         return True
@@ -163,15 +168,20 @@ def register_definition(definition: dict) -> FactorSpec:
     return spec
 
 
-def load_into_registry(data_dir: Path) -> list[str]:
-    """启动期把存储中的因子注册进注册表; 单个失败只跳过并告警。
+def load_into_registry(user_root: Path | None = None) -> list[str]:
+    """启动期/子进程把**该账户**存储中的因子注册进注册表; 单个失败只跳过并告警。
+
+    注意: 注册表是进程级单例, 且此处**必须**有账户上下文或显式 user_root ——
+    没有账户的后台调用方 (启动期 main.py、回测子进程 worker.py) 会抛
+    MissingUserContextError, 需要上层的每账户扇出决定用哪个 root。
+
 
     多轮加载: composite 成员可能引用尚未加载的 custom/其他 composite (文件按
     字母序加载, cf_* 先于 uf_*), 失败的 composite 延后重试, 覆盖链式引用;
     重试用尽仍失败的只告警不阻塞启动。
     """
     loaded: list[str] = []
-    pending = list(load_all(data_dir))
+    pending = list(load_all(user_root))
     for round_index in range(3):
         deferred: list[dict] = []
         for definition in pending:

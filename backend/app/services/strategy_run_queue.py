@@ -10,6 +10,9 @@
   慢策略 (分钟级) 留在后台慢慢算。
 - 每个策略算完立刻增量写入 strategy_cache, 前端轮询 cached-summary
   逐个点亮卡片数字。
+
+耗时记录存 ``<user_root>/user_data/strategy_run_timings.json`` —— **每账户一份**
+(排序只影响本账户的执行顺序, 不产出跨账户可见数据)。
 """
 from __future__ import annotations
 
@@ -22,21 +25,23 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
+from app.services.user_paths import resolve_user_root
+
 logger = logging.getLogger(__name__)
 
 _TIMINGS_FILENAME = "strategy_run_timings.json"
 _timings_lock = threading.Lock()
 
 
-def _timings_path(data_dir: Path) -> Path:
-    return data_dir / "user_data" / _TIMINGS_FILENAME
+def _timings_path(user_root: Path) -> Path:
+    return user_root / "user_data" / _TIMINGS_FILENAME
 
 
-def load_run_timings(data_dir: Path) -> dict[str, float]:
-    """读取各策略上次执行耗时 (ms); 无文件/损坏时返回空。"""
+def load_run_timings(user_root: Path | None = None) -> dict[str, float]:
+    """读取**当前账户**各策略上次执行耗时 (ms); 无文件/损坏时返回空。"""
     with _timings_lock:
         try:
-            data = json.loads(_timings_path(data_dir).read_text(encoding="utf-8"))
+            data = json.loads(_timings_path(resolve_user_root(user_root)).read_text(encoding="utf-8"))
         except (FileNotFoundError, ValueError, OSError):
             return {}
     if not isinstance(data, dict):
@@ -44,12 +49,12 @@ def load_run_timings(data_dir: Path) -> dict[str, float]:
     return {str(k): float(v) for k, v in data.items() if isinstance(v, (int, float))}
 
 
-def record_run_timings(data_dir: Path, elapsed_ms: dict[str, float]) -> None:
-    """批量记录策略耗时 (ms), 与已有文件合并后原子重写。"""
+def record_run_timings(elapsed_ms: dict[str, float], user_root: Path | None = None) -> None:
+    """批量记录**当前账户**的策略耗时 (ms), 与已有文件合并后原子重写。"""
     if not elapsed_ms:
         return
     with _timings_lock:
-        path = _timings_path(data_dir)
+        path = _timings_path(resolve_user_root(user_root))
         path.parent.mkdir(parents=True, exist_ok=True)
         merged: dict[str, float] = {}
         try:

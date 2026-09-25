@@ -2,7 +2,24 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from app.api import screener as screener_api
+
+
+@pytest.fixture(autouse=True)
+def _current_user_context(tmp_path):
+    """把「当前账户根」设为本次用例的临时目录。
+
+    HTTP handler 通过 user_paths 的统一接缝解析账户私有目录 (真实请求里由认证
+    中间件注入 contextvar); 这里直接调用 handler, 必须自己注入, 否则 fail-closed
+    抛 MissingUserContextError。
+    """
+    from app.services import preferences
+
+    token = preferences.set_current_user_root(tmp_path)
+    yield tmp_path
+    preferences.reset_current_user_root(token)
 
 
 class _MonitorEngine:

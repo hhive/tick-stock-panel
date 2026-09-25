@@ -8,8 +8,11 @@
 差异通过构造参数固化: filename(存储文件名) / max_reports(保留上限) / id_prefix(id 前缀) /
 id_with_symbol(id 是否带 symbol 后缀 —— 大盘复盘无 symbol)。
 
-存储文件: data/user_data/{filename} (数组, 按 created_at 降序), 保留最近 max_reports 条,
-超出自动裁剪最旧的。写入走临时文件 + os.replace 原子替换, 避免进程中断留下半截 JSON。
+存储文件: `<user_root>/user_data/{filename}` (数组, 按 created_at 降序), 保留最近
+max_reports 条, 超出自动裁剪最旧的。**每账户一份**: user_root 由
+``user_paths.resolve_user_root()`` 解析 (请求路径走认证中间件注入的 contextvar,
+后台线程必须显式传 user_root=), 报告因此不会跨账户互见。写入走临时文件 +
+os.replace 原子替换, 避免进程中断留下半截 JSON。
 读写同时可能来自请求线程与调度线程, 故加实例锁串行化写路径。
 """
 from __future__ import annotations
@@ -22,6 +25,7 @@ import time
 from pathlib import Path
 
 from app.market_time import cn_now
+from app.services.user_paths import resolve_user_root
 
 logger = logging.getLogger(__name__)
 
@@ -43,15 +47,14 @@ class JsonReportStore:
         # 请求线程 + 调度线程可能并发写, 用实例锁串行化读-改-写
         self._lock = threading.Lock()
 
-    def _path(self) -> Path:
-        from app.config import settings
-        p = settings.data_dir / "user_data" / self.filename
+    def _path(self, user_root: Path | None = None) -> Path:
+        p = resolve_user_root(user_root) / "user_data" / self.filename
         p.parent.mkdir(parents=True, exist_ok=True)
         return p
 
-    def list_reports(self) -> list[dict]:
-        """返回全部报告(按 created_at 降序)。"""
-        p = self._path()
+    def list_reports(self, user_root: Path | None = None) -> list[dict]:
+        """返回**当前账户**的全部报告(按 created_at 降序)。"""
+        p = self._path(user_root)
         if not p.exists():
             return []
         try:
@@ -62,17 +65,17 @@ class JsonReportStore:
             logger.warning("%s malformed: %s", self.filename, e)
         return []
 
-    def _save_all(self, reports: list[dict]) -> None:
+    def _save_all(self, reports: list[dict], user_root: Path | None = None) -> None:
         """全量写入(裁剪到 max_reports, 原子替换)。"""
         # 保持降序
         reports.sort(key=lambda r: r.get("created_at", ""), reverse=True)
         if len(reports) > self.max_reports:
             reports = reports[:self.max_reports]
-        self._atomic_write(reports)
+        self._atomic_write(reports, user_root)
 
-    def _atomic_write(self, reports: list[dict]) -> None:
+    def _atomic_write(self, reports: list[dict], user_root: Path | None = None) -> None:
         """先写临时文件再 os.replace 原子替换, 避免进程中断留下损坏的 JSON。"""
-        p = self._path()
+        p = self._path(user_root)
         text = json.dumps(reports, indent=2, ensure_ascii=False)
         tmp = p.with_suffix(p.suffix + ".tmp")
         tmp.write_text(text, encoding="utf-8")
@@ -84,41 +87,41 @@ class JsonReportStore:
             return f"{base}_{report.get('symbol', 'x')}"
         return base
 
-    def save_report(self, report: dict) -> dict:
-        """新增一条报告并持久化。返回保存后的报告(含 id / created_at)。
+    def save_report(self, report: dict, user_root: Path | None = None) -> dict:
+        """新增一条报告并持久化到**当前账户**。返回保存后的报告(含 id / created_at)。
 
         自动补全 id 与 created_at(若缺),并裁剪到上限。
         """
         with self._lock:
-            reports = self.list_reports()
+            reports = self.list_reports(user_root)
             if not report.get("id"):
                 report["id"] = self._make_id(report)
             if not report.get("created_at"):
                 report["created_at"] = self._now_iso()
             reports.append(report)
-            self._save_all(reports)
+            self._save_all(reports, user_root)
             total = min(len(reports), self.max_reports)
         logger.info("report saved: %s → %s, total %d", self.filename, report.get("id"), total)
         return report
 
-    def delete_report(self, report_id: str) -> bool:
-        """删除指定报告。返回是否删除成功。"""
+    def delete_report(self, report_id: str, user_root: Path | None = None) -> bool:
+        """删除当前账户的指定报告。返回是否删除成功。"""
         with self._lock:
-            reports = self.list_reports()
+            reports = self.list_reports(user_root)
             before = len(reports)
             reports = [r for r in reports if r.get("id") != report_id]
             if len(reports) < before:
-                self._save_all(reports)
+                self._save_all(reports, user_root)
                 return True
         return False
 
-    def clear_reports(self) -> int:
-        """清空全部报告。返回删除数量。"""
+    def clear_reports(self, user_root: Path | None = None) -> int:
+        """清空当前账户的全部报告。返回删除数量。"""
         with self._lock:
-            reports = self.list_reports()
+            reports = self.list_reports(user_root)
             n = len(reports)
             if n > 0:
-                self._save_all([])
+                self._save_all([], user_root)
         return n
 
     @staticmethod

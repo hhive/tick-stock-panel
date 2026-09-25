@@ -155,9 +155,16 @@ def _resolve_universe(capset: CapabilitySet, repo=None) -> list[str]:
         except Exception as e:  # noqa: BLE001
             logger.warning("CN_Equity_A pool unavailable, fallback: %s", e)
 
-    # Free 用户兜底: instruments parquet + watchlist + demo
+    # Free 档兜底: instruments parquet + demo
+    #
+    # 这里**刻意不再并入 watchlist**。自选已按账户隔离(每账户一份), 而本函数是
+    # **共享行情管道**的标的池解析: 它没有、也不该有"当前账户"的概念。
+    #   - 若读某个账户的自选 ⇒ 首个被碰到的账户会**悄悄决定全站的同步范围**(跨租户
+    #     泄漏), 且换一个账户跑就得到不同的标的池, 行为不可复现;
+    #   - 且 instruments parquet 已经提供全量 A 股标的, 自选本就是它的子集,
+    #     去掉后实际覆盖面不变。
+    # 免费档的能力限制体现在**能力键**上, 而不是"同步谁的自选"。
     base: set[str] = set(DEMO_SYMBOLS)
-    base.update(get_pool("watchlist"))
     d = Path(settings.data_dir)
     inst_path = d / "instruments" / "instruments.parquet"
     if inst_path.exists():
@@ -166,8 +173,13 @@ def _resolve_universe(capset: CapabilitySet, repo=None) -> list[str]:
             base.update(inst["symbol"].to_list())
         except Exception as e:  # noqa: BLE001
             logger.warning("instruments supplement failed: %s", e)
-    # 过滤自选兜底里的指数 symbol (指数日K走独立 kline_index_* 存储,
-    # 进股票池会污染 kline_daily/kline_minute)。ETF 刻意保留 (既有行为)。
+    # 指数防御性过滤: 指数日K走独立 kline_index_* 存储, 进股票池会污染
+    # kline_daily/kline_minute。ETF 刻意保留 (既有行为)。
+    # 注: 自选兜底已从本函数移除(见上), 故此过滤现在只对 DEMO_SYMBOLS 与
+    # instruments parquet 中可能出现的指数 symbol 生效 —— 当前行情源只含个股,
+    # 所以它是纯防御性的; 保留的理由是上游标的池一旦混入指数, 污染会静默发生。
+    # 已知不一致: app/services/extend_history.py 的同名解析函数没有这层过滤
+    # (它只拿到 capset、没有 repo), 写的是同一批存储。见计划文档。
     if repo is not None:
         base -= set(repo.get_index_symbol_set())
     return sorted(base)
@@ -731,10 +743,24 @@ def run_now(
     paper_summary: dict = {}
     try:
         emit("paper_settle", 94, "模拟盘结算…")
+        from app.services.user_paths import MissingUserContextError
         from app.strategy import paper as paper_trading
+
+        # 账户数据按面板账户分家 (data/users/<面板账户>/paper/...): 本阶段在**后台
+        # 调度线程**里跑, 没有账户上下文, 需要按账户扇出并显式传 user_root=。
+        # 扇出落地前这里拿不到任何账户 → 跳过并留痕 (计入 skipped, 不算失败: 没有
+        # 账户可结算是「本阶段无从下手」, 报成管道失败会让运维误判数据链路坏了)。
+        # 刻意不传 repo.store.data_dir 兜底 —— 那等于把共享目录当账户目录来读写。
+        try:
+            account_ids = paper_trading.list_account_ids()
+        except MissingUserContextError:
+            logger.warning("paper_settle skipped: 后台无账户上下文, 待每账户扇出 (S3)")
+            skipped.append("paper_settle")
+            account_ids = []
+
         # 逐账户结算 (账户间订单/台账隔离), 汇总合并供日志与结果展示
         totals = {"filled": 0, "expired": 0, "corp_actions": 0, "nav": None, "accounts": []}
-        for acc_id in paper_trading.list_account_ids(repo.store.data_dir):
+        for acc_id in account_ids:
             s = paper_trading.settle_day(repo.store.data_dir, today.isoformat(), account_id=acc_id)
             totals["filled"] += s.get("filled", 0)
             totals["expired"] += s.get("expired", 0)
@@ -751,9 +777,9 @@ def run_now(
             try:
                 from app.services import alert_store
                 settle_events = []
-                for acc_id in paper_trading.list_account_ids(repo.store.data_dir):
+                for acc_id in account_ids:
                     settle_events.extend(paper_trading.day_fill_events(
-                        repo.store.data_dir, today.isoformat(), account_id=acc_id))
+                        today.isoformat(), account_id=acc_id))
                 if settle_events:
                     alert_store.append_many(repo.store.data_dir, settle_events)
             except Exception as e:

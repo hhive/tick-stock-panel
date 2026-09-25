@@ -1,4 +1,9 @@
-"""量化研究候选方案的轻量本地存储。"""
+"""量化研究候选方案的轻量本地存储 — ``<user_root>/user_data/research_candidates.json``。
+
+**每账户一份**: user_root 由 ``user_paths.resolve_user_root()`` 在**构造时**解析并钉死
+(请求路径走认证中间件注入的 contextvar, 后台线程必须显式传 ``user_root=``)。刻意在
+``__init__`` 里解析而不是每次读写时解析: 候选池对象可能被交给后台发布流程, 那时
+contextvar 已经丢了, 晚解析会解析到别人或直接报错; 早解析则整条生命周期绑定同一账户。"""
 
 from __future__ import annotations
 
@@ -9,6 +14,8 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
+
+from app.services.user_paths import resolve_user_root
 
 CandidateKind = Literal["factor", "strategy"]
 CandidateStatus = Literal["pending", "validated", "rejected"]
@@ -133,8 +140,8 @@ class CandidateValidationError(CandidateStoreError):
 
 
 class CandidateStore:
-    def __init__(self, data_dir: Path) -> None:
-        self.path = Path(data_dir) / "user_data" / "research_candidates.json"
+    def __init__(self, user_root: Path | None = None) -> None:
+        self.path = resolve_user_root(user_root) / "user_data" / "research_candidates.json"
 
     def list(self) -> list[dict[str, Any]]:
         with _lock:

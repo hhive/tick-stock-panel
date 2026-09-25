@@ -62,27 +62,40 @@ def _get_monitor(request: Request) -> StrategyMonitorService:
 
 
 def _data_dir(request: Request) -> Path:
+    """**共享**行情数据根 (K线/财务/因子…), 所有账户同一份。"""
     return request.app.state.repo.store.data_dir
+
+
+def _user_root(request: Request) -> Path:
+    """**当前账户**私有数据根 —— 策略源码/覆盖配置/缓存/回测结果都落在这里。
+
+    解析走 user_paths 的统一接缝 (认证中间件已按账户设好 contextvar)。
+    刻意不提供"解析不到就用共享目录"的回退: 那等于把 A 的策略写进 B 的视野。
+    """
+    from app.services.user_paths import resolve_user_root
+
+    return resolve_user_root()
 
 
 def _invalidate_strategy_runtime(request: Request) -> None:
     from app.services import strategy_cache
 
-    strategy_cache.clear_cache(_data_dir(request))
+    strategy_cache.clear_cache(_user_root(request))
     monitor_engine = getattr(request.app.state, "monitor_engine", None)
     if monitor_engine is not None:
         monitor_engine.invalidate_strategy_state()
 
 
-def _missing_custom_signals(data_dir: Path, required_features) -> list[str]:
+def _missing_custom_signals(user_root: Path, required_features) -> list[str]:
     """required_features 中 csg_ 列对应信号未定义的部分 (保存策略前校验)。
 
-    自定义信号列 (csg_ 前缀) 只有在 data/user_data/custom_signals/*.json
+    自定义信号列 (csg_ 前缀) 只有在**本账户**的 user_data/custom_signals/*.json
     有对应定义时才会被注入; 引用不存在的信号运行必报缺列错, 保存时早失败。
+    必须查本账户: 查共享目录会把别人的信号当成"已定义"放行。
     """
     from app.strategy import custom_signals
 
-    defined = {s.get("id") for s in custom_signals.load_all(data_dir)}
+    defined = {s.get("id") for s in custom_signals.load_all(user_root)}
     return [
         name for name in (required_features or ())
         if isinstance(name, str) and name.startswith(custom_signals.PREFIX)
@@ -95,11 +108,11 @@ def _cleanup_deleted_strategy(request: Request, strategy_id: str) -> list[str]:
     from app.services import preferences
     from app.strategy import monitor_rules
 
-    data_dir = _data_dir(request)
+    user_root = _user_root(request)
     warnings: list[str] = []
 
     try:
-        strategy_config.delete_override(data_dir, strategy_id)
+        strategy_config.delete_override(strategy_id, user_root=user_root)
     except Exception as e:
         warnings.append(f"覆盖配置清理失败: {e}")
 
@@ -119,7 +132,7 @@ def _cleanup_deleted_strategy(request: Request, strategy_id: str) -> list[str]:
 
     try:
         rules_changed = False
-        for rule in monitor_rules.load_all(data_dir):
+        for rule in monitor_rules.load_all():
             if (
                 rule.get("type") == "strategy"
                 and rule.get("strategy_id") == strategy_id
@@ -127,12 +140,12 @@ def _cleanup_deleted_strategy(request: Request, strategy_id: str) -> list[str]:
             ):
                 rule = dict(rule)
                 rule["enabled"] = False
-                monitor_rules.save_one(data_dir, rule)
+                monitor_rules.save_one(rule)
                 rules_changed = True
 
         monitor_engine = getattr(request.app.state, "monitor_engine", None)
         if rules_changed and monitor_engine is not None:
-            monitor_engine.set_rules(monitor_rules.load_all(data_dir))
+            monitor_engine.set_rules(monitor_rules.load_all())
     except Exception as e:
         warnings.append(f"关联监控清理失败: {e}")
 
@@ -322,8 +335,7 @@ def list_strategies(
     include_research: bool = False,
 ):
     engine = _get_engine(request)
-    data_dir = _data_dir(request)
-    all_overrides = strategy_config.list_overrides(data_dir)
+    all_overrides = strategy_config.list_overrides(user_root=_user_root(request))
 
     result = []
     # include_research=True 时返回 research_only 草稿(供前端「草稿」分区展示/发布)。
@@ -346,7 +358,7 @@ def list_strategies(
 def get_strategy(strategy_id: str, request: Request):
     engine = _get_engine(request)
     s = _get_public_strategy(engine, strategy_id)
-    overrides = strategy_config.load_override(_data_dir(request), strategy_id)
+    overrides = strategy_config.load_override(strategy_id, user_root=_user_root(request))
     return _strategy_detail(s, overrides or None, engine)
 
 
@@ -357,10 +369,9 @@ def get_strategy(strategy_id: str, request: Request):
 def run_strategy(req: RunRequest, request: Request):
     engine = _get_engine(request)
     _get_public_strategy(engine, req.strategy_id)
-    data_dir = _data_dir(request)
 
-    # 读取用户覆盖配置
-    overrides = strategy_config.load_override(data_dir, req.strategy_id)
+    # 读取用户覆盖配置 (本账户)
+    overrides = strategy_config.load_override(req.strategy_id, user_root=_user_root(request))
     params = req.params or {}
     # 合并用户保存的策略参数
     if overrides.get("params"):
@@ -404,7 +415,6 @@ def run_strategy(req: RunRequest, request: Request):
 @router.post("/run-all")
 def run_all(req: RunAllRequest, request: Request):
     engine = _get_engine(request)
-    data_dir = _data_dir(request)
 
     as_of = req.as_of
     if not as_of:
@@ -414,7 +424,7 @@ def run_all(req: RunAllRequest, request: Request):
     if not as_of:
         return {"as_of": None, "results": {}}
 
-    all_overrides = strategy_config.list_overrides(data_dir)
+    all_overrides = strategy_config.list_overrides(user_root=_user_root(request))
     strategy_ids = [
         meta["id"]
         for meta in engine.list_strategies()
@@ -460,7 +470,7 @@ def save_config(req: SaveConfigRequest, request: Request):
     # 剥离与策略默认值相同的字段，只保存用户真正修改过的值
     overrides = _strip_defaults(req.strategy_id, req.overrides, engine)
 
-    strategy_config.save_override(_data_dir(request), req.strategy_id, overrides)
+    strategy_config.save_override(req.strategy_id, overrides, user_root=_user_root(request))
     return {"ok": True}
 
 
@@ -468,14 +478,14 @@ def save_config(req: SaveConfigRequest, request: Request):
 def patch_config(req: SaveConfigRequest, request: Request):
     engine = _get_engine(request)
     _get_public_strategy(engine, req.strategy_id)
-    data_dir = _data_dir(request)
-    overrides = strategy_config.load_override(data_dir, req.strategy_id)
+    user_root = _user_root(request)
+    overrides = strategy_config.load_override(req.strategy_id, user_root=user_root)
     overrides.update(req.overrides)
     _validate_scoring_config(overrides)
     strategy_config.save_override(
-        data_dir,
         req.strategy_id,
         _strip_defaults(req.strategy_id, overrides, engine),
+        user_root=user_root,
     )
     return {"ok": True}
 
@@ -532,7 +542,7 @@ def _strip_defaults(strategy_id: str, overrides: dict, engine) -> dict:
 @router.delete("/config/{strategy_id}")
 def reset_config(strategy_id: str, request: Request):
     _get_public_strategy(_get_engine(request), strategy_id)
-    strategy_config.delete_override(_data_dir(request), strategy_id)
+    strategy_config.delete_override(strategy_id, user_root=_user_root(request))
     return {"ok": True}
 
 
@@ -696,10 +706,14 @@ def _validate_strategy_id(strategy_id: str) -> str:
     return sid
 
 
-def _target_dir(data_dir: Path, source: str) -> Path:
+def _target_dir(user_root: Path, source: str) -> Path:
+    """策略源码落盘目录 —— ``<user_root>/strategies/{ai,custom,composite}`` (**每账户一份**)。
+
+    与 ``_data_dir`` (共享行情) 无关: 策略源码是用户资产, 不同账户可以同 ID 各存一份。
+    """
     if source not in {"ai", "custom", "composite"}:
         raise ValueError("target_source 必须是 ai、custom 或 composite")
-    return data_dir / "strategies" / source
+    return user_root / "strategies" / source
 
 
 def _prepare_strategy_code(req: StrategyCodeValidateRequest | StrategyCodeSaveRequest) -> dict:
@@ -740,7 +754,7 @@ def _save_strategy_code(req: StrategyCodeSaveRequest, request: Request, *, legac
             raise ValueError("策略 ID 必须以 ai_ 或 custom_ 开头")
 
     engine = _get_engine(request)
-    data_dir = _data_dir(request)
+    user_root = _user_root(request)
     existing: StrategyDef | None = None
     try:
         existing = engine.get(sid)
@@ -754,7 +768,7 @@ def _save_strategy_code(req: StrategyCodeSaveRequest, request: Request, *, legac
             raise ValueError("自定义策略 ID 必须以 custom_ 开头")
 
     if legacy_ai_path:
-        out_dir = _target_dir(data_dir, "ai")
+        out_dir = _target_dir(user_root, "ai")
         out_dir.mkdir(parents=True, exist_ok=True)
         path = out_dir / f"{sid}.py"
         expected_source = "ai"
@@ -769,7 +783,7 @@ def _save_strategy_code(req: StrategyCodeSaveRequest, request: Request, *, legac
         if existing is not None:
             raise ValueError(f"策略 {sid} 已存在，请改用修改模式或换一个策略 ID")
         source_dir = "ai" if legacy_ai_path else req.target_source
-        out_dir = _target_dir(data_dir, source_dir)
+        out_dir = _target_dir(user_root, source_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         path = out_dir / f"{sid}.py"
         expected_source = "ai" if legacy_ai_path else req.target_source
@@ -798,7 +812,7 @@ def _save_strategy_code(req: StrategyCodeSaveRequest, request: Request, *, legac
             raise ValueError(f"策略来源异常: 期望 {expected_source}, 实际 {loaded.source}")
         # 自定义信号存在性校验: REQUIRED_FEATURES 里 csg_ 列必须已有定义,
         # 否则运行必报缺列错。早失败并恢复文件, 提示用户先创建信号。
-        missing = _missing_custom_signals(data_dir, loaded.required_features)
+        missing = _missing_custom_signals(user_root, loaded.required_features)
         if missing:
             raise ValueError(
                 "策略引用了未定义的自定义信号: " + ", ".join(sorted(missing))
@@ -981,13 +995,19 @@ async def ai_iterate(req: AIIterateRequest, request: Request):
 
     engine = _get_engine(request)
     data_dir = _data_dir(request)
+    user_root = _user_root(request)
     try:
         prompt = build_step1(
             req.name, req.description, req.direction, req.rules,
             strategy_id="", execution_backend=req.execution_backend,
         )
         iterator = AIStrategyIterator(max_rounds=req.max_rounds)
-        result = await iterator.iterate(prompt, engine=engine, data_dir=str(data_dir))
+        result = await iterator.iterate(
+            prompt,
+            engine=engine,
+            data_dir=str(data_dir),
+            user_root=user_root,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception:
@@ -1066,7 +1086,7 @@ def _save_composite_strategy(req: StrategyCompositeSaveRequest, request: Request
         raise ValueError("叠加策略 ID 必须以 composite_ 开头")
 
     engine = _get_engine(request)
-    data_dir = _data_dir(request)
+    user_root = _user_root(request)
 
     existing: StrategyDef | None = None
     try:
@@ -1103,7 +1123,7 @@ def _save_composite_strategy(req: StrategyCompositeSaveRequest, request: Request
         sid, req.name, req.description, children, req.merge_mode, req.min_confirm
     )
 
-    out_dir = _target_dir(data_dir, "composite")
+    out_dir = _target_dir(user_root, "composite")
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"{sid}.py"
     previous_code = path.read_text(encoding="utf-8") if path.exists() else None
@@ -1220,12 +1240,14 @@ def delete_strategy(strategy_id: str, request: Request):
         )
 
     path = s.file_path
-    data_dir = _data_dir(request)
+    user_root = _user_root(request)
     if path is None or s.source not in {"custom", "ai", "composite"}:
         raise HTTPException(status_code=400, detail="策略源文件路径无效, 无法删除")
 
     try:
-        allowed_dir = (data_dir / "strategies" / s.source).resolve()
+        # 只允许删**本账户**策略目录内的文件; 用 user_root 而非共享 data_dir,
+        # 否则别的账户的 strategies/ 会落进 allowed_dir, 路径校验形同虚设。
+        allowed_dir = _target_dir(user_root, s.source).resolve()
         resolved_path = path.resolve()
     except (OSError, RuntimeError) as e:
         raise HTTPException(status_code=409, detail=f"无法访问策略文件: {e}") from e

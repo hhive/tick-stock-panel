@@ -49,8 +49,12 @@ def _should_use_free_server() -> bool:
 
 
 def _base_url() -> str | None:
-    """从 secrets.json 读取用户自定义端点,没有则返回 None(用 SDK 默认)。"""
-    return secrets_store.load().get("tickflow_base_url") or None
+    """读部署级自定义端点, 没有则返回 None(用 SDK 默认)。
+
+    必须走部署级凭据: 本函数在后台线程/子进程里被行情取数路径调用, 那里没有
+    账户上下文, 走每用户 secrets.json 会抛 MissingUserContextError。
+    """
+    return secrets_store.get_deployment("tickflow_base_url") or None
 
 
 def get_client() -> TickFlow:

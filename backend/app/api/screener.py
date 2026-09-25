@@ -10,6 +10,7 @@ import re
 import time
 from dataclasses import asdict, replace
 from datetime import date, datetime
+from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -24,6 +25,17 @@ from app.strategy import config as strategy_config
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/screener", tags=["screener"])
+
+
+def _user_root(request: Request) -> Path:
+    """**当前账户**私有数据根 (策略覆盖/结果缓存/耗时记录)。
+
+    解析走 user_paths 的统一接缝 (认证中间件已按账户设好 contextvar);
+    刻意无"回退到共享目录"的分支 —— 那等于把 A 的策略结果下发给 B。
+    """
+    from app.services.user_paths import resolve_user_root
+
+    return resolve_user_root()
 
 
 class CustomRequest(BaseModel):
@@ -235,10 +247,10 @@ def _cache_payload_with_ext(cached: dict, ext_values: dict[str, dict[str, Any]])
     return payload
 
 
-def _update_cache_strategy(data_dir, as_of: str, strategy_id: str, safe_data: dict) -> None:
-    """单跑后更新缓存中该策略的结果，保持缓存与最新计算一致。"""
+def _update_cache_strategy(user_root, as_of: str, strategy_id: str, safe_data: dict) -> None:
+    """单跑后更新**本账户**缓存中该策略的结果，保持缓存与最新计算一致。"""
     from app.services import strategy_cache
-    cached = strategy_cache.read_cache(data_dir)
+    cached = strategy_cache.read_cache(user_root)
     if cached and cached.get("as_of") == as_of:
         results = cached.get("results", {})
         results[strategy_id] = {
@@ -250,7 +262,7 @@ def _update_cache_strategy(data_dir, as_of: str, strategy_id: str, safe_data: di
             # 数据不足提示 (#303) 随缓存下发 (get_cached 原样读出),
             # 单跑刷新不得冲掉 run_all 写入的提示
             results[strategy_id]["warnings"] = safe_data["warnings"]
-        strategy_cache.write_cache(data_dir, as_of, results)
+        strategy_cache.write_cache(as_of, results, user_root=user_root)
 
 
 @router.get("/strategies")
@@ -260,7 +272,7 @@ def strategies(
     timeframe: str = Query("1d"),
 ):
     """兼容策略清单端点；唯一数据源为 StrategyEngine。"""
-    data_dir = request.app.state.repo.store.data_dir
+    user_root = _user_root(request)
     engine = getattr(request.app.state, "strategy_engine", None)
     if engine is None:
         raise HTTPException(status_code=503, detail="策略引擎未初始化")
@@ -273,7 +285,7 @@ def strategies(
         if timeframe not in meta.get("timeframes", ["1d"]):
             continue
         sid = meta["id"]
-        overrides = strategy_config.load_override(data_dir, sid)
+        overrides = strategy_config.load_override(sid, user_root=user_root)
         presets.append({
             **meta,
             "name": overrides.get("name") or meta["name"],
@@ -314,10 +326,10 @@ def run_preset(req: PresetRequest, request: Request):
     if not as_of:
         raise HTTPException(status_code=400, detail="无可用数据日期")
 
-    # 加载用户保存的策略配置
-    data_dir = request.app.state.repo.store.data_dir
+    # 加载当前账户保存的策略配置
+    user_root = _user_root(request)
     ext_values = _load_ext_value_maps(repo, req.ext_columns)
-    overrides = strategy_config.load_override(data_dir, req.strategy_id)
+    overrides = strategy_config.load_override(req.strategy_id, user_root=user_root)
     engine = getattr(request.app.state, "strategy_engine", None)
     if not engine:
         raise HTTPException(status_code=404, detail=f"策略引擎未初始化或策略 {req.strategy_id} 不存在")
@@ -359,15 +371,14 @@ def run_preset(req: PresetRequest, request: Request):
         )
         if warnings:
             safe_data["warnings"] = warnings
-        _update_cache_strategy(data_dir, str(as_of), req.strategy_id, safe_data)
+        _update_cache_strategy(user_root, str(as_of), req.strategy_id, safe_data)
 
     return _result_with_ext(safe_data, ext_values)
 
 
 def _cached_with_realtime(request: Request) -> dict:
-    """读取盘后缓存，并用监控引擎的实时结果覆盖同策略。"""
-    data_dir = request.app.state.repo.store.data_dir
-    cached = strategy_cache.read_cache(data_dir)
+    """读取**本账户**盘后缓存，并用监控引擎的实时结果覆盖同策略。"""
+    cached = strategy_cache.read_cache(_user_root(request))
     if cached is None:
         cached = {"as_of": None, "results": {}, "updated_at": None}
 
@@ -541,7 +552,7 @@ def market_snapshot(request: Request):
 
 def _run_all_progressive(
     *,
-    repo,
+    user_root: Path,
     engine,
     svc: ScreenerService,
     as_of,
@@ -558,10 +569,11 @@ def _run_all_progressive(
     执行全程在单飞执行器里 (见 services/strategy_run_queue.py): 相同请求
     搭车现有执行, 不同请求排队; HTTP 侧只轮询状态快照到首返时限。
     """
-    data_dir = repo.store.data_dir
+    # 后台 job 跑在 strategy_run_queue 的 daemon 线程里, 那里没有请求上下文 ——
+    # 必须在**请求线程**解析出账户根并闭包捕获, 不能在 job 里现解析。
     key = (asset_type, timeframe, str(as_of), tuple(sorted(all_ids)))
     ordered_ids = strategy_run_queue.order_strategy_ids(
-        all_ids, strategy_run_queue.load_run_timings(data_dir)
+        all_ids, strategy_run_queue.load_run_timings(user_root)
     )
 
     def job(handle: strategy_run_queue.StrategyRunHandle) -> None:
@@ -623,15 +635,15 @@ def _run_all_progressive(
             elapsed_map[sid] = (time.perf_counter() - t0) * 1000
             # 逐策略增量落盘 (write_cache 同日按 sid 合并), 前端轮询即可逐个看到
             try:
-                strategy_cache.write_cache(data_dir, str(as_of), {sid: payload})
+                strategy_cache.write_cache(str(as_of), {sid: payload}, user_root=user_root)
             except Exception:
                 logger.warning("run_all 渐进写入缓存失败: %s", sid, exc_info=True)
             handle.complete(sid, {k: v for k, v in payload.items() if k != "rows"})
         # 收尾: 与旧版口径一致的整体重写 + 耗时落盘供下次排序
         if all_results:
             with contextlib.suppress(Exception):
-                strategy_cache.write_cache(data_dir, str(as_of), all_results)
-        strategy_run_queue.record_run_timings(data_dir, elapsed_map)
+                strategy_cache.write_cache(str(as_of), all_results, user_root=user_root)
+        strategy_run_queue.record_run_timings(elapsed_map, user_root=user_root)
 
     handle = strategy_run_queue.MANAGER.get_or_submit(key, ordered_ids, job)
     deadline = time.perf_counter() + first_return_s
@@ -693,7 +705,7 @@ def run_all(request: Request, body: Optional[dict] = None):
     if not as_of:
         return {"as_of": None, "results": {}}
 
-    data_dir = request.app.state.repo.store.data_dir
+    user_root = _user_root(request)
 
     requested_ids = body.get("strategy_ids")
     if requested_ids and isinstance(requested_ids, list):
@@ -719,7 +731,7 @@ def run_all(request: Request, body: Optional[dict] = None):
 
     # 批量预加载所有 override 配置
     t0 = time.perf_counter()
-    all_overrides = strategy_config.list_overrides(data_dir)
+    all_overrides = strategy_config.list_overrides(user_root=user_root)
     logger.info("run_all: list_overrides took %.1fms (%d overrides)", (time.perf_counter() - t0) * 1000, len(all_overrides))
 
     params_map = {
@@ -734,7 +746,7 @@ def run_all(request: Request, body: Optional[dict] = None):
     first_return_s = settings.strategy_run_all_first_return_s
     if body.get("summary_only") and timeframe == "1d" and first_return_s > 0:
         return _run_all_progressive(
-            repo=repo,
+            user_root=user_root,
             engine=engine,
             svc=svc,
             as_of=as_of,
@@ -787,7 +799,7 @@ def run_all(request: Request, body: Optional[dict] = None):
     # 写入策略缓存 (供页面秒加载); 分钟周期结果不落盘 (日线语义缓存)
     if results and timeframe == "1d":
         try:
-            strategy_cache.write_cache(data_dir, str(as_of), results)
+            strategy_cache.write_cache(str(as_of), results, user_root=user_root)
         except Exception:  # noqa: BLE001
             pass
 

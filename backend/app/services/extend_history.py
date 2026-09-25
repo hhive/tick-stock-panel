@@ -52,8 +52,11 @@ def _resolve_universe(capset: CapabilitySet) -> list[str]:
     from app.config import settings
     from pathlib import Path
     import polars as pl
+    # 与 daily_pipeline._resolve_universe 同一理由: 自选已按账户隔离, 而此处是
+    # **共享**行情的历史补齐路径, 没有也不该有"当前账户"概念。并入某个账户的自选
+    # 会让首个被碰到的账户悄悄决定补数范围(跨租户泄漏); instruments parquet 已含
+    # 全量标的, 去掉后覆盖面不变。
     base: set[str] = set(DEMO_SYMBOLS)
-    base.update(_get_pool("watchlist"))
     d = Path(settings.data_dir)
     inst_path = d / "instruments" / "instruments.parquet"
     if inst_path.exists():

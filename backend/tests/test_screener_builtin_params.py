@@ -4,8 +4,26 @@ import types
 from datetime import date
 from typing import ClassVar
 
+import pytest
+
 from app.api import screener as screener_api
 from app.services.screener import ScreenerResult
+
+@pytest.fixture(autouse=True)
+def _current_user_context(tmp_path):
+    """把「当前账户根」设为本次用例的临时目录。
+
+    HTTP handler 通过 user_paths 的统一接缝解析账户私有目录 (真实请求里由认证
+    中间件注入 contextvar); 这里直接调用 handler 或只挂了 router 的 TestClient,
+    必须自己注入, 否则 fail-closed 抛 MissingUserContextError。
+    data_dir 与 user_root 同取 tmp_path: 用例只关心"落到哪个根", 不区分共享/私有。
+    """
+    from app.services import preferences
+
+    token = preferences.set_current_user_root(tmp_path)
+    yield tmp_path
+    preferences.reset_current_user_root(token)
+
 
 
 class _CapturingScreenerService:
@@ -84,7 +102,7 @@ def _install_api_fakes(monkeypatch):
     monkeypatch.setattr(screener_api, "ScreenerService", _CapturingScreenerService)
     monkeypatch.setattr(screener_api, "_load_ext_value_maps", lambda *_args: {})
     monkeypatch.setattr(screener_api, "_update_cache_strategy", lambda *_args: None)
-    monkeypatch.setattr(screener_api.strategy_cache, "write_cache", lambda *_args: None)
+    monkeypatch.setattr(screener_api.strategy_cache, "write_cache", lambda *_args, **_kwargs: None)
 
 
 def test_single_run_passes_saved_params_to_strategy_engine(monkeypatch, tmp_path):
@@ -92,7 +110,7 @@ def test_single_run_passes_saved_params_to_strategy_engine(monkeypatch, tmp_path
     request = _api_request(tmp_path, engine)
     _install_api_fakes(monkeypatch)
     saved = {"params": {"threshold": 3.0, "enabled": False}}
-    monkeypatch.setattr(screener_api.strategy_config, "load_override", lambda *_args: saved)
+    monkeypatch.setattr(screener_api.strategy_config, "load_override", lambda *_args, **_kwargs: saved)
 
     screener_api.run_preset(
         screener_api.PresetRequest(
@@ -118,7 +136,7 @@ def test_batch_run_passes_saved_params_to_strategy_engine(monkeypatch, tmp_path)
     monkeypatch.setattr(
         screener_api.strategy_config,
         "list_overrides",
-        lambda *_args: {"builtin_strategy": saved},
+        lambda *_args, **_kwargs: {"builtin_strategy": saved},
     )
 
     screener_api.run_all(
@@ -141,8 +159,8 @@ def test_batch_summary_response_still_writes_full_cache(monkeypatch, tmp_path):
     request = _api_request(tmp_path, engine)
     _install_api_fakes(monkeypatch)
     written = []
-    monkeypatch.setattr(screener_api.strategy_config, "list_overrides", lambda *_args: {})
-    monkeypatch.setattr(screener_api.strategy_cache, "write_cache", lambda *args: written.append(args))
+    monkeypatch.setattr(screener_api.strategy_config, "list_overrides", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(screener_api.strategy_cache, "write_cache", lambda *args, **_kwargs: written.append(args))
 
     payload = screener_api.run_all(
         request,
@@ -161,5 +179,5 @@ def test_batch_summary_response_still_writes_full_cache(monkeypatch, tmp_path):
     assert payload["complete"] is True
     assert payload["error"] is None
     # 渐进式增量写 + 收尾全量写都带 rows, 缓存口径不变
-    assert written[0][2]["builtin_strategy"]["rows"] == []
-    assert written[-1][2]["builtin_strategy"]["rows"] == []
+    assert written[0][1]["builtin_strategy"]["rows"] == []
+    assert written[-1][1]["builtin_strategy"]["rows"] == []

@@ -32,9 +32,7 @@ def list_alerts(
     ext_columns: 逗号分隔的 "configId.fieldName", 传入后按 symbol 富化行业/概念等 ext 字段,
     每条记录附带 {configId}__{fieldName} 键 (与 watchlist/screener 一致)。
     """
-    events = alert_store.list_recent(
-        _data_dir(request), days=days, limit=limit, source=source, type=type,
-    )
+    events = alert_store.list_recent(days=days, limit=limit, source=source, type=type)
     if ext_columns and events:
         try:
             from app.api.screener import _load_ext_value_maps, _rows_with_ext
@@ -44,21 +42,21 @@ def list_alerts(
                 events = _rows_with_ext(events, value_maps)
         except Exception:  # noqa: BLE001
             pass
-    total = alert_store.count(_data_dir(request))
+    total = alert_store.count()
     return {"alerts": events, "total": total}
 
 
 @router.delete("")
 def clear_alerts(request: Request):
     """清空全部触发记录。"""
-    n = alert_store.clear(_data_dir(request))
+    n = alert_store.clear()
     return {"ok": True, "cleared": n}
 
 
 @router.delete("/{ts}")
 def delete_alert(ts: int, request: Request):
     """删除单条触发记录 (按 ts 毫秒时间戳)。"""
-    deleted = alert_store.delete_one(_data_dir(request), ts)
+    deleted = alert_store.delete_one(ts)
     if not deleted:
         raise HTTPException(status_code=404, detail="记录不存在")
     return {"ok": True}
@@ -134,7 +132,7 @@ def seed_demo_alerts(request: Request, count: int = 12, recent: bool = True):
             "signals": signals,
             "severity": severity,
         })
-    alert_store.append_many(_data_dir(request), events)
+    alert_store.append_many(events)
 
     # 同步推入 SSE 队列, 让所有连着 SSE 的客户端实时收到 (不依赖轮询)
     qs = getattr(request.app.state, "quote_service", None)

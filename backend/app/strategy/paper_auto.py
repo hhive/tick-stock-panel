@@ -5,8 +5,10 @@
 冷却: 同规则同 symbol 最近一次自动下单后 N 个交易日内不再触发 (按订单
 created_at 日期判断, 无独立状态文件 — 可由订单列表重放推导)。
 
-规则按账户存放 (accounts/{account_id}/auto_rules/), 账户间隔离;
-on_rule_events 由钩子对每个账户各调一次。
+规则按账户存放 (<user_root>/paper/accounts/{account_id}/auto_rules/), 账户间隔离;
+on_rule_events 由钩子对每个账户各调一次。user_root (面板账户) 由
+``user_paths.resolve_user_root()`` 解析: 请求路径走认证中间件注入的 contextvar,
+后台线程/调度器必须显式传 user_root=。
 
 触发链路: quote_service._evaluate_monitors 产出的 rule_events →
 paper_auto.on_rule_events → paper.create_order(source=f"auto:{rule_id}")。
@@ -23,13 +25,14 @@ from pathlib import Path
 
 from app.market_time import cn_now
 from app.services.fs_utils import atomic_write_text
+from app.services.user_paths import resolve_user_root
 from app.strategy import paper
 
 logger = logging.getLogger(__name__)
 
 
-def _dir(data_dir: Path, account_id: str) -> Path:
-    d = paper._root(data_dir, account_id) / "auto_rules"
+def _dir(root: Path, account_id: str) -> Path:
+    d = paper._root(root, account_id) / "auto_rules"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -79,9 +82,13 @@ def normalize_rule(rule: dict) -> dict:
     return d
 
 
-def load_auto_rules(data_dir: Path, account_id: str = paper.DEFAULT_ACCOUNT_ID, enabled_only: bool = False) -> list[dict]:
+def load_auto_rules(
+    account_id: str = paper.DEFAULT_ACCOUNT_ID,
+    enabled_only: bool = False,
+    user_root: Path | None = None,
+) -> list[dict]:
     out: list[dict] = []
-    for f in sorted(_dir(data_dir, account_id).glob("arule_*.json")):
+    for f in sorted(_dir(resolve_user_root(user_root), account_id).glob("arule_*.json")):
         try:
             r = normalize_rule(json.loads(f.read_text(encoding="utf-8")))
             if enabled_only and not r.get("enabled"):
@@ -92,33 +99,52 @@ def load_auto_rules(data_dir: Path, account_id: str = paper.DEFAULT_ACCOUNT_ID, 
     return out
 
 
-def save_auto_rule(data_dir: Path, rule: dict, account_id: str = paper.DEFAULT_ACCOUNT_ID) -> dict:
+def save_auto_rule(
+    rule: dict,
+    account_id: str = paper.DEFAULT_ACCOUNT_ID,
+    user_root: Path | None = None,
+) -> dict:
     validate_rule(rule)
-    atomic_write_text(_dir(data_dir, account_id) / f"{rule['id']}.json", json.dumps(rule, ensure_ascii=False, indent=2))
+    root = resolve_user_root(user_root)
+    atomic_write_text(_dir(root, account_id) / f"{rule['id']}.json", json.dumps(rule, ensure_ascii=False, indent=2))
     return rule
 
 
-def create_auto_rule(data_dir: Path, rule: dict, account_id: str = paper.DEFAULT_ACCOUNT_ID) -> dict:
+def create_auto_rule(
+    rule: dict,
+    account_id: str = paper.DEFAULT_ACCOUNT_ID,
+    user_root: Path | None = None,
+) -> dict:
     rule = normalize_rule({**rule, "id": _new_id()})
     validate_rule(rule)
-    return save_auto_rule(data_dir, rule, account_id)
+    return save_auto_rule(rule, account_id, user_root=user_root)
 
 
-def delete_auto_rule(data_dir: Path, rule_id: str, account_id: str = paper.DEFAULT_ACCOUNT_ID) -> bool:
-    p = _dir(data_dir, account_id) / f"{rule_id}.json"
+def delete_auto_rule(
+    rule_id: str,
+    account_id: str = paper.DEFAULT_ACCOUNT_ID,
+    user_root: Path | None = None,
+) -> bool:
+    p = _dir(resolve_user_root(user_root), account_id) / f"{rule_id}.json"
     if p.exists():
         p.unlink()
         return True
     return False
 
 
-def set_enabled(data_dir: Path, rule_id: str, enabled: bool, account_id: str = paper.DEFAULT_ACCOUNT_ID) -> dict | None:
-    p = _dir(data_dir, account_id) / f"{rule_id}.json"
+def set_enabled(
+    rule_id: str,
+    enabled: bool,
+    account_id: str = paper.DEFAULT_ACCOUNT_ID,
+    user_root: Path | None = None,
+) -> dict | None:
+    root = resolve_user_root(user_root)
+    p = _dir(root, account_id) / f"{rule_id}.json"
     if not p.exists():
         return None
     rule = normalize_rule(json.loads(p.read_text(encoding="utf-8")))
     rule["enabled"] = enabled
-    return save_auto_rule(data_dir, rule, account_id)
+    return save_auto_rule(rule, account_id, user_root=root)
 
 
 def _matches(rule: dict, ev: dict) -> bool:
@@ -127,13 +153,13 @@ def _matches(rule: dict, ev: dict) -> bool:
     return ev.get("rule_id") == rule["match_id"]
 
 
-def _in_cooldown(data_dir: Path, rule: dict, symbol: str, cooldown_days: int, account_id: str) -> bool:
+def _in_cooldown(root: Path, rule: dict, symbol: str, cooldown_days: int, account_id: str) -> bool:
     """同规则同 symbol 最近一次自动下单是否仍在冷却期 (按日历日, 含当日)。"""
     if cooldown_days <= 0:
         return False
     prefix = f"auto:{rule['id']}"
     today = cn_now().date()
-    for order in paper.load_orders(data_dir, account_id):
+    for order in paper.load_orders(account_id, user_root=root):
         if order.get("source") != prefix or order.get("symbol") != symbol:
             continue
         try:
@@ -145,22 +171,26 @@ def _in_cooldown(data_dir: Path, rule: dict, symbol: str, cooldown_days: int, ac
     return False
 
 
-def _sizing_qty(data_dir: Path, rule: dict, ref_price: float, account_id: str) -> int:
+def _sizing_qty(root: Path, rule: dict, ref_price: float, account_id: str) -> int:
     if ref_price <= 0:
         return 0
     if rule["size_mode"] == "fixed_amount":
         amount = float(rule["size_value"])
     else:  # pct_equity: 按账户总权益 (现金 + 最新定版持仓市值)
-        acc = paper.get_account(data_dir, account_id)
+        acc = paper.get_account(account_id, user_root=root)
         if acc is None:
             return 0
-        nav_rows = paper.load_nav(data_dir, account_id)
+        nav_rows = paper.load_nav(account_id, user_root=root)
         equity = nav_rows[-1]["nav"] if nav_rows else float(acc["cash"])
         amount = equity * float(rule["size_value"]) / 100.0
     return paper.qty_from_amount(amount, ref_price)
 
 
-def on_rule_events(data_dir: Path, events: list[dict], account_id: str = paper.DEFAULT_ACCOUNT_ID) -> list[dict]:
+def on_rule_events(
+    events: list[dict],
+    account_id: str = paper.DEFAULT_ACCOUNT_ID,
+    user_root: Path | None = None,
+) -> list[dict]:
     """监控事件 → 自动下单。返回本次创建的订单列表 (被拒订单只记日志)。
 
     触发条件: 事件带 symbol 与价格、有规则匹配、未冷却; 下单复用 paper.create_order
@@ -169,7 +199,8 @@ def on_rule_events(data_dir: Path, events: list[dict], account_id: str = paper.D
     created: list[dict] = []
     if not events:
         return created
-    rules = load_auto_rules(data_dir, account_id, enabled_only=True)
+    root = resolve_user_root(user_root)
+    rules = load_auto_rules(account_id, enabled_only=True, user_root=root)
     if not rules:
         return created
     with paper.PAPER_LOCK:
@@ -181,19 +212,20 @@ def on_rule_events(data_dir: Path, events: list[dict], account_id: str = paper.D
             for rule in rules:
                 if not _matches(rule, ev):
                     continue
-                if _in_cooldown(data_dir, rule, symbol, int(rule.get("cooldown_days", 0)), account_id):
+                if _in_cooldown(root, rule, symbol, int(rule.get("cooldown_days", 0)), account_id):
                     continue
-                qty = _sizing_qty(data_dir, rule, float(price), account_id)
+                qty = _sizing_qty(root, rule, float(price), account_id)
                 if qty <= 0:
                     logger.info("paper auto %s: %s 金额不足以一手 (价 %s)", rule["name"], symbol, price)
                     continue
                 order, err = paper.create_order(
-                    data_dir, symbol, rule["side"],
+                    symbol, rule["side"],
                     account_id=account_id,
                     qty=qty,
                     order_type=rule["order_type"],
                     ref_price=float(price),
                     source=f"auto:{rule['id']}",
+                    user_root=root,
                 )
                 if err:
                     logger.info("paper auto %s: %s 下单被拒: %s", rule["name"], symbol, err)

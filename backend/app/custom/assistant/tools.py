@@ -518,7 +518,7 @@ def _get_lots(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
 
     if ctx.data_dir is None:
         raise ValueError("数据目录未就绪。")
-    lots = load_all(ctx.data_dir)
+    lots = load_all()
     if not lots:
         return {"count": 0, "rows": [], "note": "暂无持仓提醒记录。"}
     symbols = [str(lot.get("symbol") or "") for lot in lots if lot.get("symbol")]
@@ -565,7 +565,7 @@ def _run_strategy(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     as_of = svc.latest_date()
     if as_of is None:
         raise ValueError("本地暂无行情数据, 无法执行策略。")
-    overrides = load_override(ctx.data_dir, strategy_id) or {} if ctx.data_dir else {}
+    overrides = load_override(strategy_id, user_root=ctx.data_dir) or {} if ctx.data_dir else {}
     context = svc.build_strategy_context(
         ctx.engine, as_of, [strategy_id], overrides_map={strategy_id: overrides},
     )

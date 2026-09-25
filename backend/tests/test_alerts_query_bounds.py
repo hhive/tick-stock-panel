@@ -16,6 +16,22 @@ from app.api.alerts import router
 from app.services import alert_store
 
 
+@pytest.fixture(autouse=True)
+def _user_ctx(tmp_path, monkeypatch):
+    """告警记录按账户分家: 测试把账户根目录设为 tmp_path (旧 data_dir 布局)。
+
+    本文件的 app 是裸 FastAPI (没有认证中间件), 所以手工注入 contextvar;
+    真实请求由中间件按账号设置同名 contextvar。
+    """
+    from app import config as app_config
+    from app.services import preferences
+
+    monkeypatch.setattr(app_config.settings, "data_dir", tmp_path)
+    token = preferences.set_current_user_root(tmp_path)
+    yield tmp_path
+    preferences.reset_current_user_root(token)
+
+
 def _client(tmp_path) -> TestClient:
     app = FastAPI()
     app.include_router(router)
@@ -26,7 +42,6 @@ def _client(tmp_path) -> TestClient:
 def _seed(tmp_path, count: int = 3) -> None:
     now_ms = int(time.time() * 1000)
     alert_store.append_many(
-        tmp_path,
         [
             {"ts": now_ms - i * 1000, "rule_id": f"r{i}", "source": "monitor", "type": "price"}
             for i in range(count)

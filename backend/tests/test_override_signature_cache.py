@@ -30,68 +30,68 @@ def _patched_loads(monkeypatch, counter: dict):
 
 
 def test_second_load_hits_cache_without_disk_parse(tmp_path, monkeypatch):
-    strat_config.save_override(tmp_path, "s1", {"params": {"p": 1}})
+    strat_config.save_override("s1", {"params": {"p": 1}}, user_root=tmp_path)
     counter = {"loads": 0}
     _patched_loads(monkeypatch, counter)
 
-    assert strat_config.load_override(tmp_path, "s1")["params"] == {"p": 1}
-    assert strat_config.load_override(tmp_path, "s1")["params"] == {"p": 1}
+    assert strat_config.load_override("s1", user_root=tmp_path)["params"] == {"p": 1}
+    assert strat_config.load_override("s1", user_root=tmp_path)["params"] == {"p": 1}
     assert counter["loads"] == 0 or counter["loads"] == 1, "save 后首次 load 允许一次 parse"
     before = counter["loads"]
-    strat_config.load_override(tmp_path, "s1")
+    strat_config.load_override("s1", user_root=tmp_path)
     assert counter["loads"] == before, "签名未变时不得重复读盘+parse"
 
 
 def test_external_file_change_visible(tmp_path):
-    strat_config.save_override(tmp_path, "s1", {"params": {"p": 1}})
-    assert strat_config.load_override(tmp_path, "s1")["params"]["p"] == 1
+    strat_config.save_override("s1", {"params": {"p": 1}}, user_root=tmp_path)
+    assert strat_config.load_override("s1", user_root=tmp_path)["params"]["p"] == 1
 
     p: Path = tmp_path / "user_data" / "strategy_overrides" / "s1.json"
     p.write_text(json.dumps({"params": {"p": 2}}), encoding="utf-8")
     st = p.stat()
     os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
 
-    assert strat_config.load_override(tmp_path, "s1")["params"]["p"] == 2
+    assert strat_config.load_override("s1", user_root=tmp_path)["params"]["p"] == 2
 
 
 def test_save_override_invalidates_cache(tmp_path):
-    strat_config.save_override(tmp_path, "s1", {"params": {"p": 1}})
-    assert strat_config.load_override(tmp_path, "s1")["params"]["p"] == 1
+    strat_config.save_override("s1", {"params": {"p": 1}}, user_root=tmp_path)
+    assert strat_config.load_override("s1", user_root=tmp_path)["params"]["p"] == 1
 
-    strat_config.save_override(tmp_path, "s1", {"params": {"p": 9}})
-    assert strat_config.load_override(tmp_path, "s1")["params"]["p"] == 9
+    strat_config.save_override("s1", {"params": {"p": 9}}, user_root=tmp_path)
+    assert strat_config.load_override("s1", user_root=tmp_path)["params"]["p"] == 9
 
 
 def test_delete_override_invalidates_cache(tmp_path):
-    strat_config.save_override(tmp_path, "s1", {"params": {"p": 1}})
-    assert strat_config.load_override(tmp_path, "s1") != {}
+    strat_config.save_override("s1", {"params": {"p": 1}}, user_root=tmp_path)
+    assert strat_config.load_override("s1", user_root=tmp_path) != {}
 
-    strat_config.delete_override(tmp_path, "s1")
-    assert strat_config.load_override(tmp_path, "s1") == {}
-    assert strat_config.load_override(tmp_path, "s1") == {}
+    strat_config.delete_override("s1", user_root=tmp_path)
+    assert strat_config.load_override("s1", user_root=tmp_path) == {}
+    assert strat_config.load_override("s1", user_root=tmp_path) == {}
 
 
 def test_load_returns_deep_copy_not_cached_object(tmp_path):
-    strat_config.save_override(tmp_path, "s1", {"params": {"p": 1}, "basic_filter": {"a": 1}})
-    first = strat_config.load_override(tmp_path, "s1")
+    strat_config.save_override("s1", {"params": {"p": 1}, "basic_filter": {"a": 1}}, user_root=tmp_path)
+    first = strat_config.load_override("s1", user_root=tmp_path)
     first["params"]["p"] = 999
     first["extra"] = True
 
-    again = strat_config.load_override(tmp_path, "s1")
+    again = strat_config.load_override("s1", user_root=tmp_path)
     assert again["params"]["p"] == 1
     assert "extra" not in again
 
 
 def test_basic_filter_cleaning_preserved(tmp_path):
     strat_config.save_override(
-        tmp_path, "s1", {"basic_filter": {"keep": 1, "drop": None}},
+        "s1", {"basic_filter": {"keep": 1, "drop": None}}, user_root=tmp_path,
     )
-    data = strat_config.load_override(tmp_path, "s1")
+    data = strat_config.load_override("s1", user_root=tmp_path)
     assert data["basic_filter"] == {"keep": 1}
 
-    strat_config.save_override(tmp_path, "s2", {"basic_filter": {"drop": None}})
-    assert "basic_filter" not in strat_config.load_override(tmp_path, "s2")
+    strat_config.save_override("s2", {"basic_filter": {"drop": None}}, user_root=tmp_path)
+    assert "basic_filter" not in strat_config.load_override("s2", user_root=tmp_path)
 
 
 def test_load_missing_override_returns_empty(tmp_path):
-    assert strat_config.load_override(tmp_path, "never_saved") == {}
+    assert strat_config.load_override("never_saved", user_root=tmp_path) == {}

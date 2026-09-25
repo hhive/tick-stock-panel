@@ -5,7 +5,7 @@
 (原子写 + 实例锁), 本模块只固化 大盘复盘报告 的文件名 / 上限 / id 前缀
 (复盘无 symbol, id 不带 symbol 后缀), 对外保持原有函数签名不变。
 
-存储位置: data/user_data/ai_market_recaps.json (数组,按 created_at 降序)
+存储位置: <user_root>/user_data/ai_market_recaps.json (数组,按 created_at 降序)
 保留最近 MAX_REPORTS 条;超出自动裁剪最旧的。
 
 每条报告结构:
@@ -22,6 +22,8 @@
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 from app.services.json_report_store import JsonReportStore
 
 MAX_REPORTS = 20
@@ -31,16 +33,16 @@ _store = JsonReportStore(
 )
 
 
-def list_reports() -> list[dict]:
-    """返回全部报告(按 created_at 降序)。"""
-    return _store.list_reports()
+def list_reports(user_root: Path | None = None) -> list[dict]:
+    """返回**当前账户**的全部报告(按 created_at 降序)。"""
+    return _store.list_reports(user_root)
 
 
-def save_report(report: dict) -> dict:
-    """新增一条报告并持久化。返回保存后的报告(含 id / created_at)。"""
-    return _store.save_report(report)
+def save_report(report: dict, user_root: Path | None = None) -> dict:
+    """新增一条报告并持久化到当前账户。返回保存后的报告(含 id / created_at)。"""
+    return _store.save_report(report, user_root)
 
 
-def delete_report(report_id: str) -> bool:
-    """删除指定报告。返回是否删除成功。"""
-    return _store.delete_report(report_id)
+def delete_report(report_id: str, user_root: Path | None = None) -> bool:
+    """删除当前账户的指定报告。返回是否删除成功。"""
+    return _store.delete_report(report_id, user_root)

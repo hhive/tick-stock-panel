@@ -11,6 +11,20 @@ from fastapi.testclient import TestClient
 from app.api.factors import router
 
 
+@pytest.fixture(autouse=True)
+def _user_ctx(tmp_path, monkeypatch):
+    """自定义因子按账户分家: 走 API 的用例需要账户上下文。
+
+    真实请求由认证中间件注入 user_root; 这里的裸 app (只挂 router) 没有中间件,
+    因此显式设置上下文, 使 store 解析出的账户根目录 == 用例的 tmp_path。
+    """
+    from app.services import preferences
+
+    token = preferences.set_current_user_root(tmp_path)
+    yield tmp_path
+    preferences.reset_current_user_root(token)
+
+
 @pytest.fixture()
 def cleanup_registry():
     """测试注册的自定义因子在用例后注销, 不污染全局注册表 (快照测试依赖 77 基线)。"""

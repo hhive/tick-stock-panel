@@ -550,7 +550,7 @@ def _mining_runtime_services(data_dir):
     repo = KlineRepository(store)
     strategy_engine = StrategyEngine(
         strategy_dirs=worker_module._strategy_dirs(data_dir),
-        override_loader=lambda sid: strategy_config.load_override(data_dir, sid),
+        override_loader=lambda sid: strategy_config.load_override(sid, user_root=data_dir),
     )
     service = StrategyBacktestService(BacktestEngine(repo), strategy_engine)
     return service, strategy_engine

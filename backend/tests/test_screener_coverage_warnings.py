@@ -12,6 +12,8 @@ import logging
 from datetime import date
 from types import SimpleNamespace
 
+import pytest
+
 from app.api import screener as screener_api
 from app.jobs import daily_pipeline
 from app.services.screener import (
@@ -19,6 +21,22 @@ from app.services.screener import (
     ScreenerService,
     enriched_history_days,
 )
+
+
+@pytest.fixture(autouse=True)
+def _current_user_context(tmp_path):
+    """把「当前账户根」设为本次用例的临时目录。
+
+    HTTP handler 通过 user_paths 的统一接缝解析账户私有目录 (真实请求里由认证
+    中间件注入 contextvar); 这里直接调用 handler 或只挂了 router 的 TestClient,
+    必须自己注入, 否则 fail-closed 抛 MissingUserContextError。
+    data_dir 与 user_root 同取 tmp_path: 用例只关心"落到哪个根", 不区分共享/私有。
+    """
+    from app.services import preferences
+
+    token = preferences.set_current_user_root(tmp_path)
+    yield tmp_path
+    preferences.reset_current_user_root(token)
 
 
 def _make_partitions(root, dirname: str, dates: list[str]) -> None:
@@ -121,7 +139,7 @@ def test_run_preset_response_carries_warnings(monkeypatch, tmp_path):
     monkeypatch.setattr(screener_api, "ScreenerService", lambda *a, **k: svc)
     monkeypatch.setattr(screener_api, "_load_ext_value_maps", lambda *a, **k: {})
     monkeypatch.setattr(screener_api, "_update_cache_strategy", lambda *a, **k: None)
-    monkeypatch.setattr(screener_api.strategy_config, "load_override", lambda *a: {})
+    monkeypatch.setattr(screener_api.strategy_config, "load_override", lambda *a, **_kw: {})
 
     resp = screener_api.run_preset(
         screener_api.PresetRequest(strategy_id="s1", as_of=date(2026, 9, 10)),
@@ -142,7 +160,7 @@ def test_run_preset_no_warnings_key_when_sufficient(monkeypatch, tmp_path):
     monkeypatch.setattr(screener_api, "ScreenerService", lambda *a, **k: svc)
     monkeypatch.setattr(screener_api, "_load_ext_value_maps", lambda *a, **k: {})
     monkeypatch.setattr(screener_api, "_update_cache_strategy", lambda *a, **k: None)
-    monkeypatch.setattr(screener_api.strategy_config, "load_override", lambda *a: {})
+    monkeypatch.setattr(screener_api.strategy_config, "load_override", lambda *a, **_kw: {})
 
     resp = screener_api.run_preset(
         screener_api.PresetRequest(strategy_id="s1", as_of=date(2026, 9, 10)),
@@ -184,8 +202,9 @@ def test_update_cache_strategy_keeps_warnings(tmp_path):
     from app.services import strategy_cache
 
     strategy_cache.write_cache(
-        tmp_path, "2026-09-10",
+        "2026-09-10",
         {"other": {"total": 1, "as_of": "2026-09-10", "rows": []}},
+        user_root=tmp_path,
     )
 
     screener_api._update_cache_strategy(

@@ -425,9 +425,9 @@ def test_publish_factor_discovers_public_strategy_and_repairs_runtime_state(tmp_
         monitor_invalidator=lambda: invalidations.append("monitor"),
     )
     strategy_config.save_override(
-        tmp_path,
         "factor_rank_research",
         {"params": {"entry_score": 99.0}},
+        user_root=tmp_path,
     )
 
     result = service.publish(run_id, signature)
@@ -450,7 +450,7 @@ def test_publish_factor_discovers_public_strategy_and_repairs_runtime_state(tmp_
         meta["id"] for meta in engine.list_strategies()
     }
     assert strategy_config.load_override(
-        tmp_path, "factor_rank_research"
+        "factor_rank_research", user_root=tmp_path
     ) == {"params": {"entry_score": 99.0}}
     assert not (tmp_path / "user_data" / "strategy_overrides" / f"{result['strategy_id']}.json").exists()
     persisted = pl.read_parquet(store.artifact_path(run_id, "candidates")).row(0, named=True)

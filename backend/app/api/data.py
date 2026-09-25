@@ -674,7 +674,7 @@ def clear_data(request: Request):
     # 清除监控运行数据 (user_data 下仅清运行产物, 不动 monitor_rules/preferences/secrets 等用户配置)
     # - 触发记录 alerts.jsonl
     from app.services import alert_store
-    alert_store.clear(data_dir)
+    alert_store.clear()
     # - 待推送的实时通知队列 (进程内存)
     qs = getattr(request.app.state, "quote_service", None)
     if qs is not None:

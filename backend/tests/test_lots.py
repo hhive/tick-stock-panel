@@ -12,6 +12,18 @@ from app.strategy import lots as lots_domain
 from app.strategy import monitor_rules
 
 
+@pytest.fixture(autouse=True)
+def _user_ctx(tmp_path, monkeypatch):
+    """批次按账户分家: 域层从账户上下文解析 user_root (真实请求由认证中间件注入)。"""
+    from app import config as app_config
+    from app.services import preferences
+
+    monkeypatch.setattr(app_config.settings, "data_dir", tmp_path)
+    token = preferences.set_current_user_root(tmp_path)
+    yield tmp_path
+    preferences.reset_current_user_root(token)
+
+
 def _lot(**overrides):
     lot = {
         "id": "lot_test1",
@@ -138,8 +150,8 @@ def test_sync_lot_writes_lot_rules_and_reloads_once(tmp_path, monkeypatch):
 
     lots_api.sync_lot(request, _lot())
     assert _lot_path(tmp_path, "lot_test1").exists()
-    price = monitor_rules.load_one(tmp_path, "lot_test1_p")
-    date_rule = monitor_rules.load_one(tmp_path, "lot_test1_d")
+    price = monitor_rules.load_one("lot_test1_p")
+    date_rule = monitor_rules.load_one("lot_test1_d")
     assert price is not None and price["lot_id"] == "lot_test1"
     assert price["conditions"][0] == {"field": "close", "op": ">=", "value": 1650.0}
     assert date_rule is not None and date_rule["remind_date"] == "2026-09-01"
@@ -154,8 +166,8 @@ def test_sync_lot_removes_rules_when_monitor_point_removed(tmp_path, monkeypatch
     lots_api.sync_lot(request, _lot())
     # 编辑后只剩止盈, 无到期 → date 规则应被级联删除
     lots_api.sync_lot(request, _lot(remind_date=None))
-    assert monitor_rules.load_one(tmp_path, "lot_test1_d") is None
-    assert monitor_rules.load_one(tmp_path, "lot_test1_p") is not None
+    assert monitor_rules.load_one("lot_test1_d") is None
+    assert monitor_rules.load_one("lot_test1_p") is not None
 
 
 def test_delete_lot_removes_lot_and_both_rules(tmp_path, monkeypatch):
@@ -166,8 +178,8 @@ def test_delete_lot_removes_lot_and_both_rules(tmp_path, monkeypatch):
     lots_api.sync_lot(request, _lot())
     lots_api.delete_lot("lot_test1", request)
     assert not _lot_path(tmp_path, "lot_test1").exists()
-    assert monitor_rules.load_one(tmp_path, "lot_test1_p") is None
-    assert monitor_rules.load_one(tmp_path, "lot_test1_d") is None
+    assert monitor_rules.load_one("lot_test1_p") is None
+    assert monitor_rules.load_one("lot_test1_d") is None
 
 
 def test_sync_lot_etf_resolves_asset_type(tmp_path, monkeypatch):
@@ -182,8 +194,8 @@ def test_sync_lot_etf_resolves_asset_type(tmp_path, monkeypatch):
     monkeypatch.setattr(lots_api, "_reload_engine", lambda r: None)
     lots_api.sync_lot(request, _lot(symbol="510300.SH"))
     # 止盈止损价格规则须走 ETF 监控轮才会触发, 故 asset_type 必须为 etf
-    price = monitor_rules.load_one(tmp_path, "lot_test1_p")
-    date_rule = monitor_rules.load_one(tmp_path, "lot_test1_d")
+    price = monitor_rules.load_one("lot_test1_p")
+    date_rule = monitor_rules.load_one("lot_test1_d")
     assert price is not None and price["asset_type"] == "etf"
     assert date_rule is not None and date_rule["asset_type"] == "etf"
 

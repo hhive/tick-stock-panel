@@ -34,7 +34,11 @@ def data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
     monkeypatch.setattr(settings, "data_dir", tmp_path, raising=False)
     preferences._invalidate_cache()
+    # 每用户存储 (secrets 等) 没有共享回退, 需要账户上下文 —— 真实请求由认证
+    # 中间件注入 user_root; 这里把测试的 data_dir 当作该账户的根目录。
+    token = preferences.set_current_user_root(tmp_path)
     yield tmp_path
+    preferences.reset_current_user_root(token)
     preferences._invalidate_cache()
 
 
@@ -101,16 +105,16 @@ def test_strategy_override_survives_a_torn_write(data_dir: Path, torn_write) -> 
     """load_override 吞异常返回 {} —— 半截文件会让策略参数静默回默认值。"""
     strat_config._override_cache.clear()
     strat_config._override_cache_sig.clear()
-    strat_config.save_override(data_dir, "s1", {"params": {"period": 20}})
-    assert strat_config.load_override(data_dir, "s1") == {"params": {"period": 20}}
+    strat_config.save_override("s1", {"params": {"period": 20}}, user_root=data_dir)
+    assert strat_config.load_override("s1", user_root=data_dir) == {"params": {"period": 20}}
 
     torn_write()
     with pytest.raises(OSError):
-        strat_config.save_override(data_dir, "s1", {"params": {"period": 60}})
+        strat_config.save_override("s1", {"params": {"period": 60}}, user_root=data_dir)
 
     strat_config._override_cache.clear()
     strat_config._override_cache_sig.clear()
-    assert strat_config.load_override(data_dir, "s1") == {"params": {"period": 20}}
+    assert strat_config.load_override("s1", user_root=data_dir) == {"params": {"period": 20}}
 
 
 def test_custom_signal_survives_a_torn_write(data_dir: Path, torn_write) -> None:
@@ -119,12 +123,12 @@ def test_custom_signal_survives_a_torn_write(data_dir: Path, torn_write) -> None
         "id": "vol_up", "name": "放量", "kind": "entry", "enabled": True,
         "conditions": [{"left": "volume", "op": ">", "right": "0", "leftDays": 0, "rightDays": 0}],
     }
-    custom_signals.save_one(data_dir, sig)
+    custom_signals.save_one(sig, user_root=data_dir)
     assert [s["id"] for s in custom_signals.load_all(data_dir)] == ["vol_up"]
 
     torn_write()
     with pytest.raises(OSError):
-        custom_signals.save_one(data_dir, {**sig, "name": "放量2"})
+        custom_signals.save_one({**sig, "name": "放量2"}, user_root=data_dir)
 
     assert custom_signals.load_all(data_dir) == [sig]
 
@@ -132,12 +136,12 @@ def test_custom_signal_survives_a_torn_write(data_dir: Path, torn_write) -> None
 def test_custom_factor_survives_a_torn_write(data_dir: Path, torn_write) -> None:
     """factors.store.load_all 跳过损坏文件 —— 半截文件会让该因子静默消失。"""
     definition = {"id": "uf_mom", "kind": "custom", "label": "动量", "status": "draft"}
-    factor_store.save_one(data_dir, definition)
+    factor_store.save_one(definition, data_dir)
     assert [d["id"] for d in factor_store.load_all(data_dir)] == ["uf_mom"]
 
     torn_write()
     with pytest.raises(OSError):
-        factor_store.save_one(data_dir, {**definition, "label": "动量2"})
+        factor_store.save_one({**definition, "label": "动量2"}, data_dir)
 
     assert factor_store.load_all(data_dir) == [definition]
 
@@ -197,9 +201,9 @@ def test_a_normal_save_still_writes_what_it_was_given(data_dir: Path) -> None:
 def test_no_tmp_file_is_left_behind(data_dir: Path) -> None:
     preferences.save({"theme": "dark"})
     secrets_store.save({"a": "1"})
-    strat_config.save_override(data_dir, "s1", {"params": {}})
-    custom_signals.save_one(data_dir, {"id": "vol_up", "conditions": []})
-    factor_store.save_one(data_dir, {"id": "uf_mom", "label": "动量"})
+    strat_config.save_override("s1", {"params": {}}, user_root=data_dir)
+    custom_signals.save_one({"id": "vol_up", "conditions": []}, user_root=data_dir)
+    factor_store.save_one({"id": "uf_mom", "label": "动量"}, data_dir)
     custom_loader.save_config("demo", {"name": "demo", "datasets": {}})
 
     leftovers = sorted(p.name for p in data_dir.rglob("*.tmp"))

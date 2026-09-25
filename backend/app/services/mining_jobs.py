@@ -1,4 +1,9 @@
-"""Persistent metadata and bounded event storage for mining runs."""
+"""Persistent metadata and bounded event storage for mining runs.
+
+一次挖掘运行的全部产物落在 ``<user_root>/research/mining/runs/<run_id>/`` (**每账户一份**),
+user_root 由 ``user_paths.resolve_user_root()`` 解析 (请求路径走认证中间件注入的 contextvar,
+后台线程/worker 必须显式传 ``user_root=``)。
+"""
 
 from __future__ import annotations
 
@@ -13,6 +18,8 @@ from datetime import UTC, date, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, cast
+
+from app.services.user_paths import resolve_user_root
 
 MiningRunStatus = Literal[
     "queued",
@@ -123,12 +130,11 @@ def compute_run_signature(request: Mapping[str, Any], data_fingerprint: Any) -> 
 class MiningRunStore:
     """Store one manifest, summary, artifact registry, and bounded event log per run."""
 
-    def __init__(self, data_dir: Path | str | None = None) -> None:
-        if data_dir is None:
-            from app.config import settings
-
-            data_dir = settings.data_dir
-        self.runs_root = (Path(data_dir).resolve() / "research" / "mining" / "runs").resolve()
+    def __init__(self, user_root: Path | str | None = None) -> None:
+        # 挖掘运行目录归发起账户: 运行产物 (manifest/事件/工件) 是账户私有数据。
+        # user_root 为 None 时按请求上下文解析; 后台线程/worker 必须显式传。
+        explicit = Path(user_root) if user_root is not None else None
+        self.runs_root = (resolve_user_root(explicit) / "research" / "mining" / "runs").resolve()
         self.runs_root.mkdir(parents=True, exist_ok=True)
 
     def create(

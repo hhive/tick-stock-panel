@@ -190,10 +190,10 @@ def test_snapshot_gated_off_history_frames(data_dir):
 # ── 信号消费 / 评分引用 ───────────────────────────────────
 
 def _save_signal(data_dir, sid="ext_hot", left=COL):
-    custom_signals.save_one(data_dir, {
+    custom_signals.save_one({
         "id": sid, "name": "题材热度", "kind": "entry", "enabled": True,
         "conditions": [{"left": left, "op": ">", "right": "0.5", "leftDays": 0, "rightDays": 0}],
-    })
+    }, user_root=data_dir)
 
 
 def test_signal_validate_and_inject_with_ext_field(data_dir):
@@ -251,8 +251,9 @@ def test_routine_pull_keeps_strategy_cache_but_default_clears(data_dir):
 
     cfg = _mk_config(data_dir, mode="timeseries")
     strategy_cache.write_cache(
-        data_dir, "2026-01-05",
+        "2026-01-05",
         {"s1": {"total": 1, "as_of": "2026-01-05", "rows": []}},
+        user_root=data_dir,
     )
 
     write_ext_parquet(
@@ -288,8 +289,9 @@ def test_scheduler_status_upsert_keeps_strategy_cache(data_dir):
     cfg = _mk_config(data_dir, mode="timeseries")
     store = ExtConfigStore(data_dir)
     strategy_cache.write_cache(
-        data_dir, "2026-01-05",
+        "2026-01-05",
         {"s1": {"total": 1, "as_of": "2026-01-05", "rows": []}},
+        user_root=data_dir,
     )
 
     # 调度器例行回写 (last_run/next_run): 保留策略结果

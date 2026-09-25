@@ -90,14 +90,14 @@ def test_strategy_rule_compatibility_and_validation(tmp_path):
         "id": "legacy", "name": "旧规则", "type": "strategy",
         "scope": "all", "strategy_id": "demo",
     }
-    monitor_rules.save_one(tmp_path, legacy)
+    monitor_rules.save_one(legacy, user_root=tmp_path)
 
-    loaded = monitor_rules.load_one(tmp_path, "legacy")
+    loaded = monitor_rules.load_one("legacy", user_root=tmp_path)
     assert loaded is not None
     assert loaded["notify_events"] == ["pool_entry", "pool_exit"]
     assert loaded["score_min"] is None
     assert loaded["score_max"] is None
-    assert monitor_rules.load_all(tmp_path)[0]["notify_events"] == ["pool_entry", "pool_exit"]
+    assert monitor_rules.load_all(user_root=tmp_path)[0]["notify_events"] == ["pool_entry", "pool_exit"]
 
     with pytest.raises(ValueError, match="至少选择一个通知事件"):
         monitor_rules.validate(_rule())

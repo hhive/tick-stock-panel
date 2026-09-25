@@ -1,6 +1,6 @@
 """AI 财务分析报告持久化存储。
 
-存储位置: data/user_data/ai_reports.json (数组,按 created_at 降序)
+存储位置: <user_root>/user_data/ai_reports.json (数组,按 created_at 降序)
 保留最近 MAX_REPORTS 条;超出自动裁剪最旧的。
 
 存储机制统一委托给 JsonReportStore(原子写 + 实例锁), 本模块只固化
@@ -20,6 +20,8 @@
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 from app.services.json_report_store import JsonReportStore
 
 MAX_REPORTS = 20
@@ -27,24 +29,24 @@ MAX_REPORTS = 20
 _store = JsonReportStore("ai_reports.json", MAX_REPORTS, id_prefix="rpt")
 
 
-def list_reports() -> list[dict]:
-    """返回全部报告(按 created_at 降序)。"""
-    return _store.list_reports()
+def list_reports(user_root: Path | None = None) -> list[dict]:
+    """返回**当前账户**的全部报告(按 created_at 降序)。"""
+    return _store.list_reports(user_root)
 
 
-def save_report(report: dict) -> dict:
-    """新增一条报告并持久化。返回保存后的报告(含 id / created_at)。
+def save_report(report: dict, user_root: Path | None = None) -> dict:
+    """新增一条报告并持久化到当前账户。返回保存后的报告(含 id / created_at)。
 
     自动补全 id 与 created_at(若缺),并裁剪到上限。
     """
-    return _store.save_report(report)
+    return _store.save_report(report, user_root)
 
 
-def delete_report(report_id: str) -> bool:
-    """删除指定报告。返回是否删除成功。"""
-    return _store.delete_report(report_id)
+def delete_report(report_id: str, user_root: Path | None = None) -> bool:
+    """删除当前账户的指定报告。返回是否删除成功。"""
+    return _store.delete_report(report_id, user_root)
 
 
-def clear_reports() -> int:
-    """清空全部报告。返回删除数量。"""
-    return _store.clear_reports()
+def clear_reports(user_root: Path | None = None) -> int:
+    """清空当前账户的全部报告。返回删除数量。"""
+    return _store.clear_reports(user_root)

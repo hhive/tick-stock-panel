@@ -60,6 +60,17 @@ def _mock_upload(
     return file
 
 
+@pytest.fixture(autouse=True)
+def _user_ctx(tmp_path, monkeypatch):
+    """自选按账户分家: 测试把账户根目录设为 tmp_path (等价于旧的 data_dir 布局)。"""
+    from app.services import preferences
+
+    monkeypatch.setattr(settings, "data_dir", tmp_path)
+    token = preferences.set_current_user_root(tmp_path)
+    yield tmp_path
+    preferences.reset_current_user_root(token)
+
+
 def _mock_request(data_dir: Path) -> MagicMock:
     request = MagicMock()
     request.app.state.repo.store.data_dir = data_dir

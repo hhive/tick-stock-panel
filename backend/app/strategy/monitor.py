@@ -647,7 +647,9 @@ class MonitorRuleEngine:
                     continue
                 overrides = {}
                 if self._data_dir:
-                    overrides = _strategy_config.load_override(self._data_dir, sid)
+                    # 监控引擎是进程级后台服务, 暂无账户上下文: 仍用共享 data_dir,
+                    # 需改为按账户扇出。
+                    overrides = _strategy_config.load_override(sid, user_root=self._data_dir)
                 matrix_rules.append(rule)
                 overrides_map[sid] = overrides
                 params_map[sid] = dict(overrides.get("params") or {})
@@ -1218,7 +1220,9 @@ class MonitorRuleEngine:
         overrides = {}
         if self._data_dir:
             try:
-                overrides = _strategy_config.load_override(self._data_dir, sid)
+                # 监控引擎是进程级后台服务, 暂无账户上下文: 仍用共享 data_dir,
+                # 需改为按账户扇出。
+                overrides = _strategy_config.load_override(sid, user_root=self._data_dir)
             except Exception:
                 pass
 

@@ -20,6 +20,24 @@ from app.plugins.fuyao import provider as fp
 from app.plugins.fuyao.provider import FuyaoProvider
 
 
+@pytest.fixture(autouse=True)
+def _deployment_creds(tmp_path, monkeypatch):
+    """凭据隔离: 数据源 Key 是**部署级**凭据(共享行情全站一份)。
+
+    关键是把 ``settings.data_dir`` 重定向到 tmp_path —— 部署级凭据文件
+    ``<data_dir>/deployment_secrets.json`` 因此不存在 (等效于「未配置」), 插件
+    「先探后存」的落盘不会写进仓库真实数据目录。账户上下文一并给出仅为本模块的
+    历史行为保留: 部署级凭据的读写**不要求**账户上下文(取数路径遍布后台线程)。
+    """
+    from app import config as app_config
+    from app.services import preferences
+
+    monkeypatch.setattr(app_config.settings, "data_dir", tmp_path)
+    token = preferences.set_current_user_root(tmp_path)
+    yield tmp_path
+    preferences.reset_current_user_root(token)
+
+
 class _FakeClient:
     """按调用次数返回预置页, 记录调用供分页断言。snapshot_all 同真实客户端语义。"""
 
@@ -344,14 +362,16 @@ def test_datasets_declaration():
     assert "minute" not in config.datasets
 
 
-# ---- API Key 解析 (secrets.json > .env, 对齐 tickflow 语义) ----
+# ---- API Key 解析 (部署级凭据文件 > .env, 对齐 tickflow 语义) ----
 
 
 def test_get_api_key_secrets_store_takes_priority(monkeypatch):
     from app import secrets_store
 
     monkeypatch.delenv(fp.API_KEY_ENV, raising=False)
-    monkeypatch.setattr(secrets_store, "load", lambda: {fp.SECRETS_FIELD: "sk-from-ui"})
+    monkeypatch.setattr(
+        secrets_store, "load_deployment", lambda *a, **k: {fp.SECRETS_FIELD: "sk-from-ui"}
+    )
     assert fp.get_api_key() == "sk-from-ui"
 
 
@@ -359,7 +379,7 @@ def test_get_api_key_falls_back_to_env(monkeypatch):
     from app import secrets_store
 
     monkeypatch.setenv(fp.API_KEY_ENV, "sk-from-env")
-    monkeypatch.setattr(secrets_store, "load", lambda: {})
+    monkeypatch.setattr(secrets_store, "load_deployment", lambda *a, **k: {})
     assert fp.get_api_key() == "sk-from-env"
 
 
@@ -367,7 +387,9 @@ def test_availability_accepts_secrets_store_key(monkeypatch):
     from app import secrets_store
 
     monkeypatch.delenv(fp.API_KEY_ENV, raising=False)
-    monkeypatch.setattr(secrets_store, "load", lambda: {fp.SECRETS_FIELD: "sk-from-ui"})
+    monkeypatch.setattr(
+        secrets_store, "load_deployment", lambda *a, **k: {fp.SECRETS_FIELD: "sk-from-ui"}
+    )
     assert fp.availability() == (True, "ok")
 
 
@@ -375,7 +397,7 @@ def test_availability_requires_env_key(monkeypatch):
     from app import secrets_store
 
     monkeypatch.delenv(fp.API_KEY_ENV, raising=False)
-    monkeypatch.setattr(secrets_store, "load", lambda: {})
+    monkeypatch.setattr(secrets_store, "load_deployment", lambda *a, **k: {})
     ok, reason = fp.availability()
     assert ok is False and fp.API_KEY_ENV in reason
 
@@ -433,7 +455,7 @@ def test_save_plugin_key_invalid_key_not_persisted(monkeypatch):
     saved: dict = {}
     monkeypatch.setattr(custom_sources, "probe_plugin_key", lambda n, k: (False, "Key 无效"))
     monkeypatch.setattr(
-        settings_api.secrets_store, "save", lambda updates: saved.update(updates) or updates
+        settings_api.secrets_store, "save", lambda updates, *a, **k: saved.update(updates) or updates
     )
     out = settings_api.save_plugin_key(settings_api.PluginKeyIn(plugin="fuyao", api_key="bad"))
     assert out["ok"] is False and out["reason"] == "invalid"
@@ -448,7 +470,7 @@ def test_save_plugin_key_valid_persists_and_rescans(monkeypatch):
     reloaded = []
     monkeypatch.setattr(custom_sources, "probe_plugin_key", lambda n, k: (True, "ok"))
     monkeypatch.setattr(
-        settings_api.secrets_store, "save", lambda updates: saved.update(updates) or updates
+        settings_api.secrets_store, "save", lambda updates, *a, **k: saved.update(updates) or updates
     )
     monkeypatch.setattr(
         settings_api.secrets_store, "mask", lambda key, prefix=4, suffix=4: "abcd••••wxyz"
@@ -470,7 +492,7 @@ def test_clear_plugin_key(monkeypatch):
 
     cleared: list = []
     monkeypatch.setattr(custom_sources, "is_builtin", lambda n: n == "fuyao")
-    monkeypatch.setattr(settings_api.secrets_store, "clear", lambda *keys: cleared.extend(keys))
+    monkeypatch.setattr(settings_api.secrets_store, "clear", lambda *keys, **kwargs: cleared.extend(keys))
     monkeypatch.setattr(custom_sources, "load_all", lambda: None)
     monkeypatch.setattr(
         custom_sources, "list_plugins", lambda: [{"name": "fuyao", "available": False}]
@@ -515,7 +537,7 @@ def test_hidden_plugin_not_registered():
 
 
 def test_plugin_key_masked_from_secrets_then_env(monkeypatch):
-    """api_key_masked 随插件状态返回: secrets.json 优先, .env 兜底, 未配置为空。
+    """api_key_masked 随插件状态返回: 部署级凭据文件优先, .env 兜底, 未配置为空。
 
     完整 Key 不出后端, 只出 mask() 结果 — 与 settings API 的
     tickflow_api_key_masked 同一展示契约。
@@ -525,7 +547,7 @@ def test_plugin_key_masked_from_secrets_then_env(monkeypatch):
 
     # 未声明 api_key_env / 未配置 Key → 空
     assert loader._plugin_key_masked("x", "") == ""
-    monkeypatch.setattr(secrets_store, "load", lambda: {})
+    monkeypatch.setattr(secrets_store, "load_deployment", lambda *a, **k: {})
     monkeypatch.delenv(fp.API_KEY_ENV, raising=False)
     assert loader._plugin_key_masked("fuyao", fp.API_KEY_ENV) == ""
 
@@ -533,8 +555,10 @@ def test_plugin_key_masked_from_secrets_then_env(monkeypatch):
     monkeypatch.setenv(fp.API_KEY_ENV, "env-secret-key-123456")
     assert loader._plugin_key_masked("fuyao", fp.API_KEY_ENV) == "env-••••••3456"
 
-    # secrets.json 优先于 .env
-    monkeypatch.setattr(secrets_store, "load", lambda: {"fuyao_api_key": "stored-secret-key-999"})
+    # 存储的 Key 优先于 .env
+    monkeypatch.setattr(
+        secrets_store, "load_deployment", lambda *a, **k: {"fuyao_api_key": "stored-secret-key-999"}
+    )
     assert loader._plugin_key_masked("fuyao", fp.API_KEY_ENV) == "stor••••••-999"
 
     # 注册进插件状态: 数据源列表接口据此常驻展示 (而非仅保存后瞬时显示)

@@ -1,9 +1,13 @@
 """告警触发记录存储 — JSONL 追加写 + 滚动清理。
 
 职责:
-  - 把每次触发的 AlertEvent 追加写入 data/user_data/alerts.jsonl
+  - 把每次触发的 AlertEvent 追加写入 ``<user_root>/user_data/alerts.jsonl``
   - 提供查询 (按来源/类型过滤、时间倒序、限量)
   - 滚动清理: 保留近 N 天 + 上限 M 条 (取交集)
+
+归属: **每账户一份**。``user_root`` 由 ``user_paths.resolve_user_root()`` 解析
+(请求路径走认证中间件注入的 contextvar, 后台线程/调度器必须显式传 ``user_root=``),
+触发记录因此不会跨账户互见。
 
 设计:
   - JSONL 每行一个 JSON 对象,便于增量追加和流式读取
@@ -17,6 +21,8 @@ import logging
 import threading
 from pathlib import Path
 
+from app.services.user_paths import resolve_user_root
+
 logger = logging.getLogger(__name__)
 
 # 保留策略
@@ -29,17 +35,17 @@ _lock = threading.Lock()
 _write_count = 0
 
 
-def _path(data_dir: Path) -> Path:
-    p = data_dir / "user_data" / "alerts.jsonl"
+def _path(user_root: Path | None = None) -> Path:
+    p = resolve_user_root(user_root) / "user_data" / "alerts.jsonl"
     p.parent.mkdir(parents=True, exist_ok=True)
     return p
 
 
-def append(data_dir: Path, event: dict) -> None:
-    """追加一条触发记录。event 应含 ts(毫秒)、rule_id、source 等字段。"""
+def append(event: dict, user_root: Path | None = None) -> None:
+    """向**当前账户**追加一条触发记录。event 应含 ts(毫秒)、rule_id、source 等字段。"""
     line = json.dumps(event, ensure_ascii=False)
     with _lock:
-        p = _path(data_dir)
+        p = _path(user_root)
         with p.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
         global _write_count
@@ -49,12 +55,12 @@ def append(data_dir: Path, event: dict) -> None:
             _prune_locked(p)
 
 
-def append_many(data_dir: Path, events: list[dict]) -> None:
-    """批量追加。"""
+def append_many(events: list[dict], user_root: Path | None = None) -> None:
+    """向**当前账户**批量追加。"""
     if not events:
         return
     with _lock:
-        p = _path(data_dir)
+        p = _path(user_root)
         with p.open("a", encoding="utf-8") as f:
             for ev in events:
                 f.write(json.dumps(ev, ensure_ascii=False) + "\n")
@@ -66,20 +72,20 @@ def append_many(data_dir: Path, events: list[dict]) -> None:
 
 
 def list_recent(
-    data_dir: Path,
     days: int = MAX_DAYS,
     limit: int = MAX_RECORDS,
     source: str | None = None,
     type: str | None = None,
+    user_root: Path | None = None,
 ) -> list[dict]:
-    """读取近 N 天记录,按时间倒序,支持按 source/type 过滤。
+    """读取**当前账户**近 N 天记录,按时间倒序,支持按 source/type 过滤。
 
     持锁读: prune/delete/clear 会整文件重写, 无锁读可能读到截断内容。
     """
     import time
     cutoff = (time.time() - days * 86400) * 1000  # 毫秒
     out: list[dict] = []
-    p = _path(data_dir)
+    p = _path(user_root)
     if not p.exists():
         return []
     try:
@@ -107,10 +113,10 @@ def list_recent(
     return out[:limit]
 
 
-def clear(data_dir: Path) -> int:
-    """清空全部记录,返回清除的条数。"""
+def clear(user_root: Path | None = None) -> int:
+    """清空**当前账户**的全部记录,返回清除的条数。"""
     with _lock:
-        p = _path(data_dir)
+        p = _path(user_root)
         if not p.exists():
             return 0
         count = 0
@@ -123,14 +129,14 @@ def clear(data_dir: Path) -> int:
         return count
 
 
-def delete_one(data_dir: Path, ts: int) -> bool:
-    """删除指定 ts 的单条记录,返回是否删除成功。
+def delete_one(ts: int, user_root: Path | None = None) -> bool:
+    """删除**当前账户**指定 ts 的单条记录,返回是否删除成功。
 
     JSONL 无主键, 用 ts(毫秒时间戳) 作为标识。
     若存在多条同 ts, 只删第一条。
     """
     with _lock:
-        p = _path(data_dir)
+        p = _path(user_root)
         if not p.exists():
             return False
         kept: list[dict] = []
@@ -164,9 +170,9 @@ def delete_one(data_dir: Path, ts: int) -> bool:
         return True
 
 
-def count(data_dir: Path) -> int:
-    """返回当前记录总数。持锁读, 防与整文件重写并发。"""
-    p = _path(data_dir)
+def count(user_root: Path | None = None) -> int:
+    """返回**当前账户**的记录总数。持锁读, 防与整文件重写并发。"""
+    p = _path(user_root)
     if not p.exists():
         return 0
     try:

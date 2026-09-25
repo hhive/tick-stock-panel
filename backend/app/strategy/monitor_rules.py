@@ -1,9 +1,13 @@
 """监控规则 — 统一的 MonitorRule 模型,覆盖策略/个股信号/个股价格/市场异动四类。
 
 职责:
-  - 从 data/user_data/monitor_rules/*.json 加载规则定义
+  - 从 ``<user_root>/user_data/monitor_rules/*.json`` 加载规则定义
   - 校验规则字段合法性
   - 提供 CRUD (load_all / save_one / delete_one)
+
+归属: **每账户一份**。``user_root`` 由 ``user_paths.resolve_user_root()`` 解析
+(请求路径走认证中间件注入的 contextvar, 后台线程/调度器必须显式传 ``user_root=``),
+规则因此不会跨账户互见。
 
 不知道: 行情评估引擎、API、告警落盘。纯函数 + 文件存储。
 
@@ -22,6 +26,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from app.services.fs_utils import atomic_write_text
+from app.services.user_paths import resolve_user_root
 from app.strategy.custom_signals import ALLOWED_FIELDS
 from app.strategy.intraday_signals import uses_intraday_signals
 
@@ -65,19 +70,19 @@ _SIGNAL_PREFIXES = ("signal_", "csg_")
 
 
 # ── 持久化 (镜像 custom_signals.py) ─────────────────────
-def _dir(data_dir: Path) -> Path:
-    d = data_dir / "user_data" / "monitor_rules"
+def _dir(user_root: Path | None = None) -> Path:
+    d = resolve_user_root(user_root) / "user_data" / "monitor_rules"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
-def _path(data_dir: Path, rule_id: str) -> Path:
-    return _dir(data_dir) / f"{rule_id}.json"
+def _path(user_root: Path | None, rule_id: str) -> Path:
+    return _dir(user_root) / f"{rule_id}.json"
 
 
-def load_all(data_dir: Path) -> list[dict]:
-    """读取全部监控规则。损坏的文件被跳过。"""
-    d = _dir(data_dir)
+def load_all(user_root: Path | None = None) -> list[dict]:
+    """读取**当前账户**的全部监控规则。损坏的文件被跳过。"""
+    d = _dir(user_root)
     out: list[dict] = []
     for f in sorted(d.glob("*.json")):
         try:
@@ -87,8 +92,8 @@ def load_all(data_dir: Path) -> list[dict]:
     return out
 
 
-def load_one(data_dir: Path, rule_id: str) -> dict | None:
-    p = _path(data_dir, rule_id)
+def load_one(rule_id: str, user_root: Path | None = None) -> dict | None:
+    p = _path(user_root, rule_id)
     if not p.exists():
         return None
     try:
@@ -98,14 +103,14 @@ def load_one(data_dir: Path, rule_id: str) -> dict | None:
         return None
 
 
-def save_one(data_dir: Path, rule: dict) -> None:
-    p = _path(data_dir, rule["id"])
+def save_one(rule: dict, user_root: Path | None = None) -> None:
+    p = _path(user_root, rule["id"])
     p.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(p, json.dumps(rule, ensure_ascii=False, indent=2))
 
 
-def delete_one(data_dir: Path, rule_id: str) -> bool:
-    p = _path(data_dir, rule_id)
+def delete_one(rule_id: str, user_root: Path | None = None) -> bool:
+    p = _path(user_root, rule_id)
     if p.exists():
         p.unlink()
         return True
@@ -418,21 +423,25 @@ def strategy_rule_id(strategy_id: str) -> str:
     return f"{STRATEGY_RULE_PREFIX}{strategy_id}"
 
 
-def migrate_strategy_monitors(data_dir: Path, strategy_ids: list[str], strategy_names: dict[str, str]) -> list[dict]:
+def migrate_strategy_monitors(
+    strategy_ids: list[str],
+    strategy_names: dict[str, str],
+    user_root: Path | None = None,
+) -> list[dict]:
     """把 preferences.strategy_monitor_ids 里的策略,同步生成/更新 type=strategy 规则。
 
     幂等: 已存在的策略规则会被更新 (方向/名称),不会重复创建。
     已从 strategy_ids 移除的策略, 其规则会被停用 (enabled=False) 而非删除 (保留历史触发记录的关联)。
 
     Args:
-        data_dir: 数据目录
         strategy_ids: 当前监控池中的策略 id 列表
         strategy_names: {strategy_id: 策略名} 用于规则显示名
+        user_root: 账户根目录 (请求路径可省略, 走 contextvar)
     Returns:
         本次生成/更新的规则列表
     """
     desired = set(strategy_ids)
-    existing = load_all(data_dir)
+    existing = load_all(user_root)
     # 已存在的策略规则 {strategy_id: rule}
     existing_strategy_rules: dict[str, dict] = {}
     for r in existing:
@@ -468,7 +477,7 @@ def migrate_strategy_monitors(data_dir: Path, strategy_ids: list[str], strategy_
             rule["name"] = f"策略监控 · {name}"
             rule.setdefault("scope", "all")
             rule.setdefault("direction", "entry")
-        save_one(data_dir, rule)
+        save_one(rule, user_root)
         touched.append(rule)
 
     # 2. 不在监控池的策略 → 停用其规则 (不删除)
@@ -476,6 +485,6 @@ def migrate_strategy_monitors(data_dir: Path, strategy_ids: list[str], strategy_
         if sid not in desired and rule.get("enabled") is not False:
             rule = dict(rule)
             rule["enabled"] = False
-            save_one(data_dir, rule)
+            save_one(rule, user_root)
 
     return touched

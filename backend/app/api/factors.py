@@ -223,8 +223,8 @@ def _resolve_id(requested: str | None, label: str, prefix: str) -> str:
     return requested.strip() if requested and requested.strip() else _slugify_id(label, prefix)
 
 
-def _next_version(data_dir, factor_id: str) -> int:
-    for definition in store.load_all(data_dir):
+def _next_version(factor_id: str) -> int:
+    for definition in store.load_all():
         if str(definition.get("id")) == factor_id:
             return int(definition.get("version", 1)) + 1
     return 1
@@ -256,12 +256,11 @@ def _trial_nonempty(request: Request, formula: str, asset_type: str = "stock") -
 @router.post("/custom")
 def create_custom_factor(req: CustomFactorCreateRequest, request: Request) -> dict:
     """保存自定义公式因子: 编译通过 + 服务端试算非空 (fail-closed)。"""
-    data_dir = _data_dir(request)
     factor_id = _resolve_id(req.id, req.label, "uf")
     definition = {
         "id": factor_id,
         "kind": "custom",
-        "version": _next_version(data_dir, factor_id),
+        "version": _next_version(factor_id),
         "label": req.label,
         "group": req.group,
         "formula": req.formula,
@@ -280,19 +279,18 @@ def create_custom_factor(req: CustomFactorCreateRequest, request: Request) -> di
         store.register_definition(definition)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    store.save_one(data_dir, definition)
+    store.save_one(definition)
     return {"ok": True, "id": factor_id, "version": definition["version"]}
 
 
 @router.post("/composite")
 def create_composite_factor(req: CompositeFactorCreateRequest, request: Request) -> dict:
     """保存复合因子: 成员校验 + 循环引用检查 (无需试算, 值由成员物化路径计算)。"""
-    data_dir = _data_dir(request)
     factor_id = _resolve_id(req.id, req.label, "cf")
     definition = {
         "id": factor_id,
         "kind": "composite",
-        "version": _next_version(data_dir, factor_id),
+        "version": _next_version(factor_id),
         "label": req.label,
         "group": req.group,
         "members": req.members,
@@ -306,7 +304,7 @@ def create_composite_factor(req: CompositeFactorCreateRequest, request: Request)
         store.register_definition(definition)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    store.save_one(data_dir, definition)
+    store.save_one(definition)
     return {"ok": True, "id": factor_id, "version": definition["version"]}
 
 
@@ -324,9 +322,8 @@ def update_custom_factor(factor_id: str, req: CustomFactorUpdateRequest, request
 
     公式变化时状态回 draft (生命周期语义: 编辑后需重新检验激活); 仅改名称/分组保留状态。
     """
-    data_dir = _data_dir(request)
     target = None
-    for definition in store.load_all(data_dir):
+    for definition in store.load_all():
         if str(definition.get("id")) == factor_id:
             target = definition
             break
@@ -351,12 +348,16 @@ def update_custom_factor(factor_id: str, req: CustomFactorUpdateRequest, request
         store.register_definition(target)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    store.save_one(data_dir, target)
+    store.save_one(target)
     return {"ok": True, "id": factor_id, "version": target["version"], "status": target["status"]}
 
 
 def _find_references(data_dir, factor_id: str) -> list[str]:
-    """扫描策略与复合因子定义中的引用 (删除前 fail-closed 检查)。"""
+    """扫描策略与复合因子定义中的引用 (删除前 fail-closed 检查)。
+
+    因子定义读**当前账户**的存储 (store 自己解析 user_root); 策略覆盖文件仍扫
+    ``data_dir/strategies`` —— 策略归属是另一个域, 这里保持原口径不动。
+    """
     references: list[str] = []
     strategies_dir = data_dir / "strategies"
     if strategies_dir.is_dir():
@@ -367,7 +368,7 @@ def _find_references(data_dir, factor_id: str) -> list[str]:
                     references.append(f"strategies/{file.name}")
             except OSError:
                 continue
-    for definition in store.load_all(data_dir):
+    for definition in store.load_all():
         if str(definition.get("id")) == factor_id:
             continue
         members = definition.get("members")
@@ -390,13 +391,13 @@ def delete_custom_factor(factor_id: str, request: Request, force: bool = Query(d
             status_code=409,
             detail={"message": "该因子仍有引用, 拒绝删除 (可带 force=true 强制)", "references": references},
         )
-    if get_factor(factor_id) is None and not store.delete_one(data_dir, factor_id):
+    if get_factor(factor_id) is None and not store.delete_one(factor_id):
         raise HTTPException(status_code=404, detail=f"因子不存在: {factor_id}")
     try:
         unregister_factor(factor_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    store.delete_one(data_dir, factor_id)
+    store.delete_one(factor_id)
     return {"ok": True, "id": factor_id, "removed_references": references}
 
 
@@ -407,9 +408,8 @@ class FactorStatusRequest(BaseModel):
 @router.post("/custom/{factor_id}/status")
 def update_factor_status(factor_id: str, req: FactorStatusRequest, request: Request) -> dict:
     """生命周期状态迁移 (P4): draft->active->watch->retired, 编辑后回 draft。"""
-    data_dir = _data_dir(request)
     target = None
-    for definition in store.load_all(data_dir):
+    for definition in store.load_all():
         if str(definition.get("id")) == factor_id:
             target = definition
             break
@@ -424,7 +424,7 @@ def update_factor_status(factor_id: str, req: FactorStatusRequest, request: Requ
         store.register_definition(target)  # 状态与 stability 联动
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    store.save_one(data_dir, target)
+    store.save_one(target)
     return {"ok": True, "id": factor_id, "status": req.status}
 
 
@@ -435,12 +435,11 @@ class FactorGroupRequest(BaseModel):
 @router.post("/custom/{factor_id}/group")
 def update_factor_group(factor_id: str, req: FactorGroupRequest, request: Request) -> dict:
     """修改单个自定义/复合因子的分组 (内置因子分组与快照/预设绑定, 不可改)。"""
-    data_dir = _data_dir(request)
     group = req.group.strip()
     if not group:
         raise HTTPException(status_code=400, detail="分组名不能为空")
     target = None
-    for definition in store.load_all(data_dir):
+    for definition in store.load_all():
         if str(definition.get("id")) == factor_id:
             target = definition
             break
@@ -453,5 +452,5 @@ def update_factor_group(factor_id: str, req: FactorGroupRequest, request: Reques
         store.register_definition(target)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    store.save_one(data_dir, target)
+    store.save_one(target)
     return {"ok": True, "id": factor_id, "group": group}

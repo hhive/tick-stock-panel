@@ -255,7 +255,7 @@ class MatcherCandidateEvaluator:
         if kind == "existing_strategy":
             strategy_id = str(definition.get("strategy_id") or "")
             strategy = self.strategy_engine.get(strategy_id)
-            overrides = strategy_config.load_override(self.data_dir, strategy_id)
+            overrides = strategy_config.load_override(strategy_id, user_root=self.data_dir)
             params = self.strategy_engine.resolve_params(strategy, overrides=overrides)
         elif kind == "factor_rank":
             strategy_id = "factor_rank_research"
@@ -969,7 +969,7 @@ def _prepare_base_market(
         ))
     for strategy_id in request.strategy_ids:
         strategy = strategy_engine.get(strategy_id)
-        overrides = strategy_config.load_override(data_dir, strategy_id)
+        overrides = strategy_config.load_override(strategy_id, user_root=data_dir)
         params = strategy_engine.resolve_params(strategy, overrides=overrides)
         plans.append(resolver.resolve(
             strategy,
