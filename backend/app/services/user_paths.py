@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Iterator
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -69,7 +70,7 @@ def resolve_user_root(explicit: Path | None = None) -> Path:
     第 3 条是刻意的 fail-closed, 理由见 MissingUserContextError 的 docstring。
     """
     if explicit is not None:
-        return Path(explicit)
+        return _validate_explicit_root(explicit)
     from app.services import preferences  # 惰性导入: 避免与本模块形成导入环
 
     root = preferences.current_user_root()
@@ -78,7 +79,51 @@ def resolve_user_root(explicit: Path | None = None) -> Path:
             "无法解析账户根目录: 既未显式传 user_root, 也没有请求上下文。"
             "后台线程/调度器必须显式传 user_root=。"
         )
+    # 上下文里的根**不**在此处校验归属: 它由认证中间件经
+    # preferences.set_current_user_root(user_paths.user_root(account_id)) 注入,
+    # 而 user_root() 已经校验过 account_id。在此重复校验会要求根必须严格位于
+    # <data_dir>/users/ 之下 —— 那会把"测试用 tmp 根做行为兼容"这类正当用法一并
+    # 拒掉(曾因此一次打红 258 条测试), 收益却只是挡住一个本就不存在的调用方。
     return Path(root)
+
+
+def _validate_explicit_root(p: Path) -> Path:
+    """拒绝把**共享目录**当作账户根, 并归一化返回值。
+
+    这是"传错目录却静默通过"的闸门。但校验按**危害分级**, 只挡真正会导致跨用户
+    串号的那几类, 而不是要求路径必须在 ``<data_dir>/users/`` 之下 —— 后者过严:
+    它会连带拒掉"测试用独立 tmp 根隔离数据"这类正当用法(曾一次打红 258 条测试),
+    而那种路径并不共享任何东西, 不会造成跨账户泄漏。
+
+    真正致命的是**共享目录**被当成账户根, 数据会落到所有人都读写的位置:
+
+      - ``data_dir`` 本身: 每用户存储退化成共享文件 ⇒ A 的写入覆盖 B 的;
+      - ``<data_dir>/users`` 这个**容器**: 数据落到 ``users/user_data/…``, 同样是共享;
+      - ``data_dir`` 的**祖先**(如 ``..``): 同上, 且范围更大。
+
+    用 ``resolve()`` 归一化后再比较: 能识别 ``users/1/..`` 这类绕过, 也让返回值成为
+    规范形态(符号链接展开), 调用方拿到的路径与实际落盘位置一致。
+    """
+    from app.config import settings
+
+    data_dir = Path(settings.data_dir).resolve()
+    users_base = data_dir / "users"
+    resolved = Path(p).resolve()
+
+    if resolved == data_dir or resolved.is_relative_to(data_dir):
+        # 位于 data_dir 之下: 只有 users/<id> 子树才是账户私有, 其余
+        # (data_dir 自身、user_data/、strategies/、pools/… 以及 users/ 容器本身)
+        # 都是**共享位置**, 拿它们当账户根会让所有账户读写同一份文件。
+        if resolved == users_base or not resolved.is_relative_to(users_base):
+            raise InvalidAccountIdError(
+                f"data_dir 之下只有 users/<id> 可作为账户根(其余是共享位置): {p}",
+            )
+    elif data_dir.is_relative_to(resolved):
+        # 位于 data_dir 之外、但是它的祖先(如 .. 或 /): 会把整个共享树包进来
+        raise InvalidAccountIdError(
+            f"data_dir 的祖先目录不能作为账户根: {p}",
+        )
+    return resolved
 
 
 def validate_account_id(raw: object) -> int:
@@ -132,6 +177,28 @@ def user_root(account_id: int) -> Path:
     from app.config import settings
 
     return Path(settings.data_dir) / "users" / _as_dirname(validate_account_id(account_id))
+
+
+def iter_user_roots() -> Iterator[tuple[int, Path]]:
+    """遍历全部账户的 ``(account_id, user_root)``。
+
+    用途: **共享**数据变更后需要让所有账户的派生状态失效。典型场景是扩展数据
+    (概念/行业)变更 —— 它喂的是所有人共用的计算, 因此每个账户基于它算出的策略结果
+    缓存都过期了。只清"当前账户"会留下其它账户展示旧口径结果, 且没有任何提示。
+
+    开销与边界:
+      - 会读账号注册表, 属进程级遍历 —— **只在低频路径使用**(配置变更、管理操作),
+        不要放进每请求或行情轮询的热路径。
+      - 账户 id 非法时跳过并记警告, 不让一个坏账号中断整轮扇出。
+      - 无账号时产出空序列(全新部署即是如此), 调用方无需特判。
+    """
+    from app.services import accounts  # 惰性导入: 避免导入环
+
+    for acc in accounts.list_accounts():
+        try:
+            yield acc.id, user_root(acc.id)
+        except InvalidAccountIdError:
+            logger.warning("fan-out: 跳过非法账号 id %r", getattr(acc, "id", None))
 
 
 def ensure_user_dirs(account_id: int) -> Path:

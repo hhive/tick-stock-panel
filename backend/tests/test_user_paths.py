@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from app import config as app_config
@@ -261,3 +263,55 @@ def test_resolve_fails_closed_without_any_context(_isolated):
             resolve_user_root()
     finally:
         preferences.reset_current_user_root(token)
+
+
+# ================================================================
+# resolve_user_root: 显式根的归属校验（"静默读写错目录"的总闸门）
+# ================================================================
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        lambda d: d,                            # 共享 data_dir 本身
+        lambda d: d / "user_data",              # 共享子目录（每用户存储的旧位置）
+        lambda d: d / "strategies",             # 同上
+        lambda d: d / "backtest_results",       # 同上
+        lambda d: d / "users",                  # users 容器（不是某个账户）
+        lambda d: d.parent,                     # data_dir 的祖先
+        lambda d: d / "users" / "1" / "..",     # 归一化后回到 users 容器
+    ],
+)
+def test_resolve_rejects_shared_dirs_as_root(_isolated, bad):
+    """**共享目录**不得被当成账户根 —— 这是跨账户串号的直接来源。
+
+    落到这里的后果是: 每用户存储退化成共享文件, A 的写入覆盖 B 的; 或后台读到
+    别人的数据。不报错、不崩溃, 只是安静地串号, 因此必须在入口挡住。
+
+    校验按**危害分级**, 只挡位于 data_dir 之下的共享位置与 data_dir 的祖先 ——
+    它们必然共享; 而不要求路径必须在 users/ 之下(见下一条的说明)。
+    """
+    with pytest.raises(InvalidAccountIdError):
+        resolve_user_root(bad(_isolated))
+
+
+def test_resolve_accepts_root_inside_users_dir(_isolated):
+    ok = _isolated / "users" / "5"
+    assert resolve_user_root(ok) == ok.resolve()
+
+
+def test_resolve_allows_isolated_dir_outside_data_dir(_isolated):
+    """刻意**允许** data_dir 之外的独立目录作为账户根。
+
+    这是有意的边界, 不是疏漏: 致命情形是"共享目录被当成账户根", 而共享目录必然
+    位于 data_dir 之下(或其祖先)。data_dir 之外的独立目录不共享任何东西, 不会
+    跨账户串号。要求路径必须在 users/ 之下会连带拒掉"用独立临时目录隔离数据"
+    这类正当用法 —— 实测一次打红 258 条测试, 收益只是挡住一个本不存在的调用方。
+    """
+    outside = Path("/var/tmp/tsp-isolated-root")
+    assert resolve_user_root(outside) == outside.resolve()
+
+
+def test_resolve_returns_normalized_path(_isolated):
+    """返回值归一化: 展开符号链接与 .., 调用方拿到的路径与实际落盘位置一致。"""
+    indirect = _isolated / "users" / "3" / ".." / "3"
+    assert resolve_user_root(indirect) == (_isolated / "users" / "3").resolve()

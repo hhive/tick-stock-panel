@@ -251,3 +251,78 @@ def test_authenticated_user_is_not_guest_rate_limited(client):
     codes = [client.get("/api/overview/market").status_code
              for _ in range(app_main._GUEST_LIMIT_EXPENSIVE + 5)]
     assert 429 not in codes
+
+
+# ================================================================
+# 管理员门控（原实现只注入 role 却从不按它拒绝）
+# ================================================================
+
+@pytest.fixture
+def admin(client):
+    """已登录的**管理员**（首个注册者即 admin）。"""
+    client.post("/api/account/register",
+                json={"email": "admin@example.com", "password": "secret123"})
+    return client
+
+
+@pytest.fixture
+def regular_user(client):
+    """已登录的**普通用户**。首个注册者是 admin，因此普通用户是第二个。"""
+    client.post("/api/account/register",
+                json={"email": "admin@example.com", "password": "secret123"})
+    client.post("/api/account/logout")
+    client.post("/api/account/register",
+                json={"email": "user@example.com", "password": "secret123"})
+    return client
+
+
+def test_regular_user_cannot_clear_shared_data(regular_user):
+    """删光共享行情/财务/任务表的端点必须 admin-only。
+
+    开放注册下，任何登录用户一次请求即可毁掉全站数据面 —— 这是最严重的越权后果，
+    而原实现（只注入 role 却从不按它拒绝）会放行它。
+    """
+    r = regular_user.post("/api/data/clear")
+    assert r.status_code == 403
+    assert r.json()["code"] == "ADMIN_REQUIRED"
+
+
+def test_admin_reaches_clear_endpoint(admin):
+    assert admin.post("/api/data/clear").status_code != 403
+
+
+def test_regular_user_cannot_write_strategy_source(regular_user):
+    """写策略源码必须在**服务端**被拒 —— 源码会被写盘并在服务进程内 import 执行。
+
+    只藏前端入口不够：请求可以绕过 UI 直接发。面板作者的 AST 名单自述"不是真正的
+    沙箱"，因此对不可信用户开放该路径等于放弃隔离。
+    """
+    for path in ("/api/strategy/build", "/api/strategy/build/stream",
+                 "/api/strategy/ai/generate", "/api/strategy/ai/iterate",
+                 "/api/strategy/ai/save", "/api/strategy/ai/test",
+                 "/api/strategy/code/save", "/api/strategy/code/validate",
+                 "/api/strategy/composite/save", "/api/strategy/reload"):
+        assert regular_user.post(path, json={}).status_code == 403, path
+
+
+def test_regular_user_cannot_delete_or_publish_strategy(regular_user):
+    assert regular_user.delete("/api/strategy/some_id").status_code == 403
+    assert regular_user.post("/api/strategy/some_id/publish").status_code == 403
+
+
+def test_regular_user_can_still_run_strategies(regular_user):
+    """核心产品功能**不得**被门控误伤：用内置策略跑自己的参数、改自己的覆盖值。"""
+    assert regular_user.post("/api/strategy/run", json={}).status_code != 403
+    assert regular_user.patch("/api/strategy/config/x", json={}).status_code != 403
+
+
+def test_guest_cannot_reach_admin_endpoints(client):
+    assert client.post("/api/data/clear").status_code in (401, 403)
+
+
+def test_legacy_password_session_counts_as_admin(client):
+    """单密码应急入口等价 admin，不应被新门控挡住。"""
+    auth_service.set_password("legacy-pass-123")
+    client.cookies.clear()
+    client.post("/api/auth/login", json={"password": "legacy-pass-123"})
+    assert client.post("/api/data/clear").status_code != 403

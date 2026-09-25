@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import sys
 import threading
 import time
@@ -483,6 +484,37 @@ _PUBLIC_READ_EXPENSIVE = (
     "/api/abnormal/overview", "/api/stock-analysis/levels",
 )
 
+# 管理员专属端点(精确匹配)。判断依据与完整理由见 _is_admin_only 的 docstring。
+_ADMIN_ONLY_EXACT = frozenset({
+    "/api/data/clear",
+    "/api/strategy/build",
+    "/api/strategy/build/stream",
+    "/api/strategy/ai/test",
+    "/api/strategy/ai/generate",
+    "/api/strategy/ai/iterate",
+    "/api/strategy/ai/save",
+    "/api/strategy/code/validate",
+    "/api/strategy/code/save",
+    "/api/strategy/composite/save",
+    "/api/strategy/reload",
+    # 自定义信号的定义端点。信号是**部署级**的(产出共享 enriched 表的 csg_* 列),
+    # 且用户提交的是表达式 —— 与策略创作面同类, 故创作侧仅管理员可用。
+    # 只读端点(/options、列表)不门控; /intraday/replay 是回放分析, 不改定义。
+    "/api/custom-signals",
+    "/api/custom-signals/ai/generate",
+})
+# 带路径参数的端点。**必须按方法分开**:
+#   - `^/api/strategy/[^/]+$` 若对 POST 也生效, 会连 `POST /api/strategy/run`
+#     一起挡掉 —— 那是普通用户的核心功能(用内置策略跑自己的参数), 不能门控。
+#   - DELETE 下它匹配的才是 `DELETE /api/strategy/{id}`(删除策略本体)。
+_ADMIN_ONLY_RE_POST = (
+    re.compile(r"^/api/strategy/[^/]+/publish$"),
+)
+_ADMIN_ONLY_RE_DELETE = (
+    re.compile(r"^/api/strategy/[^/]+$"),
+    re.compile(r"^/api/custom-signals/[^/]+$"),
+)
+
 # 游客限流额度(按 IP, 滑动窗口 60s)。普通只读 / 重算类分开计量。
 _GUEST_LIMIT_PLAIN = 120
 _GUEST_LIMIT_EXPENSIVE = 15
@@ -538,6 +570,33 @@ def _resolve_identity(request: Request) -> tuple[int | None, str]:
     return None, "guest"
 
 
+def _is_admin_only(method: str, path: str) -> bool:
+    """管理员专属端点。
+
+    **必须先看清这是干什么用的再往里加东西** —— 这里的判断依据是"该端点的效果
+    超出单个账户":
+
+      - `/api/data/clear`: 删光**共享**行情/enriched/financials 与任务表。用户决策
+        要求开放注册, 所以任何登录用户都能一次请求毁掉全站数据面。
+      - `/api/strategy/{build,ai/*,code/*,composite/*,reload}` 与
+        `POST /{id}/publish`、`DELETE /{id}`: 写策略源码, 而源码会被写盘并在
+        **服务进程内** import 执行(`strategy/engine.py` spec_from_file_location →
+        exec_module)。唯一防护是静态 AST 名单, 面板作者自己在 docstring 里写明
+        "不是真正的沙箱"。因此对不可信用户开放该功能等于放弃隔离 —— 用户决策:
+        先把自定义 Python 策略对普通用户隐藏, 沙箱化留作后续 P0。
+
+    刻意**不**设为 admin 的: `POST /run`、`/run-all`、`PATCH|DELETE /config/{id}`
+    —— 用内置策略跑自己的参数、存自己的覆盖值, 是多用户的核心产品功能。
+    """
+    if path in _ADMIN_ONLY_EXACT:
+        return True
+    if method == "POST" and any(r.match(path) for r in _ADMIN_ONLY_RE_POST):
+        return True
+    if method == "DELETE" and any(r.match(path) for r in _ADMIN_ONLY_RE_DELETE):
+        return True
+    return False
+
+
 def _authorize(request: Request, path: str, role: str) -> JSONResponse | None:
     """授权判定。返回 None 表示放行, 否则返回应直接下发的拒绝响应。"""
     # 白名单放行(登录/注册/探活本身不拦)
@@ -545,6 +604,13 @@ def _authorize(request: Request, path: str, role: str) -> JSONResponse | None:
         return None
 
     if role != "guest":
+        # 已登录: 管理员专属端点需 admin 角色。
+        # 单密码应急入口等价 admin(见 _resolve_identity), 因此不受影响。
+        if role != "admin" and _is_admin_only(request.method, path):
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "需要管理员权限", "code": "ADMIN_REQUIRED"},
+            )
         return None
 
     # 未登录: 公开只读子集放行, 但必须限量
