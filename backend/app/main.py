@@ -535,6 +535,46 @@ def _resolve_identity(request: Request) -> tuple[int | None, str]:
     return None, "guest"
 
 
+def _authorize(request: Request, path: str, role: str) -> JSONResponse | None:
+    """授权判定。返回 None 表示放行, 否则返回应直接下发的拒绝响应。"""
+    # 白名单放行(登录/注册/探活本身不拦)
+    if path in _AUTH_WHITELIST_EXACT:
+        return None
+
+    if role != "guest":
+        return None
+
+    # 未登录: 公开只读子集放行, 但必须限量
+    if _is_public_read(request.method, path):
+        ip = auth_api._client_ip(request)
+        if _guest_rate_limited(ip, path):
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "访问过于频繁, 请稍后重试", "code": "GUEST_RATE_LIMITED"},
+            )
+        return None
+
+    from app.services import accounts, auth as auth_service
+    # 未**认领**的面板 = 既没有账号、也没有设过密码。此时保留既有「仅本机/内网」
+    # 语义, 防公网陌生人抢先设密码。
+    # 一旦注册出第一个账号, 面板即视为已认领 —— 之后未登录一律 401, 前端据此
+    # 跳登录/注册页。否则已认领的面板会给未登录用户回「请通过 SSH 设置密码」的
+    # 403, 前端会显示完全错误的引导。
+    if not auth_service.is_configured() and not accounts.has_accounts():
+        if auth_api._is_local_network(auth_api._client_ip(request)):
+            return None
+        return JSONResponse(
+            status_code=403,
+            content={
+                "detail": "面板尚未初始化访问密码,请通过 SSH/本机浏览器访问以设置密码",
+                "code": "NOT_INITIALIZED",
+            },
+        )
+
+    # 未登录: 401(前端跳登录页)
+    return JSONResponse(status_code=401, content={"detail": "未登录或会话已过期"})
+
+
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     path = request.url.path
@@ -550,46 +590,26 @@ async def auth_middleware(request: Request, call_next):
     if not path.startswith("/api/"):
         return await call_next(request)
 
+    from app.services import preferences, user_paths
+
     account_id, role = _resolve_identity(request)
     request.state.account_id = account_id
     request.state.role = role
 
-    # 白名单放行(登录/注册/探活本身不拦)
-    if path in _AUTH_WHITELIST_EXACT:
+    # 注入每用户偏好上下文 —— 这是请求路径读取/写入每用户偏好键的唯一入口。
+    # 无账号(游客/应急入口)时置 None, 此时写每用户键会被 save() 拒绝(fail-closed),
+    # 而不是静默写进全局文件被所有账户共享。
+    ctx_token = preferences.set_current_user_root(
+        user_paths.user_root(account_id) if account_id is not None else None,
+    )
+    try:
+        denial = _authorize(request, path, role)
+        if denial is not None:
+            return denial
         return await call_next(request)
-
-    if role != "guest":
-        return await call_next(request)
-
-    # 未登录: 公开只读子集放行, 但必须限量
-    if _is_public_read(request.method, path):
-        ip = auth_api._client_ip(request)
-        if _guest_rate_limited(ip, path):
-            return JSONResponse(
-                status_code=429,
-                content={"detail": "访问过于频繁, 请稍后重试", "code": "GUEST_RATE_LIMITED"},
-            )
-        return await call_next(request)
-
-    from app.services import accounts, auth as auth_service
-    # 未**认领**的面板 = 既没有账号、也没有设过密码。此时保留既有「仅本机/内网」
-    # 语义, 防公网陌生人抢先设密码。
-    # 一旦注册出第一个账号, 面板即视为已认领 —— 之后未登录一律 401, 前端据此
-    # 跳登录/注册页。否则已认领的面板会给未登录用户回「请通过 SSH 设置密码」的
-    # 403, 前端会显示完全错误的引导。
-    if not auth_service.is_configured() and not accounts.has_accounts():
-        if auth_api._is_local_network(auth_api._client_ip(request)):
-            return await call_next(request)
-        return JSONResponse(
-            status_code=403,
-            content={
-                "detail": "面板尚未初始化访问密码,请通过 SSH/本机浏览器访问以设置密码",
-                "code": "NOT_INITIALIZED",
-            },
-        )
-
-    # 未登录: 401(前端跳登录页)
-    return JSONResponse(status_code=401, content={"detail": "未登录或会话已过期"})
+    finally:
+        # 必须复位: contextvar 在同一次请求的并发任务间共享, 泄漏会串到别的请求
+        preferences.reset_current_user_root(ctx_token)
 
 
 # 路由
