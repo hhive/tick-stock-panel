@@ -2147,6 +2147,39 @@ export const api = {
       body: JSON.stringify({ old_password: oldPassword, new_password: newPassword }),
     }),
 
+  // ===== Account (多用户账号: Sub2API 跳转 + 邮箱/密码) =====
+  // 会话在 HttpOnly cookie 里, 前端不接触 token。
+  /** Sub2API 跳转登录: 用 API Key 换面板会话。401 = key 无效; 其余 key 有效但尚无账号 → needs_auth */
+  accountJump: (apiKey: string) =>
+    request<{ status: 'logged_in'; email: string } | { status: 'needs_auth' }>(
+      '/api/account/jump',
+      { method: 'POST', body: JSON.stringify({ api_key: apiKey }), quiet: true },
+    ),
+  accountRegister: (email: string, password: string, apiKey?: string) =>
+    request<{ ok: boolean; email: string }>('/api/account/register', {
+      method: 'POST',
+      body: JSON.stringify(apiKey ? { email, password, api_key: apiKey } : { email, password }),
+    }),
+  accountLogin: (email: string, password: string) =>
+    request<{ ok: boolean; email: string }>('/api/account/login', {
+      method: 'POST',
+      body: JSON.stringify({ email, password }),
+    }),
+  accountLogout: () =>
+    request<{ ok: boolean }>('/api/account/logout', { method: 'POST' }),
+  accountMe: () =>
+    request<{ email: string; role: string; bindings: string[] }>('/api/account/me'),
+  accountBind: (apiKey: string) =>
+    request<{ ok: boolean }>('/api/account/bindings', {
+      method: 'POST',
+      body: JSON.stringify({ api_key: apiKey }),
+    }),
+  accountUnbind: (apiKey: string) =>
+    request<{ ok: boolean }>('/api/account/bindings', {
+      method: 'DELETE',
+      body: JSON.stringify({ api_key: apiKey }),
+    }),
+
   settings: () => request<SettingsState>('/api/settings'),
   saveTickflowKey: (api_key: string) =>
     request<SaveTickflowKeyResult>('/api/settings/tickflow-key', {

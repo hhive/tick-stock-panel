@@ -1,6 +1,7 @@
 import { lazy } from 'react'
-import { createBrowserRouter, Navigate, useSearchParams } from 'react-router-dom'
+import { createBrowserRouter, Navigate, useSearchParams, type RouteObject } from 'react-router-dom'
 import { Layout } from './components/Layout'
+import { JumpGate } from './components/JumpGate'
 import { Onboarding } from './pages/Onboarding'
 import { Auth } from './pages/Auth'
 import { useSettings } from './lib/useSharedQueries'
@@ -112,7 +113,7 @@ function OnboardingGuard({ children }: { children: React.ReactNode }) {
   return <>{children}</>
 }
 
-export const router = createBrowserRouter([
+export const appRoutes: RouteObject[] = [
   { path: '/onboarding', element: <Onboarding /> },
   { path: '/login', element: <Auth /> },
   {
@@ -167,4 +168,10 @@ export const router = createBrowserRouter([
       }),
     ],
   },
+]
+
+// 最外层包一道跳转门: Sub2API 带 ?apikey= 跳回时, 先摘凭证并换取会话;
+// 地址栏没有凭证时同步放行, 不产生任何额外请求。
+export const router = createBrowserRouter([
+  { element: <JumpGate />, children: appRoutes },
 ])
