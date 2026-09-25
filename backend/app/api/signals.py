@@ -38,7 +38,11 @@ def _invalidate(request: Request) -> None:
     from app.indicators.pipeline import invalidate_custom_signals
     invalidate_custom_signals()
     from app.services import strategy_cache
-    strategy_cache.clear_cache(_user_root(request))
+
+    # 必须清**所有账户**的策略缓存, 不能只清当前账户: 自定义信号是**部署级**的
+    # (产出共享 enriched 表的 csg_* 列), 增删信号会改变**所有人**看到的那张表 ——
+    # 只清当前账户会让其它账户继续展示用旧列集合算出的结果, 且没有任何提示。
+    strategy_cache.clear_all_accounts()
     repo = request.app.state.repo
     if hasattr(repo, "clear_cache"):
         repo.clear_cache()
