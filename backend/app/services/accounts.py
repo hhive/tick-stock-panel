@@ -33,6 +33,11 @@ _BEIJING = ZoneInfo("Asia/Shanghai")
 
 _lock = threading.Lock()
 
+# 「账号 id → 角色」缓存。认证中间件是**每请求热路径**, 不能每次都读整个账号文件
+# (阻塞事件循环)。写入路径统一经 _save(), 在那里失效即可保证读到最新真值 ——
+# 与 app.services.auth 的 _configured_cache 同一姿态。
+_roles_cache: dict[int, str] | None = None
+
 
 class EmailTakenError(ValueError):
     """邮箱已被注册。"""
@@ -81,6 +86,9 @@ def _load() -> dict:
 
 
 def _save(data: dict) -> None:
+    global _roles_cache
+    # 任何写入都让角色缓存失效 —— 保证下一次 get_role 读到最新真值
+    _roles_cache = None
     atomic_write_text(
         _path(), json.dumps(data, indent=2, ensure_ascii=False), mode=0o600,
     )
@@ -164,6 +172,35 @@ def find_by_key_hash(key_hash: str) -> Account | None:
             if target in [str(x).lower() for x in (r.get("api_key_bindings") or [])]:
                 return _row_to_account(r)
     return None
+
+
+def _ensure_roles_cache() -> dict[int, str]:
+    """填充并返回「账号 id → 角色」缓存。由 _save() 统一失效。"""
+    global _roles_cache
+    if _roles_cache is None:
+        with _lock:
+            _roles_cache = {
+                int(r["id"]): str(r.get("role", "user")) for r in _rows(_load())
+            }
+    return _roles_cache
+
+
+def get_role(account_id: int) -> str | None:
+    """取账号角色(带缓存), 不存在返回 None。
+
+    认证中间件每请求都会调用, 所以这里必须走缓存而不能每次读文件。
+    缓存由 _save() 统一失效, 因此不会读到过期角色。
+    """
+    return _ensure_roles_cache().get(int(account_id))
+
+
+def has_accounts() -> bool:
+    """是否已存在任何账号 —— 即「面板是否已被认领」。
+
+    认证中间件用它判定未登录请求该回 403(未认领) 还是 401(已认领)。
+    带缓存, 与 get_role 共用同一份数据, 热路径不读文件。
+    """
+    return bool(_ensure_roles_cache())
 
 
 def hash_api_key(api_key: str) -> str:
@@ -284,5 +321,6 @@ def unbind_api_key(account_id: int, key_hash: str) -> Account:
 
 def reset_state_for_tests() -> None:
     """仅供测试: 丢弃内存态。账号数据本身在文件里, 由测试的临时 DATA_DIR 隔离。"""
-    global _lock
+    global _lock, _roles_cache
     _lock = threading.Lock()
+    _roles_cache = None

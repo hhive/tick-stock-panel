@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -14,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from app import __version__
 from app.api import (
     abnormal,
+    account,
     alerts,
     analysis,
     backtest,
@@ -425,32 +428,158 @@ app.add_middleware(
 # ================================================================
 # 访问认证中间件
 # ================================================================
-# 拦截所有 /api/ 请求, 三种状态:
-#   1. 未设密码 + 本机/内网 → 放行(让本机用户访问面板 + 调 /api/auth/setup 设密码)
-#   2. 未设密码 + 公网       → 拒绝(403, 防裸奔也防抢占; 引导本机设密码)
-#   3. 已设密码              → 检查 session, 无效则 401(前端跳登录)
-# 白名单: /api/auth/* (设密码/登录本身)、/health 等探活。
-_AUTH_WHITELIST_PREFIX = ("/api/auth/",)
-_AUTH_WHITELIST_EXACT = ("/health", "/api/health", "/openapi.json", "/docs", "/redoc")
+# 拦截所有 /api/ 请求, 四种状态:
+#   1. 有效账号会话          → 放行, 注入 request.state.account_id / role
+#   2. 有效单密码应急会话     → 放行, role="admin"(account_id 为 None)
+#   3. 未登录 + 公开只读路径  → 放行, role="guest"(受限限流)
+#   4. 未登录 + 其它          → 401; 未设密码的面板对公网仍 403(防抢占)
+#
+# 精确白名单, **刻意不用前缀**: 原实现用 ("/api/auth/",) 前缀, 会把未来任何
+# 新增的 /api/auth/* 路由默认公开(它同时也无条件放行了 logout / change-password)。
+_AUTH_WHITELIST_EXACT = (
+    "/api/auth/status",     # 前端据此决定要不要跳登录页
+    "/api/auth/setup",      # 自带本机/内网限制(防公网抢占)
+    "/api/auth/login",      # 自带失败限流
+    "/api/account/jump",    # 跳转登录: 此刻必然还没有会话
+    "/api/account/register",
+    "/api/account/login",
+    "/health",
+)
+
+# 文档端点。它们**不在 /api/ 前缀下**, 会被下面的早退分支无条件放行, 所以必须
+# 单独拦一道 —— 否则"把它从白名单移除"是无效操作, 完整路由 schema 仍对匿名开放。
+_DOCS_PATHS = ("/openapi.json", "/docs", "/redoc")
+
+# 公开只读: 游客(匿名)可访问的受限子集。精确匹配 + 少量前缀(带路径参数的)。
+# 新增路由**不会**自动进入这里, 未分类即落在"需登录"侧(fail-closed)。
+_PUBLIC_READ_EXACT = (
+    "/api/regime/latest", "/api/regime/states", "/api/regime/history",
+    "/api/regime/phases", "/api/regime/coverage", "/api/regime/mainline",
+    "/api/market-recap/dragon-tiger", "/api/market-recap/auction-benchmark",
+    "/api/data/version", "/api/data/status",
+    "/api/intraday/status", "/api/intraday/indices",
+    "/api/kline/daily", "/api/kline/daily/latest",
+    "/api/kline/minute", "/api/kline/minute-range",
+    "/api/kline/instruments/search",
+    "/api/stock-analysis/levels",
+    "/api/overview/market",
+    "/api/sector-rotation",
+    "/api/rps/rotation",
+    "/api/abnormal/intraday", "/api/abnormal/overview",
+    "/api/screener/cached-summary", "/api/screener/strategies",
+)
+_PUBLIC_READ_PREFIX = ("/api/screener/cached-result/",)
+# 唯一的公开 POST: 纯粹的 code→name 批量查询, 无副作用、不打上游。
+_PUBLIC_READ_POST = ("/api/kline/instruments/names",)
+
+# 公开只读里**背后是全市场重建**的那批: 缓存 TTL 仅 5s/30s/120s, 匿名流量可低成本
+# 反复击穿 → 单独给更紧的额度。全站原本零限流, 这是游客分层引入的新放大面。
+_PUBLIC_READ_EXPENSIVE = (
+    "/api/overview/market", "/api/sector-rotation", "/api/rps/rotation",
+    "/api/screener/cached-summary", "/api/abnormal/intraday",
+    "/api/abnormal/overview", "/api/stock-analysis/levels",
+)
+
+# 游客限流额度(按 IP, 滑动窗口 60s)。普通只读 / 重算类分开计量。
+_GUEST_LIMIT_PLAIN = 120
+_GUEST_LIMIT_EXPENSIVE = 15
+_GUEST_LIMIT_WINDOW_S = 60.0
+_guest_hits: dict[str, dict[str, list[float]]] = {}
+_guest_lock = threading.Lock()
+
+
+def _is_public_read(method: str, path: str) -> bool:
+    if path in _PUBLIC_READ_POST:
+        return method == "POST"
+    if method != "GET":
+        return False
+    if path in _PUBLIC_READ_EXACT:
+        return True
+    return any(path.startswith(p) for p in _PUBLIC_READ_PREFIX)
+
+
+def _guest_rate_limited(ip: str, path: str) -> bool:
+    """游客额度检查(超限返回 True)。两档分开计数, 互不挤占。"""
+    bucket = "expensive" if path in _PUBLIC_READ_EXPENSIVE else "plain"
+    limit = _GUEST_LIMIT_EXPENSIVE if bucket == "expensive" else _GUEST_LIMIT_PLAIN
+    now = time.time()
+    with _guest_lock:
+        if len(_guest_hits) > 5000:
+            _guest_hits.clear()  # 防内存膨胀(粗暴但安全, 只影响限流精度)
+        per_ip = _guest_hits.setdefault(ip, {"plain": [], "expensive": []})
+        hits = [t for t in per_ip[bucket] if now - t < _GUEST_LIMIT_WINDOW_S]
+        if len(hits) >= limit:
+            per_ip[bucket] = hits
+            return True
+        hits.append(now)
+        per_ip[bucket] = hits
+    return False
+
+
+def _resolve_identity(request: Request) -> tuple[int | None, str]:
+    """解析请求身份 → (account_id, role)。
+
+    两份会话存储彼此独立: 先查多用户账号会话, 再回落单密码应急会话。
+    """
+    from app.services import account_sessions, accounts, auth as auth_service
+
+    token = request.cookies.get(auth_api.COOKIE_NAME)
+    if not token:
+        return None, "guest"
+    account_id = account_sessions.get_session(token)
+    if account_id is not None:
+        return account_id, (accounts.get_role(account_id) or "user")
+    if auth_service.is_configured() and auth_service.is_valid_session(token):
+        # 单密码应急入口: 等价管理员, 但没有账号 id
+        return None, "admin"
+    return None, "guest"
 
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     path = request.url.path
+
+    # 文档端点不在 /api/ 下, 必须在早退之前单独拦(否则移除白名单条目毫无作用)
+    if path in _DOCS_PATHS:
+        _account_id, role = _resolve_identity(request)
+        if role == "guest":
+            return JSONResponse(status_code=401, content={"detail": "未登录或会话已过期"})
+        return await call_next(request)
+
     # 仅 /api/ 走认证; 静态资源(前端页面/assets)放行, 由前端处理跳转
     if not path.startswith("/api/"):
         return await call_next(request)
-    # 白名单放行(设密码/登录/探活本身不拦)
-    if path.startswith(_AUTH_WHITELIST_PREFIX) or path in _AUTH_WHITELIST_EXACT:
+
+    account_id, role = _resolve_identity(request)
+    request.state.account_id = account_id
+    request.state.role = role
+
+    # 白名单放行(登录/注册/探活本身不拦)
+    if path in _AUTH_WHITELIST_EXACT:
         return await call_next(request)
 
-    from app.services import auth as auth_service
-    # 情况 1+2: 未设密码
-    if not auth_service.is_configured():
-        # 本机/内网 → 放行(服务器主人可访问, 并去 /login 设密码)
+    if role != "guest":
+        return await call_next(request)
+
+    # 未登录: 公开只读子集放行, 但必须限量
+    if _is_public_read(request.method, path):
+        ip = auth_api._client_ip(request)
+        if _guest_rate_limited(ip, path):
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "访问过于频繁, 请稍后重试", "code": "GUEST_RATE_LIMITED"},
+            )
+        return await call_next(request)
+
+    from app.services import accounts, auth as auth_service
+    # 未**认领**的面板 = 既没有账号、也没有设过密码。此时保留既有「仅本机/内网」
+    # 语义, 防公网陌生人抢先设密码。
+    # 一旦注册出第一个账号, 面板即视为已认领 —— 之后未登录一律 401, 前端据此
+    # 跳登录/注册页。否则已认领的面板会给未登录用户回「请通过 SSH 设置密码」的
+    # 403, 前端会显示完全错误的引导。
+    if not auth_service.is_configured() and not accounts.has_accounts():
         if auth_api._is_local_network(auth_api._client_ip(request)):
             return await call_next(request)
-        # 公网 → 拒绝。不裸奔, 也不给公网设密码的机会(防抢占)
         return JSONResponse(
             status_code=403,
             content={
@@ -459,10 +588,6 @@ async def auth_middleware(request: Request, call_next):
             },
         )
 
-    # 情况 3: 已设密码, 检查会话
-    token = request.cookies.get(auth_api.COOKIE_NAME)
-    if token and auth_service.is_valid_session(token):
-        return await call_next(request)
     # 未登录: 401(前端跳登录页)
     return JSONResponse(status_code=401, content={"detail": "未登录或会话已过期"})
 
@@ -470,6 +595,7 @@ async def auth_middleware(request: Request, call_next):
 # 路由
 app.include_router(core_router)
 app.include_router(auth_api.router)
+app.include_router(account.router)
 app.include_router(kline.router)
 app.include_router(watchlist.router)
 app.include_router(screener.router)
