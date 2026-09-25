@@ -86,6 +86,12 @@ def _verify_password(password: str, salt_hex: str, hash_hex: str) -> bool:
     return _secrets.compare_digest(actual, expected)
 
 
+# 公开别名: 多用户账号体系 (app.services.accounts) 复用同一套 PBKDF2 参数与恒定时间
+# 比较, 避免密码学参数在两处各写一份后漂移。内部实现与语义完全不变。
+hash_password = _hash_password
+verify_password = _verify_password
+
+
 # ================================================================
 # 密码管理
 # ================================================================
