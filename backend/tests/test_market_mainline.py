@@ -141,7 +141,8 @@ class TestComputeMainline:
 class TestMainlineFilterPreferences:
     def test_blacklist_string_parsing_and_clamp(self, tmp_path, monkeypatch):
         path = tmp_path / "preferences.json"
-        monkeypatch.setattr(preferences, "_path", lambda: path)
+        # mainline_* / sentiment_exclude_st 是全局键, 落在全局文件。
+        monkeypatch.setattr(preferences, "_global_path", lambda: path)
         got = preferences.set_mainline_filter_config({
             "max_members": 99999,          # 超上限被夹到 5000
             "min_members": 0,              # 低于下限被夹到 1
@@ -157,13 +158,15 @@ class TestMainlineFilterPreferences:
 
     def test_defaults(self, tmp_path, monkeypatch):
         path = tmp_path / "preferences.json"
-        monkeypatch.setattr(preferences, "_path", lambda: path)
+        # mainline_* / sentiment_exclude_st 是全局键, 落在全局文件。
+        monkeypatch.setattr(preferences, "_global_path", lambda: path)
         cfg = preferences.get_mainline_filter_config()
         assert cfg == {"min_members": 4, "max_members": 600, "blacklist": [], "exclude_st": True}
 
     def test_sentiment_exclude_st_roundtrip(self, tmp_path, monkeypatch):
         path = tmp_path / "preferences.json"
-        monkeypatch.setattr(preferences, "_path", lambda: path)
+        # mainline_* / sentiment_exclude_st 是全局键, 落在全局文件。
+        monkeypatch.setattr(preferences, "_global_path", lambda: path)
         assert preferences.get_sentiment_exclude_st() is True  # 默认剔除
         assert preferences.set_sentiment_exclude_st(False) is False
         assert preferences.get_sentiment_exclude_st() is False

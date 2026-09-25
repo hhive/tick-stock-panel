@@ -15,7 +15,8 @@ from app.services import preferences
 @pytest.fixture(autouse=True)
 def _isolated(tmp_path, monkeypatch):
     path = tmp_path / "preferences.json"
-    monkeypatch.setattr(preferences, "_path", lambda: path)
+    # pipeline_pull_* 是全局键, 落在全局文件。
+    monkeypatch.setattr(preferences, "_global_path", lambda: path)
     preferences._invalidate_cache()
     yield path
     preferences._invalidate_cache()

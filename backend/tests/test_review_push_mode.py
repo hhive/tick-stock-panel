@@ -11,10 +11,29 @@ from app.services import preferences
 @pytest.fixture(autouse=True)
 def _isolated(tmp_path, monkeypatch):
     path = tmp_path / "preferences.json"
-    monkeypatch.setattr(preferences, "_path", lambda: path)
+    monkeypatch.setattr(preferences, "_global_path", lambda: path)
+    # review_push_mode / review_push_channels 是**每用户键**: save() 按归属分派到
+    # <user_root>/user_data/preferences.json, 且无账户上下文时会 fail-closed 抛
+    # RuntimeError。
+    #
+    # 这里建立上下文, 是为了**测 getter 本身的逻辑**(默认值/白名单/旧格式兼容),
+    # 不是在声明生产侧的复盘推送能用。
+    #
+    # 生产实况: jobs/daily_pipeline.py 的 _run_scheduled_review 跑在 APScheduler 的
+    # 线程里, 而 contextvar 只由认证中间件在**请求路径**上设置 —— 后台线程运行时
+    # 拿不到账户上下文, 于是 get_review_push_mode() 拿到默认值 "manual",
+    # get_review_push_channels() 拿到空列表 ⇒ **定时复盘推送实际不会发生**。
+    # 该调用点目前会打出 "without account context" 警告(fail-loud), 但功能是坏的。
+    # 修复属 S3(后台逐用户扇出): 那时该调用点会遍历账户并显式传 user_root。
+    # 本测试通过 ≠ 该功能可用。
+    user_root = tmp_path / "user"
+    token = preferences.set_current_user_root(user_root)
     preferences._invalidate_cache()
-    yield path
-    preferences._invalidate_cache()
+    try:
+        yield path
+    finally:
+        preferences.reset_current_user_root(token)
+        preferences._invalidate_cache()
 
 
 def test_review_push_mode_defaults_to_manual():

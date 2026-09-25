@@ -12,10 +12,27 @@ from app.services import preferences
 @pytest.fixture(autouse=True)
 def _isolated(tmp_path, monkeypatch):
     path = tmp_path / "preferences.json"
-    monkeypatch.setattr(preferences, "_path", lambda: path)
+    monkeypatch.setattr(preferences, "_global_path", lambda: path)
     preferences._invalidate_cache()
     yield path
     preferences._invalidate_cache()
+
+
+@pytest.fixture
+def user_context(tmp_path):
+    """每用户键的账户上下文。
+
+    本文件多数键是全局键, 但 ``webhook_default_channels`` / ``review_push_channels``
+    / ``email_smtp_config`` 是每用户键: ``save()`` 按归属分派, 无上下文时
+    fail-closed 抛 RuntimeError。账户根建在 tmp_path 下, 并在 teardown 复位,
+    避免 contextvar 泄漏到其它测试。
+    """
+    root = tmp_path / "user"
+    token = preferences.set_current_user_root(root)
+    try:
+        yield root
+    finally:
+        preferences.reset_current_user_root(token)
 
 
 def _patched_loads(monkeypatch, counter: dict):
@@ -123,7 +140,7 @@ def test_mining_schedule_setter_rejects_invalid_profile():
         preferences.set_mining_schedule(True, 4, "exploratory")
 
 
-def test_external_push_channel_whitelists_include_custom_and_email(_isolated):
+def test_external_push_channel_whitelists_include_custom_and_email(_isolated, user_context):
     assert preferences.set_webhook_default_channels([
         "custom", "email", "custom", "unsupported",
     ]) == ["custom", "email"]
@@ -132,7 +149,7 @@ def test_external_push_channel_whitelists_include_custom_and_email(_isolated):
     ]) == ["email", "wecom"]
 
 
-def test_email_smtp_config_falls_back_from_malformed_stored_values(_isolated):
+def test_email_smtp_config_falls_back_from_malformed_stored_values(_isolated, user_context):
     preferences.save({
         "email_smtp_config": {
             "host": " smtp.example.com ",

@@ -1,7 +1,25 @@
 """用户偏好设置持久化。
 
-存储位置: data/user_data/preferences.json
+存储位置(多租户拆分后为**两个文件**):
+  - 全局/部署级 → ``data/user_data/preferences.json``
+  - 每账户     → ``data/users/<account_id>/user_data/preferences.json``
+
 沿用 secrets_store 的 merge-write 模式,但不做 chmod 0600 (非敏感数据)。
+
+拆分原则(见 ``docs/superpowers/plans/2026-09-25-tick-stock-panel-multiuser.md`` S2):
+  - 归属表是**硬编码**的 ``PER_USER_KEYS``: 文件里没有 owner 元数据, 只能显式登记。
+  - **未知键一律 GLOBAL**。不对称风险: 漏在全局文件最坏是"没人读它"; 漏进某个
+    每用户目录会让该设置对其它账户静默消失, 且排查成本高得多。
+  - **分派做在 save() 这一层, 不做在 set_* 里**。有 14 个键没有 setter、只经
+    save({...}) 直写, 另有 3 处动态键名的直写(api/settings.py 的循环变量与
+    model_dump); 只改 setter 必漏, 那些键会全部落进默认文件。
+  - 认为控制**进程级单例线程**的键(实时行情轮询/深度轮询/分钟增量常驻服务)一律
+    GLOBAL —— 单例线程注定只能有一份, 每账户能控制的只是"我看到什么"。
+
+上下文: 每用户键需要一个"当前账户根目录"。
+  - 请求路径: 由认证中间件用 ``set_current_user_root()`` 设置(contextvar)。
+  - **后台线程/调度器必须显式传 user_root**, 不得依赖 contextvar —— 后台是
+    threading 与 asyncio 混用, contextvar 跨线程不可靠。
 """
 from __future__ import annotations
 
@@ -10,70 +28,254 @@ import json
 import logging
 import re
 import threading
+from contextvars import ContextVar
 from pathlib import Path
 
 from app.services.fs_utils import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
-# 进程内缓存: 行情轮询线程一轮会调用 8~12 次 getter, 每次读盘+parse 是纯重复;
-# 文件仅在用户改设置时变化, 以 (mtime_ns, size) 签名判断是否重读。
-_cache: dict | None = None
-_cache_sig: tuple[int, int] | None = None
+# 每用户键(25 个)。其余键一律 GLOBAL。改动此集合等于改变数据归属, 需同步更新
+# 计划文档的归属表与 tests/test_preferences_split.py 的冻结断言。
+PER_USER_KEYS: frozenset[str] = frozenset({
+    # 分时图(纯前端刷新提示, 唯一读者 api/settings.py)
+    "minute_intraday_refresh",
+    "minute_intraday_refresh_interval",
+    # 复盘推送(调度器逐用户扇出)
+    "review_push_channels",
+    "review_push_mode",
+    "review_push_channel",     # legacy 只读键
+    "review_push_enabled",     # legacy 只读键
+    # 推送渠道: 无状态 webhook / 邮件(有状态的企业微信长连接不在此列, 见下)
+    "feishu_webhook_url",
+    "feishu_webhook_secret",
+    "wecom_webhook_url",
+    "custom_webhook_url",
+    "email_smtp_config",
+    "system_notify_enabled",
+    "webhook_default_channels",
+    "webhook_enabled_default",
+    # 实时监控 / SSE / 选股交互(纯展示, 无后台读者)
+    "sse_refresh_pages",
+    "strategy_monitor_enabled",
+    "strategy_monitor_ids",
+    "screener_auto_run",
+    "monitor_ext_fields",
+    # 导航 / 列配置(纯 UI)
+    "nav_order",
+    "nav_hidden",
+    "watchlist_columns",
+    "screener_result_columns",
+    "watchlist_groups_in_nav",
+    # 首次引导: 必须每账户独立为 False, 否则新用户看不到引导
+    "onboarding_completed",
+})
+
+# 归属明确但**刻意留全局**、容易被误判为每用户的键。登记在这里是为了留下否证依据,
+# 避免后来者"顺手"把它们搬进每用户文件:
+#   - wecom_bot_*: 企微智能机器人是**有状态长连接**(单线程), 每账户一条会撞企微侧的
+#     BotID 唯一性与连接数上限, 最坏是所有账户都建不起连接。其凭据也是企业级而非个人级。
+#   - realtime_* / depth_polling_interval / limit_ladder_monitor_enabled / minute_refresh_*:
+#     控制进程级单例线程的启停与频率, 注定只能一份。
+GLOBAL_BY_DESIGN: frozenset[str] = frozenset({
+    "wecom_bot_id", "wecom_bot_secret", "wecom_bot_enabled",
+    "realtime_quotes_enabled", "realtime_quote_interval",
+    "realtime_pull_stock", "realtime_pull_etf",
+    "limit_ladder_monitor_enabled", "depth_polling_interval",
+    "minute_refresh_enabled", "minute_refresh_interval",
+    "last_fetch_ms",
+})
 
 
-def _path() -> Path:
+def _owner_of(key: str) -> str:
+    """键 → 归属。未知键一律 GLOBAL(见模块 docstring 的不对称风险论证)。"""
+    return "per_user" if key in PER_USER_KEYS else "global"
+
+
+# ================================================================
+# 当前账户上下文
+# ================================================================
+
+_current_user_root: ContextVar[Path | None] = ContextVar(
+    "_current_user_root", default=None,
+)
+
+
+def set_current_user_root(root: Path | None):
+    """设置当前请求的账户根目录, 返回可用于 reset 的 token。仅应由认证中间件调用。"""
+    return _current_user_root.set(root)
+
+
+def reset_current_user_root(token) -> None:
+    _current_user_root.reset(token)
+
+
+def current_user_root() -> Path | None:
+    """当前账户根目录; 无账户上下文(未登录/后台线程)返回 None。"""
+    return _current_user_root.get()
+
+
+def _resolve_root(explicit: Path | None) -> Path | None:
+    """显式参数优先, 否则取 contextvar。后台线程**必须**用显式参数。"""
+    return explicit if explicit is not None else _current_user_root.get()
+
+
+# ================================================================
+# 路径与文件级缓存
+# ================================================================
+
+def _global_path() -> Path:
     from app.config import settings
     p = settings.data_dir / "user_data" / "preferences.json"
     p.parent.mkdir(parents=True, exist_ok=True)
     return p
 
 
+def _user_path(user_root: Path) -> Path:
+    p = Path(user_root) / "user_data" / "preferences.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+# 进程内缓存: 行情轮询线程一轮会调用 8~12 次 getter, 每次读盘+parse 是纯重复;
+# 文件仅在用户改设置时变化, 以 (mtime_ns, size) 签名判断是否重读。
+# 拆成两个文件后按路径分别缓存, 故是 dict 而非单变量。
+_file_cache: dict[str, tuple[tuple[int, int], dict]] = {}
+
+
 def _invalidate_cache() -> None:
-    global _cache, _cache_sig
-    _cache = None
-    _cache_sig = None
+    _file_cache.clear()
 
 
-def load() -> dict:
-    """读取 preferences.json (带 mtime 签名缓存)。返回深拷贝, 调用方可自由修改。"""
-    global _cache, _cache_sig
-    p = _path()
+def _load_file(p: Path) -> dict:
+    """读单个偏好文件(带 mtime 签名缓存)。返回深拷贝, 调用方可自由修改。"""
     try:
-        sig = (p.stat().st_mtime_ns, p.stat().st_size)
+        st = p.stat()
+        sig = (st.st_mtime_ns, st.st_size)
     except OSError:
         return {}
-    if _cache is not None and sig == _cache_sig:
-        return copy.deepcopy(_cache)
+    cached = _file_cache.get(str(p))
+    if cached is not None and cached[0] == sig:
+        return copy.deepcopy(cached[1])
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return {}
-    except Exception as e:
-        logger.warning("preferences.json malformed: %s", e)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("%s malformed: %s", p.name, e)
         return {}
-    _cache = data
-    _cache_sig = sig
-    return copy.deepcopy(_cache)
+    if not isinstance(data, dict):
+        logger.warning("%s is not an object, ignored", p.name)
+        return {}
+    _file_cache[str(p)] = (sig, data)
+    return copy.deepcopy(data)
+
+
+def _write_file(p: Path, data: dict) -> None:
+    atomic_write_text(p, json.dumps(data, indent=2, ensure_ascii=False))
+
+
+# ================================================================
+# 读写
+# ================================================================
+
+def load(user_root: Path | None = None) -> dict:
+    """读取偏好: 全局文件 + (有账户上下文时)该账户文件, 后者覆盖同名键。
+
+    无账户上下文时只返回全局部分 —— 未登录的游客与后台共享路径拿到的是部署级
+    配置, 不会误读某个账户的私有偏好。
+    """
+    data = _load_file(_global_path())
+    root = _resolve_root(user_root)
+    if root is not None:
+        data.update(_load_file(_user_path(root)))
+    return data
 
 
 _SAVE_LOCK = threading.Lock()
 
+# 已在无账户上下文时告警过的键, 避免后台高频路径刷屏(告警本身不该成为噪声源)
+_warned_missing_context: set[str] = set()
 
-def save(updates: dict) -> dict:
-    """合并写入。返回新内容。
+
+def _warn_missing_context(key: str, default=None) -> None:
+    """键在**无账户上下文**时被读取 → 大声记录一次(同键不重复刷屏)。见 per_user_get。"""
+    if current_user_root() is None and key not in _warned_missing_context:
+        _warned_missing_context.add(key)
+        logger.warning(
+            "per-user preference %r read without account context; returning default "
+            "(%r). Background callers need the per-user fan-out (S3) to pass user_root.",
+            key, default,
+        )
+
+
+def per_user_get(key: str, default):
+    """读取**每用户**键的单键入口。
+
+    与 ``load().get(key, default)`` 的区别只有一处, 但很关键: 当调用方**没有账户
+    上下文**时大声记录。
+
+    背景: 全局单例(行情轮询/告警推送、日线调度器)在进程里只有一份, 没有 Request,
+    也就没有账户上下文。它们直接读每用户键时会**静默拿到默认值** —— 推送地址是空串
+    ⇒ 告警与复盘推送悄悄停止工作, 不报错、不记日志, 是本项目最危险的一类失效。
+
+    在后台扇出(S3)落地前, 这些调用点无法拿到正确值; 本函数保证「拿不到」这件事
+    **至少是可见的**。S3 完成后, 这些调用方会显式传 user_root, 告警随之消失 ——
+    所以这里同时也是扇出的接缝。
+    """
+    _warn_missing_context(key, default)
+    return load().get(key, default)
+
+
+def save(updates: dict, user_root: Path | None = None) -> dict:
+    """合并写入, **按归属分派**到全局/每用户两个文件。返回合并后的新内容。
 
     锁内 read-modify-write: FastAPI 同步端点跑线程池, 并行 PUT 各自基于旧快照
     写盘会互相覆盖 (实测: 压缩总开关并行写分时/日K两键, 后写者把先写者覆盖)。
+    锁是**一把全局锁覆盖两个文件** —— 否则两个文件的写者各锁自己, 虽各自文件内
+    仍原子, 却会破坏"一次调用两个文件都一致"的意图。
+
+    跨文件原子性: 若一次调用同时命中两个文件, 会产生两次独立的 os.replace。
+    已知只有 PUT /preferences/realtime-monitor 会这样(set_realtime_monitor_config
+    混写 7 每用户 + 2 全局); 此处按分区正确写入并**打警告**, 不为此写补偿逻辑。
+    真要根治应先把 minute_refresh_* 拆成独立端点, 使每次 save 只落一个文件。
     """
-    with _SAVE_LOCK:
-        current = load()
-        current.update(updates)
-        atomic_write_text(
-            _path(), json.dumps(current, indent=2, ensure_ascii=False),
+    root = _resolve_root(user_root)
+    global_updates: dict = {}
+    user_updates: dict = {}
+    for key, value in updates.items():
+        if _owner_of(key) == "per_user":
+            user_updates[key] = value
+        else:
+            global_updates[key] = value
+
+    if user_updates and root is None:
+        # 有每用户键却没有账户上下文 = 调用方 bug。静默写进全局文件会让这个设置
+        # 对所有账户共享(且该键本该是私有的), 属于必须炸出来的错误。
+        raise RuntimeError(
+            f"写入每用户偏好键但缺少账户上下文: {sorted(user_updates)}; "
+            "后台线程请显式传 user_root=",
         )
+
+    with _SAVE_LOCK:
+        if global_updates:
+            current = _load_file(_global_path())
+            current.update(global_updates)
+            _write_file(_global_path(), current)
+        if user_updates:
+            cur_root = root
+            assert cur_root is not None  # 上面的检查已保证
+            current = _load_file(_user_path(cur_root))
+            current.update(user_updates)
+            _write_file(_user_path(cur_root), current)
         _invalidate_cache()
-    return current
+
+    if global_updates and user_updates:
+        logger.warning(
+            "preferences save spans both files (cross-file atomicity lost): %s",
+            sorted(updates),
+        )
+    return load(user_root)
 
 
 def get_realtime_quotes_enabled() -> bool:
@@ -169,6 +371,7 @@ def get_monitor_ext_fields() -> dict:
     后端只需读 .field 构建 ext_columns; maxTags/hiddenIndices 供前端渲染裁剪。
     兼容旧字符串格式 ("id.field") 自动升级。
     """
+    _warn_missing_context("monitor_ext_fields")
     data = load()
     raw = data.get("monitor_ext_fields")
     if raw is None:
@@ -668,6 +871,7 @@ def get_review_push_channels() -> list[str]:
       - 老多版本单选 review_push_channel=='feishu' → ['feishu']
       - 更老布尔 review_push_enabled==True → ['feishu']
     """
+    _warn_missing_context("review_push_channels")
     d = load()
     raw = d.get("review_push_channels")
     if isinstance(raw, list):
@@ -702,7 +906,7 @@ def get_review_push_mode() -> str:
     定时复盘与手动保存复盘共用此开关。manual 时定时路径只归档不推送,
     手动路径需 save_report 显式传 push=True 才推。
     """
-    mode = load().get("review_push_mode", "manual")
+    mode = per_user_get("review_push_mode", "manual")
     return mode if mode in REVIEW_PUSH_MODES else "manual"
 
 
@@ -776,7 +980,7 @@ def get_strategy_monitor_enabled() -> bool:
 
 def get_system_notify_enabled() -> bool:
     """系统通知开关 — 开启后监控告警同时推送到操作系统通知中心。"""
-    return load().get("system_notify_enabled", False)
+    return per_user_get("system_notify_enabled", False)
 
 
 def set_system_notify_enabled(enabled: bool) -> bool:
@@ -787,12 +991,12 @@ def set_system_notify_enabled(enabled: bool) -> bool:
 
 def get_feishu_webhook_url() -> str:
     """飞书自定义机器人 Webhook 地址 — 全局共用一处, 所有启用推送的规则都推到这一个群。"""
-    return load().get("feishu_webhook_url", "")
+    return per_user_get("feishu_webhook_url", "")
 
 
 def get_feishu_webhook_secret() -> str:
     """飞书自定义机器人签名密钥 — 机器人启用「签名校验」时必填, 留空表示不验签。"""
-    return load().get("feishu_webhook_secret", "")
+    return per_user_get("feishu_webhook_secret", "")
 
 
 def set_feishu_webhook_url(url: str) -> str:
@@ -813,7 +1017,7 @@ def get_wecom_webhook_url() -> str:
     存储完整 URL (https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx);
     用户也可只填 key, 由 webhook_adapter.normalize_wecom_url 自动补全。
     """
-    return load().get("wecom_webhook_url", "")
+    return per_user_get("wecom_webhook_url", "")
 
 
 def set_wecom_webhook_url(url: str) -> str:
@@ -828,7 +1032,7 @@ def set_wecom_webhook_url(url: str) -> str:
 
 def get_custom_webhook_url() -> str:
     """Generic third-party JSON Webhook URL shared by enabled rules and reviews."""
-    return str(load().get("custom_webhook_url") or "")
+    return str(per_user_get("custom_webhook_url", None) or "")
 
 
 def set_custom_webhook_url(url: str) -> str:
@@ -850,6 +1054,7 @@ _EMAIL_SMTP_DEFAULTS = {
 
 def get_email_smtp_config() -> dict:
     """Return non-secret SMTP settings for the email notification channel."""
+    _warn_missing_context("email_smtp_config")
     raw = load().get("email_smtp_config")
     if not isinstance(raw, dict):
         raw = {}

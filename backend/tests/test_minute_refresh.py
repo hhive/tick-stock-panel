@@ -24,7 +24,8 @@ from app.services.minute_refresh import MinuteRefreshService, _in_continuous_ses
 
 def _isolated_prefs(tmp_path, monkeypatch):
     path = tmp_path / "preferences.json"
-    monkeypatch.setattr(preferences, "_path", lambda: path)
+    # 本文件用到的 minute_refresh_* 是全局键, 落在全局文件。
+    monkeypatch.setattr(preferences, "_global_path", lambda: path)
     preferences._invalidate_cache()
     return path
 
