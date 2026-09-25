@@ -256,6 +256,31 @@ def test_settle_next_open_close_and_postpone_expire(tmp_path):
     assert s["expired"] >= 1
 
 
+def test_settle_fill_is_recorded_in_own_account_alert_log(tmp_path, user_root):
+    """成交留痕必须真的落到**本账户**的 alerts.jsonl。
+
+    回归: 旧调用把 ``alert_store.append_many(events, user_root=...)`` 的两个位置参数
+    传反了 (data_dir 当 events、events 当 user_root), 每次都在 ``Path(<list>)`` 上抛
+    异常并被 except 吞成一条 WARNING —— 成交记录从来没进过监控中心触发历史, 而且
+    落盘位置本身就是账户边界, 猜不得。
+    """
+    from app.services import alert_store
+
+    day = date(2026, 9, 24)
+    _cap_account(tmp_path)
+    _write_daily(tmp_path, [(day - timedelta(days=1), 10.0, 10.0), (day, 10.2, 10.8)])
+    paper.create_order(SYM, "buy", qty=100, order_type="close", ref_price=10.0)
+    summary = paper.settle_day(tmp_path, day.isoformat(), user_root=user_root)
+    assert summary["filled"] == 1
+
+    fills = [r for r in alert_store.list_recent(user_root=user_root) if r.get("type") == "paper_fill"]
+    assert len(fills) == 1
+    assert fills[0]["symbol"] == SYM
+    # 落在本账户目录里; 共享目录 (data_dir/user_data) 下不得出现
+    assert (user_root / "user_data" / "alerts.jsonl").exists()
+    assert not (tmp_path / "user_data" / "alerts.jsonl").exists()
+
+
 def test_pending_sell_occupies_available_quota(tmp_path, monkeypatch, user_root):
     """超卖防护: pending 卖出单占用可卖额度, 第二张超额卖出单在下单时被拒。"""
     day = date(2026, 9, 24)

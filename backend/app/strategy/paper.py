@@ -705,7 +705,11 @@ def _fill_order(
     try:
         label = "模拟盘" if account_id == DEFAULT_ACCOUNT_ID else f"模拟盘[{acc.get('name') or account_id}]"
         from app.services import alert_store
-        alert_store.append_many(data_dir, [{
+        # 注意签名: append_many(events, user_root=None)。此处必须显式传 root ——
+        # 本函数在后台线程/管道里跑, 没有请求上下文; 旧写法把 (data_dir, events)
+        # 按位置传反了, 于是 _path() 拿到 list 直接抛, 被下面的 except 吞成一条
+        # WARNING ⇒ 成交记录从来没进过监控中心触发历史。
+        alert_store.append_many([{
             "ts": int(datetime.now().timestamp() * 1000),
             "source": "paper",
             "type": "paper_fill",
@@ -721,7 +725,7 @@ def _fill_order(
             "severity": "info",
             "conditions": [],
             "logic": "and",
-        }])
+        }], user_root=root)
     except Exception as e:
         logger.warning("paper 成交告警落盘失败 (不影响账务): %s", e)
 

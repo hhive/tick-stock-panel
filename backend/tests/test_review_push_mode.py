@@ -16,17 +16,15 @@ def _isolated(tmp_path, monkeypatch):
     # <user_root>/user_data/preferences.json, 且无账户上下文时会 fail-closed 抛
     # RuntimeError。
     #
-    # 这里建立上下文, 是为了**测 getter 本身的逻辑**(默认值/白名单/旧格式兼容),
-    # 不是在声明生产侧的复盘推送能用。
+    # 这里建立上下文, 是为了**测 getter 本身的逻辑**(默认值/白名单/旧格式兼容)。
     #
-    # 生产实况: jobs/daily_pipeline.py 的 _run_scheduled_review 跑在 APScheduler 的
-    # 线程里, 而 contextvar 只由认证中间件在**请求路径**上设置 —— 后台线程运行时
-    # 拿不到账户上下文, 于是 get_review_push_mode() 拿到默认值 "manual",
-    # get_review_push_channels() 拿到空列表 ⇒ **定时复盘推送实际不会发生**。
-    # 该调用点目前会打出 "without account context" 警告(fail-loud), 但功能是坏的。
-    # 修复属 S3(后台逐用户扇出): 那时该调用点会遍历账户并显式传 user_root。
-    # 本测试通过 ≠ 该功能可用。
-    user_root = tmp_path / "user"
+    # 生产侧的定时复盘已经**逐账户扇出**(见下方 _patch_scheduled_review 的说明):
+    # jobs/daily_pipeline.py 的 _run_scheduled_review 遍历账户并显式把 user_root
+    # 传下去, 因此后台线程不需要 contextvar 也能读到该账户的推送配置。
+    # 账户根 = <data_dir>/users/1 (与生产布局一致): 后台扇出按 account_id 解析出
+    # 同一个根, 只有测试的 contextvar 指向它, "请求侧写入的偏好"与"后台扇出读到的
+    # 偏好"才是同一份 —— 否则测的就成了另一条路径。
+    user_root = tmp_path / "users" / "1"
     token = preferences.set_current_user_root(user_root)
     preferences._invalidate_cache()
     try:
@@ -104,8 +102,13 @@ def test_save_report_auto_pushes_without_flag(monkeypatch):
     assert pushed == [{"as_of": "2026-07-18", "emotion_label": ""}]
 
 
-def _patch_scheduled_review(monkeypatch, pushed: list, archived: list):
-    """装配定时复盘的依赖: 有 AI key、流式产出固定内容、捕获归档与推送调用。"""
+def _patch_scheduled_review(monkeypatch, pushed: list, archived: list, account_root):
+    """装配定时复盘的依赖: 有 AI key、流式产出固定内容、捕获归档与推送调用。
+
+    归档/推送都是**每账户**动作 (报告存在 <user_root>/user_data 下, 推送渠道也是每账户
+    偏好), 所以后台 job 必须逐账户扇出 —— 这里把账户列表钉成"一个账户", 并断言
+    扇出时把该账户的根显式传了下去 (不传会退回部署级默认值 ⇒ 推送静默失效)。
+    """
     from app.jobs import daily_pipeline
 
     async def _fake_stream(*a, **k):
@@ -114,41 +117,47 @@ def _patch_scheduled_review(monkeypatch, pushed: list, archived: list):
     monkeypatch.setattr("app.secrets_store.get_ai_key", lambda: "sk-test")
     monkeypatch.setattr(daily_pipeline, "_stream_review_with_retry", _fake_stream)
     monkeypatch.setattr(
+        "app.jobs.daily_pipeline.user_paths.iter_user_roots",
+        lambda: [(1, account_root)],
+    )
+    monkeypatch.setattr(
         "app.services.market_recap_reports.save_report",
-        lambda d: archived.append(d) or {"id": "r1"},
+        lambda d, user_root=None: archived.append((d, user_root)) or {"id": "r1"},
     )
     monkeypatch.setattr(
         daily_pipeline,
         "_maybe_push_review",
-        lambda content, meta: pushed.append(meta),
+        lambda content, meta, user_root=None: pushed.append((meta, user_root)),
     )
 
 
-def test_scheduled_review_manual_archives_without_push(monkeypatch):
+def test_scheduled_review_manual_archives_without_push(monkeypatch, tmp_path):
     from app.jobs import daily_pipeline
 
     pushed: list = []
     archived: list = []
-    _patch_scheduled_review(monkeypatch, pushed, archived)
+    account_root = tmp_path / "users" / "1"
+    _patch_scheduled_review(monkeypatch, pushed, archived, account_root)
     preferences.set_review_push_mode("manual")
 
     asyncio.run(daily_pipeline._run_scheduled_review(None))
 
-    # manual 模式: 归档发生, 但不外发
-    assert len(archived) == 1
+    # manual 模式: 归档发生 (且落进该账户的根), 但不外发
+    assert [root for _, root in archived] == [account_root]
     assert pushed == []
 
 
-def test_scheduled_review_auto_pushes(monkeypatch):
+def test_scheduled_review_auto_pushes(monkeypatch, tmp_path):
     from app.jobs import daily_pipeline
 
     pushed: list = []
     archived: list = []
-    _patch_scheduled_review(monkeypatch, pushed, archived)
+    account_root = tmp_path / "users" / "1"
+    _patch_scheduled_review(monkeypatch, pushed, archived, account_root)
     preferences.set_review_push_mode("auto")
 
     asyncio.run(daily_pipeline._run_scheduled_review(None))
 
-    # auto 模式: 归档并外发
-    assert len(archived) == 1
-    assert pushed == [{"as_of": "2026-07-18", "emotion_label": "中性"}]
+    # auto 模式: 归档并外发 (推送同样显式带该账户的根, 否则读不到该账户的渠道配置)
+    assert [root for _, root in archived] == [account_root]
+    assert pushed == [({"as_of": "2026-07-18", "emotion_label": "中性"}, account_root)]

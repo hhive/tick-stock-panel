@@ -427,7 +427,7 @@ def test_abnormal_rule_validation_and_defaults() -> None:
 
 def test_engine_abnormal_edge_trigger_and_cooldown() -> None:
     engine = MonitorRuleEngine()
-    engine.set_rules([_ab_rule()])
+    engine.set_rules_for(1, [_ab_rule()])
     assert engine.min_abnormal_closeness() == pytest.approx(0.7)
 
     # 首轮观测不触发 (防新建规则刷屏); 0.10/0.2 = 50% 接近度, 低于阈值
@@ -450,7 +450,7 @@ def test_engine_abnormal_edge_trigger_and_cooldown() -> None:
 
     # cooldown 内的上穿被抑制
     engine_cd = MonitorRuleEngine()
-    engine_cd.set_rules([_ab_rule(cooldown_seconds=3600)])
+    engine_cd.set_rules_for(1, [_ab_rule(cooldown_seconds=3600)])
     engine_cd.evaluate_abnormal([_row("600000.SH", ("3d", 0.10))], now=1000.0)
     engine_cd.evaluate_abnormal([_row("600000.SH", ("3d", 0.16))], now=1006.0)
     engine_cd.evaluate_abnormal([_row("600000.SH", ("3d", 0.10))], now=1012.0)
@@ -460,7 +460,7 @@ def test_engine_abnormal_edge_trigger_and_cooldown() -> None:
 def test_engine_abnormal_stale_symbol_state_cleared() -> None:
     """标的跌出快照后状态应清回 False, 回升穿过阈值时可再次触发。"""
     engine = MonitorRuleEngine()
-    engine.set_rules([_ab_rule()])
+    engine.set_rules_for(1, [_ab_rule()])
     engine.evaluate_abnormal([_row("600000.SH", ("3d", 0.10))], now=1000.0)  # 首轮 False
     assert len(engine.evaluate_abnormal([_row("600000.SH", ("3d", 0.18))], now=1006.0)) == 1
     # 跌出预过滤区间 (快照中消失)
@@ -472,19 +472,19 @@ def test_engine_abnormal_stale_symbol_state_cleared() -> None:
 def test_engine_abnormal_direction_window_scope_filters() -> None:
     # 方向: 只报上涨偏离
     engine = MonitorRuleEngine()
-    engine.set_rules([_ab_rule(direction="up")])
+    engine.set_rules_for(1, [_ab_rule(direction="up")])
     engine.evaluate_abnormal([_row("600000.SH", ("3d", -0.16))], now=1000.0)
     assert engine.evaluate_abnormal([_row("600000.SH", ("3d", -0.19))], now=1006.0) == []
 
     # 窗口: 只看 3d (10d/30d 的偏离不参与)
     engine = MonitorRuleEngine()
-    engine.set_rules([_ab_rule(abnormal_window="3d")])
+    engine.set_rules_for(1, [_ab_rule(abnormal_window="3d")])
     engine.evaluate_abnormal([_row("600000.SH", ("10d", 0.98))], now=1000.0)
     assert engine.evaluate_abnormal([_row("600000.SH", ("10d", 0.99))], now=1006.0) == []
 
     # 作用域: 只监控指定标的
     engine = MonitorRuleEngine()
-    engine.set_rules([_ab_rule(scope="symbols", symbols=["600000.SH"])])
+    engine.set_rules_for(1, [_ab_rule(scope="symbols", symbols=["600000.SH"])])
     engine.evaluate_abnormal(
         [_row("600000.SH", ("3d", 0.10)), _row("000001.SZ", ("3d", 0.10))], now=1000.0,
     )
@@ -496,7 +496,7 @@ def test_engine_abnormal_direction_window_scope_filters() -> None:
 
 def test_engine_abnormal_down_direction_event_type() -> None:
     engine = MonitorRuleEngine()
-    engine.set_rules([_ab_rule(direction="down")])
+    engine.set_rules_for(1, [_ab_rule(direction="down")])
     engine.evaluate_abnormal([_row("600000.SH", ("3d", -0.10))], now=1000.0)
     events = engine.evaluate_abnormal([_row("600000.SH", ("3d", -0.16))], now=1006.0)
     assert len(events) == 1

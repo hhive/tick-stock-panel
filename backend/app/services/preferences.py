@@ -198,9 +198,16 @@ _SAVE_LOCK = threading.Lock()
 _warned_missing_context: set[str] = set()
 
 
-def _warn_missing_context(key: str, default=None) -> None:
-    """键在**无账户上下文**时被读取 → 大声记录一次(同键不重复刷屏)。见 per_user_get。"""
-    if current_user_root() is None and key not in _warned_missing_context:
+def _warn_missing_context(key: str, default=None, root: Path | None = None) -> None:
+    """键在**无账户上下文**时被读取 → 大声记录一次(同键不重复刷屏)。见 per_user_get。
+
+    root: 调用方**已解析到**的账户根 (显式 user_root= 或 contextvar)。不传则回落
+    到 contextvar (兼容旧调用点)。显式传了账户根的后台调用方不再告警 —— 它们读到
+    的就是该账户的真值, 告警反而会变成噪声。
+    """
+    if root is None:
+        root = current_user_root()
+    if root is None and key not in _warned_missing_context:
         _warned_missing_context.add(key)
         logger.warning(
             "per-user preference %r read without account context; returning default "
@@ -209,7 +216,7 @@ def _warn_missing_context(key: str, default=None) -> None:
         )
 
 
-def per_user_get(key: str, default):
+def per_user_get(key: str, default, user_root: Path | None = None):
     """读取**每用户**键的单键入口。
 
     与 ``load().get(key, default)`` 的区别只有一处, 但很关键: 当调用方**没有账户
@@ -219,12 +226,11 @@ def per_user_get(key: str, default):
     也就没有账户上下文。它们直接读每用户键时会**静默拿到默认值** —— 推送地址是空串
     ⇒ 告警与复盘推送悄悄停止工作, 不报错、不记日志, 是本项目最危险的一类失效。
 
-    在后台扇出(S3)落地前, 这些调用点无法拿到正确值; 本函数保证「拿不到」这件事
-    **至少是可见的**。S3 完成后, 这些调用方会显式传 user_root, 告警随之消失 ——
-    所以这里同时也是扇出的接缝。
+    扇出已落地: 后台调用方 (行情轮询的告警推送、复盘调度) 显式传 user_root=,
+    读到的是该账户的真值, 于是不再告警 —— 告警只留给"确实没有账户上下文"的调用方。
     """
-    _warn_missing_context(key, default)
-    return load().get(key, default)
+    _warn_missing_context(key, default, _resolve_root(user_root))
+    return load(user_root).get(key, default)
 
 
 def save(updates: dict, user_root: Path | None = None) -> dict:
@@ -364,15 +370,15 @@ def _normalize_ext_field(raw) -> dict | None:
     return None
 
 
-def get_monitor_ext_fields() -> dict:
+def get_monitor_ext_fields(user_root: Path | None = None) -> dict:
     """监控中心个股通知要展示的 ext 字段 (concept/industry)。
 
     返回 {"concept": {"field", "maxTags", "hiddenIndices"} | None, ...}。
     后端只需读 .field 构建 ext_columns; maxTags/hiddenIndices 供前端渲染裁剪。
     兼容旧字符串格式 ("id.field") 自动升级。
     """
-    _warn_missing_context("monitor_ext_fields")
-    data = load()
+    _warn_missing_context("monitor_ext_fields", root=_resolve_root(user_root))
+    data = load(user_root)
     raw = data.get("monitor_ext_fields")
     if raw is None:
         return {
@@ -861,7 +867,7 @@ def set_mining_schedule(enabled: bool, weekday: int, profile: str) -> dict:
     return result
 
 
-def get_review_push_channels() -> list[str]:
+def get_review_push_channels(user_root: Path | None = None) -> list[str]:
     """复盘推送渠道(多选) — 选定的外部工具列表, 复盘归档后逐个推送。
 
     与 review_schedule / 实时行情完全独立, 常驻可单独设置。
@@ -871,8 +877,8 @@ def get_review_push_channels() -> list[str]:
       - 老多版本单选 review_push_channel=='feishu' → ['feishu']
       - 更老布尔 review_push_enabled==True → ['feishu']
     """
-    _warn_missing_context("review_push_channels")
-    d = load()
+    _warn_missing_context("review_push_channels", root=_resolve_root(user_root))
+    d = load(user_root)
     raw = d.get("review_push_channels")
     if isinstance(raw, list):
         return [c for c in raw if c in PUSH_CHANNELS]
@@ -900,13 +906,14 @@ def set_review_push_channels(channels: list[str]) -> list[str]:
 REVIEW_PUSH_MODES = frozenset({"auto", "manual"})
 
 
-def get_review_push_mode() -> str:
+def get_review_push_mode(user_root: Path | None = None) -> str:
     """复盘推送触发方式: auto=归档后自动推; manual=仅显式 push。默认 manual。
 
     定时复盘与手动保存复盘共用此开关。manual 时定时路径只归档不推送,
     手动路径需 save_report 显式传 push=True 才推。
+    每用户键: 后台调用方 (定时复盘) 必须显式传 user_root=。
     """
-    mode = per_user_get("review_push_mode", "manual")
+    mode = per_user_get("review_push_mode", "manual", user_root)
     return mode if mode in REVIEW_PUSH_MODES else "manual"
 
 
@@ -973,14 +980,14 @@ def set_sse_refresh_pages(pages: dict[str, bool]) -> dict[str, bool]:
     return get_sse_refresh_pages()
 
 
-def get_strategy_monitor_enabled() -> bool:
-    """策略告警评估总开关。"""
-    return load().get("strategy_monitor_enabled", False)
+def get_strategy_monitor_enabled(user_root: Path | None = None) -> bool:
+    """策略告警评估总开关 (每用户键; 后台调用方传 user_root=, 否则读到的只是部署默认)。"""
+    return load(user_root).get("strategy_monitor_enabled", False)
 
 
-def get_system_notify_enabled() -> bool:
+def get_system_notify_enabled(user_root: Path | None = None) -> bool:
     """系统通知开关 — 开启后监控告警同时推送到操作系统通知中心。"""
-    return per_user_get("system_notify_enabled", False)
+    return per_user_get("system_notify_enabled", False, user_root)
 
 
 def set_system_notify_enabled(enabled: bool) -> bool:
@@ -989,14 +996,18 @@ def set_system_notify_enabled(enabled: bool) -> bool:
     return bool(enabled)
 
 
-def get_feishu_webhook_url() -> str:
-    """飞书自定义机器人 Webhook 地址 — 全局共用一处, 所有启用推送的规则都推到这一个群。"""
-    return per_user_get("feishu_webhook_url", "")
+def get_feishu_webhook_url(user_root: Path | None = None) -> str:
+    """飞书自定义机器人 Webhook 地址 — 每个账户一处, 只推本账户规则的告警。
+
+    后台推送方必须显式传 user_root= (没有 contextvar); 不传则退回 contextvar,
+    真没有账户上下文时记一次告警并返回空串 (推送静默失效必须可见)。
+    """
+    return per_user_get("feishu_webhook_url", "", user_root)
 
 
-def get_feishu_webhook_secret() -> str:
+def get_feishu_webhook_secret(user_root: Path | None = None) -> str:
     """飞书自定义机器人签名密钥 — 机器人启用「签名校验」时必填, 留空表示不验签。"""
-    return per_user_get("feishu_webhook_secret", "")
+    return per_user_get("feishu_webhook_secret", "", user_root)
 
 
 def set_feishu_webhook_url(url: str) -> str:
@@ -1011,13 +1022,13 @@ def set_feishu_webhook_secret(secret: str) -> str:
     return get_feishu_webhook_secret()
 
 
-def get_wecom_webhook_url() -> str:
+def get_wecom_webhook_url(user_root: Path | None = None) -> str:
     """企业微信群推送 Webhook 地址 — 与飞书并列的第二推送通道。
 
     存储完整 URL (https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx);
     用户也可只填 key, 由 webhook_adapter.normalize_wecom_url 自动补全。
     """
-    return per_user_get("wecom_webhook_url", "")
+    return per_user_get("wecom_webhook_url", "", user_root)
 
 
 def set_wecom_webhook_url(url: str) -> str:
@@ -1030,9 +1041,9 @@ def set_wecom_webhook_url(url: str) -> str:
     return get_wecom_webhook_url()
 
 
-def get_custom_webhook_url() -> str:
+def get_custom_webhook_url(user_root: Path | None = None) -> str:
     """Generic third-party JSON Webhook URL shared by enabled rules and reviews."""
-    return str(per_user_get("custom_webhook_url", None) or "")
+    return str(per_user_get("custom_webhook_url", None, user_root) or "")
 
 
 def set_custom_webhook_url(url: str) -> str:
@@ -1052,10 +1063,10 @@ _EMAIL_SMTP_DEFAULTS = {
 }
 
 
-def get_email_smtp_config() -> dict:
+def get_email_smtp_config(user_root: Path | None = None) -> dict:
     """Return non-secret SMTP settings for the email notification channel."""
-    _warn_missing_context("email_smtp_config")
-    raw = load().get("email_smtp_config")
+    _warn_missing_context("email_smtp_config", root=_resolve_root(user_root))
+    raw = load(user_root).get("email_smtp_config")
     if not isinstance(raw, dict):
         raw = {}
     security = raw.get("security", _EMAIL_SMTP_DEFAULTS["security"])
@@ -1186,9 +1197,9 @@ def get_screener_auto_run() -> bool:
     return load().get("screener_auto_run", True)
 
 
-def get_strategy_monitor_ids() -> list[str]:
-    """返回监控池中的策略 ID。"""
-    return load().get("strategy_monitor_ids", [])
+def get_strategy_monitor_ids(user_root: Path | None = None) -> list[str]:
+    """返回监控池中的策略 ID (每用户键; 后台调用方传 user_root=)。"""
+    return load(user_root).get("strategy_monitor_ids", [])
 
 
 def set_realtime_monitor_config(cfg: dict) -> dict:

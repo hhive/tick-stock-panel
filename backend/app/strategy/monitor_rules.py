@@ -92,6 +92,36 @@ def load_all(user_root: Path | None = None) -> list[dict]:
     return out
 
 
+def load_all_by_account() -> dict[int, list[dict]]:
+    """按账户扇出读取**每个账户**的监控规则 (启动 / 全量 reload 用)。
+
+    引擎内存态按账户分家, 装载时必须逐账户装载: 规则 id 可由策略 id 派生
+    (``strategy_rule_id``), 两个账户建同名策略会得到同一个 rule_id, 合并成一份
+    会互相覆盖。会读账号注册表, 属**低频**路径 (启动、设置变更), 不要放进
+    每请求或每轮询。
+    """
+    from app.services import user_paths  # 惰性导入: 避免与本模块形成导入环
+
+    return {
+        account_id: load_all(user_root=user_root)
+        for account_id, user_root in user_paths.iter_user_roots()
+    }
+
+
+def reload_engine(engine) -> int:
+    """把全部账户的磁盘规则装载进引擎内存态, 返回装载的规则总数。
+
+    启动 (app/main.py) 与全量 reload (PUT /preferences/realtime-monitor) 的唯一入口。
+    引擎不认识存储层、存储层不认识引擎, 这里是两者之间唯一的装配缝 —— 只做
+    「逐账户读取 → 逐账户装载」, 不含任何评估逻辑。单个账户读取失败不影响其它账户。
+    """
+    total = 0
+    for account_id, rules in load_all_by_account().items():
+        engine.set_rules_for(account_id, rules)
+        total += len(rules)
+    return total
+
+
 def load_one(rule_id: str, user_root: Path | None = None) -> dict | None:
     p = _path(user_root, rule_id)
     if not p.exists():

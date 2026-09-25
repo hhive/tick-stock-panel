@@ -37,7 +37,7 @@ def _quote_df() -> pl.DataFrame:
 
 
 def test_strategy_result_subscriber_notification_is_coalesced():
-    sub = QuoteSubscriber()
+    sub = QuoteSubscriber(1)
 
     sub.notify_strategy_results()
     sub.notify_strategy_results()
@@ -52,10 +52,10 @@ def test_strategy_result_subscriber_notification_is_coalesced():
 
 def test_strategy_result_notification_fans_out_to_all_subscribers():
     service = QuoteService()
-    first = service.subscribe()
-    second = service.subscribe()
+    first = service.subscribe(1)
+    second = service.subscribe(1)
 
-    service.notify_strategy_results_updated()
+    service.notify_strategy_results_updated({1})
 
     assert first.pop()["strategy_results_updated"] is True
     assert second.pop()["strategy_results_updated"] is True
@@ -80,30 +80,30 @@ class _FailingStrategyEngine(_EmptyResultStrategyEngine):
 def test_successful_zero_match_strategy_marks_result_refresh():
     engine = MonitorRuleEngine()
     engine.set_strategy_engine(_EmptyResultStrategyEngine())
-    engine.set_rules([_strategy_rule()])
+    engine.set_rules_for(1, [_strategy_rule()])
 
     assert engine.evaluate(_quote_df()) == []
-    assert engine.latest_strategy_results()["strategy_1"]["total"] == 0
-    assert engine.consume_strategy_result_updates() is True
-    assert engine.consume_strategy_result_updates() is False
+    assert engine.latest_strategy_results(1)["strategy_1"]["total"] == 0
+    assert engine.consume_strategy_result_updates() == {1}
+    assert engine.consume_strategy_result_updates() == set()
 
 
 def test_failed_or_skipped_strategy_does_not_mark_result_refresh():
     failed = MonitorRuleEngine()
     failed.set_strategy_engine(_FailingStrategyEngine())
-    failed.set_rules([_strategy_rule()])
+    failed.set_rules_for(1, [_strategy_rule()])
 
     assert failed.evaluate(_quote_df()) == []
-    assert failed.latest_strategy_results() == {}
-    assert failed.consume_strategy_result_updates() is False
+    assert failed.latest_strategy_results(1) == {}
+    assert failed.consume_strategy_result_updates() == set()
 
     skipped = MonitorRuleEngine()
     skipped.set_strategy_engine(_EmptyResultStrategyEngine())
-    skipped.set_rules([_strategy_rule(scope="symbols")])
+    skipped.set_rules_for(1, [_strategy_rule(scope="symbols")])
 
     assert skipped.evaluate(pl.DataFrame({"symbol": ["000001.SZ"]})) == []
-    assert skipped.latest_strategy_results() == {}
-    assert skipped.consume_strategy_result_updates() is False
+    assert skipped.latest_strategy_results(1) == {}
+    assert skipped.consume_strategy_result_updates() == set()
 
 
 def test_matrix_strategy_monitor_reuses_live_matrix_and_updates_last_row():
@@ -146,7 +146,7 @@ def test_matrix_strategy_monitor_reuses_live_matrix_and_updates_last_row():
     monitor.set_strategy_engine(strategy_engine)
     monitor.set_data_dir(Path("test-data"))
     monitor.set_history_loader(load_history)
-    monitor.set_rules([{
+    monitor.set_rules_for(1, [{
         "id": "matrix_macd",
         "name": "MACD",
         "type": "strategy",
@@ -159,14 +159,14 @@ def test_matrix_strategy_monitor_reuses_live_matrix_and_updates_last_row():
 
     with patch("app.strategy.monitor._strategy_config.load_override", return_value=overrides):
         assert monitor.evaluate(current) == []
-        assert monitor.latest_strategy_results()["macd_golden"]["total"] == 2
-        first_stats = strategy_engine.realtime_matrix_stats("monitor:stock")
+        assert monitor.latest_strategy_results(1)["macd_golden"]["total"] == 2
+        first_stats = strategy_engine.realtime_matrix_stats(f"monitor:1:stock")
         assert first_stats["build_count"] == 1
         assert len(load_calls) == 1
 
         updated = current.with_columns((pl.col("close") + 1.0).alias("close"))
         assert monitor.evaluate(updated) == []
-        second_stats = strategy_engine.realtime_matrix_stats("monitor:stock")
+        second_stats = strategy_engine.realtime_matrix_stats(f"monitor:1:stock")
         assert second_stats["build_count"] == 1
         assert second_stats["update_count"] == 1
         assert len(load_calls) == 1
@@ -191,13 +191,13 @@ class _MonitorWithUpdate:
         assert asset_type == "stock"
         return []
 
-    def consume_strategy_result_updates(self) -> bool:
-        return self.updated
+    def consume_strategy_result_updates(self) -> set[int]:
+        return {1} if self.updated else set()
 
 
 def test_quote_service_notifies_only_after_strategy_result_update():
     service = QuoteService()
-    subscriber = service.subscribe()
+    subscriber = service.subscribe(1)
     service.set_app_state(SimpleNamespace(monitor_engine=_MonitorWithUpdate(updated=True)))
     service.get_enriched_today = lambda: (_quote_df(), quote_service.cn_today())
 
@@ -209,7 +209,7 @@ def test_quote_service_notifies_only_after_strategy_result_update():
 
 def test_quote_service_skips_notification_without_strategy_result_update():
     service = QuoteService()
-    subscriber = service.subscribe()
+    subscriber = service.subscribe(1)
     service.set_app_state(SimpleNamespace(monitor_engine=_MonitorWithUpdate(updated=False)))
     service.get_enriched_today = lambda: (_quote_df(), quote_service.cn_today())
 

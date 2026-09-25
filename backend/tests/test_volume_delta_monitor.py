@@ -45,7 +45,7 @@ def _rule(**kw):
 
 def test_volume_delta_hits_above_threshold():
     eng = MonitorRuleEngine()
-    eng.set_rules([_rule()])
+    eng.set_rules_for(1, [_rule()])
     events = eng.evaluate(_df([
         {"symbol": "S1.SH", "_volume_delta": 9500.0, "close": 10.0},
         {"symbol": "S2.SH", "_volume_delta": 8999.0, "close": 20.0},
@@ -59,14 +59,14 @@ def test_volume_delta_hits_above_threshold():
 
 def test_volume_delta_no_column_degrades_silently():
     eng = MonitorRuleEngine()
-    eng.set_rules([_rule()])
+    eng.set_rules_for(1, [_rule()])
     plain = pl.DataFrame({"symbol": ["S1.SH"], "close": [10.0]})
     assert eng.evaluate(plain) == []
 
 
 def test_volume_delta_cooldown_suppresses_repeat():
     eng = MonitorRuleEngine()
-    eng.set_rules([_rule(cooldown=300)])
+    eng.set_rules_for(1, [_rule(cooldown=300)])
     df = _df([{"symbol": "S1.SH", "_volume_delta": 12000.0}])
     assert len(eng.evaluate(df)) == 1
     assert eng.evaluate(df) == []
@@ -74,7 +74,7 @@ def test_volume_delta_cooldown_suppresses_repeat():
 
 def test_volume_delta_batch_merge_over_five():
     eng = MonitorRuleEngine()
-    eng.set_rules([_rule()])
+    eng.set_rules_for(1, [_rule()])
     rows = [{"symbol": f"S{i}.SH", "_volume_delta": 20000.0 + i} for i in range(8)]
     events = eng.evaluate(_df(rows))
     assert len(events) == 1
@@ -84,7 +84,7 @@ def test_volume_delta_batch_merge_over_five():
 
 def test_volume_delta_scope_filters():
     eng = MonitorRuleEngine()
-    eng.set_rules([_rule(scope="symbols", symbols=["S2.SH"])])
+    eng.set_rules_for(1, [_rule(scope="symbols", symbols=["S2.SH"])])
     events = eng.evaluate(_df([
         {"symbol": "S1.SH", "_volume_delta": 9500.0},
         {"symbol": "S2.SH", "_volume_delta": 9500.0},
@@ -94,7 +94,7 @@ def test_volume_delta_scope_filters():
 
 def test_volume_delta_metric_amount():
     eng = MonitorRuleEngine()
-    eng.set_rules([_rule(metric="amount", threshold_amount=5e6)])
+    eng.set_rules_for(1, [_rule(metric="amount", threshold_amount=5e6)])
     events = eng.evaluate(_df([
         {"symbol": "S1.SH", "_volume_delta": 100.0, "_volume_delta_amount": 6e6},
         {"symbol": "S2.SH", "_volume_delta": 20000.0, "_volume_delta_amount": 4.9e6},
@@ -105,7 +105,7 @@ def test_volume_delta_metric_amount():
 
 def test_volume_delta_basic_filter_price_and_amount():
     eng = MonitorRuleEngine()
-    eng.set_rules([_rule(basic_filter={
+    eng.set_rules_for(1, [_rule(basic_filter={
         "price_min": 5, "price_max": 100, "amount_min": 1e8, "exclude_st": False,
     })])
     events = eng.evaluate(_df([
@@ -123,7 +123,7 @@ def test_volume_delta_basic_filter_price_and_amount():
 
 def test_volume_delta_basic_filter_market_cap():
     eng = MonitorRuleEngine()
-    eng.set_rules([_rule(basic_filter={
+    eng.set_rules_for(1, [_rule(basic_filter={
         "market_cap_min": 20e8, "price_min": None, "price_max": None,
         "amount_min": None, "exclude_st": False,
     })])
@@ -138,7 +138,7 @@ def test_volume_delta_basic_filter_market_cap():
 def test_volume_delta_basic_filter_exclude_st():
     eng = MonitorRuleEngine()
     eng.set_name_map({"STOCK.SH": "平安银行", "STK.SH": "ST 某某"})
-    eng.set_rules([_rule(basic_filter={
+    eng.set_rules_for(1, [_rule(basic_filter={
         "price_min": None, "price_max": None, "amount_min": None, "exclude_st": True,
     })])
     events = eng.evaluate(_df([

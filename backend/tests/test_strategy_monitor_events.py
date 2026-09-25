@@ -134,7 +134,7 @@ def test_strategy_score_range_filters_pool_and_buy_signals_but_not_sell_signals(
             scores={"A": 70, "B": 91, "C": 90},
         ),
     ]))
-    engine.set_rules([_rule(
+    engine.set_rules_for(1, [_rule(
         "buy_signal", "sell_signal", "pool_entry", "pool_exit",
         score_min=70,
         score_max=90,
@@ -162,10 +162,10 @@ def test_strategy_score_range_edit_resets_pool_baseline():
         _result(day, pool=("A",), scores={"A": 80}),
     ]))
     rule = _rule("pool_exit", score_min=70)
-    engine.set_rules([rule])
+    engine.set_rules_for(1, [rule])
     assert engine.evaluate(_quotes()) == []
 
-    engine.set_rules([{**rule, "score_min": 90}])
+    engine.set_rules_for(1, [{**rule, "score_min": 90}])
 
     assert engine.evaluate(_quotes()) == []
 
@@ -181,7 +181,7 @@ def test_strategy_events_baseline_dedupe_and_next_day_replay():
         _result(day1, pool=("A", "B"), buys=("B",)),
         _result(day2, pool=("A", "B"), buys=("B",)),
     ]))
-    engine.set_rules([_rule("buy_signal", "pool_entry")])
+    engine.set_rules_for(1, [_rule("buy_signal", "pool_entry")])
 
     with patch("app.strategy.monitor.time.time", side_effect=[100, 101, 102, 103, 4000]):
         assert engine.evaluate(_quotes()) == []
@@ -204,7 +204,7 @@ def test_strategy_sell_and_pool_exit_are_independent_events():
         _result(day, pool=("A", "B")),
         _result(day, pool=("A",), sells=("B",)),
     ]))
-    engine.set_rules([_rule("sell_signal", "pool_exit")])
+    engine.set_rules_for(1, [_rule("sell_signal", "pool_exit")])
 
     with patch("app.strategy.monitor.time.time", side_effect=[100, 101]):
         assert engine.evaluate(_quotes()) == []
@@ -226,18 +226,18 @@ def test_strategy_rule_reload_preserves_state_and_semantic_edit_resets_it():
         _result(day, buys=("A",)),
     ]))
     rule = _rule("buy_signal")
-    engine.set_rules([rule])
+    engine.set_rules_for(1, [rule])
     assert engine.evaluate(_quotes()) == []
 
-    engine.set_rules([{**rule, "message": "新文案"}])
+    engine.set_rules_for(1, [{**rule, "message": "新文案"}])
     assert engine.evaluate(_quotes()) == []
 
-    engine.set_rules([{**rule, "scope": "symbols", "symbols": ["A"]}])
+    engine.set_rules_for(1, [{**rule, "scope": "symbols", "symbols": ["A"]}])
     assert engine.evaluate(_quotes()) == []
 
-    engine.set_rules([])
+    engine.set_rules_for(1, [])
     assert not engine._strategy_signal_state
-    engine.set_rules([rule])
+    engine.set_rules_for(1, [rule])
     assert engine.evaluate(_quotes()) == []
 
 
@@ -376,7 +376,10 @@ def test_ordinary_strategy_uses_signal_overrides_and_ignores_malformed_values():
 
 
 def test_quote_service_forwards_real_strategy_id(monkeypatch, tmp_path):
+    # 引擎产出的每个事件都带 account_id (路由标签); quote_service 的每一条出口
+    # (SSE/落盘/推送) 都以它为准, 这里如实构造。
     event = {
+        "account_id": 1,
         "ts": 1,
         "rule_id": "strategy_rule",
         "strategy_id": "demo",
@@ -397,6 +400,10 @@ def test_quote_service_forwards_real_strategy_id(monkeypatch, tmp_path):
         def __init__(self):
             self.rules = {"strategy_rule": {"webhook_channels": []}}
 
+        def rules_for(self, account_id: int) -> dict:
+            assert account_id == 1
+            return self.rules
+
         def set_name_map(self, name_map):
             pass
 
@@ -409,8 +416,8 @@ def test_quote_service_forwards_real_strategy_id(monkeypatch, tmp_path):
         def evaluate(self, df, asset_type: str):
             return [event]
 
-        def consume_strategy_result_updates(self) -> bool:
-            return False
+        def consume_strategy_result_updates(self) -> set[int]:
+            return set()
 
     class _Repo:
         store = SimpleNamespace(data_dir=tmp_path)
@@ -422,7 +429,7 @@ def test_quote_service_forwards_real_strategy_id(monkeypatch, tmp_path):
     monkeypatch.setattr(alert_store, "append_many", lambda *args: None)
     monkeypatch.setattr(preferences, "get_system_notify_enabled", lambda: False)
     service = QuoteService()
-    subscriber = service.subscribe()
+    subscriber = service.subscribe(1)
     service.set_app_state(SimpleNamespace(monitor_engine=_Engine(), repo=_Repo()))
     service._repo = _Repo()
     service.get_enriched_today = lambda: (_quotes(), quote_service.cn_today())
@@ -430,4 +437,7 @@ def test_quote_service_forwards_real_strategy_id(monkeypatch, tmp_path):
     with patch.object(QuoteService, "_is_continuous_trading", return_value=True):
         service._evaluate_monitors(pl.DataFrame(), None)
 
-    assert subscriber.pop()["alerts"][0]["strategy_id"] == "demo"
+    alert = subscriber.pop()["alerts"][0]
+    assert alert["strategy_id"] == "demo"
+    # 路由标签必须一路带到 SSE 载荷: 少了它订阅端无法判断这条告警归谁
+    assert alert["account_id"] == 1

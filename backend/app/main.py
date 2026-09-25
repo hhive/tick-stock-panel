@@ -324,7 +324,7 @@ async def _application_lifespan(app: FastAPI):
     # 通用监控规则引擎: 启动时 reload 规则到内存态 (修复重启后告警失效)
     from app.strategy.monitor import MonitorRuleEngine
     from app.strategy import monitor_rules as mr_store
-    from app.services import preferences
+    from app.services import preferences, user_paths
     from app.services.sector_monitor import SectorMonitorService
     monitor_engine = MonitorRuleEngine()
     sector_monitor_service = SectorMonitorService(repo)
@@ -337,21 +337,30 @@ async def _application_lifespan(app: FastAPI):
     # ETF 版历史加载器: asset_type=etf 的 strategy 型规则用 (读 kline_etf_enriched)。
     monitor_engine.set_history_loader_etf(_etf_screener_svc._load_enriched_history)
 
-    # 自动迁移: 把旧 strategy_monitor_ids 同步为 type=strategy 规则 (统一到监控页)
+    # 自动迁移: 把旧 strategy_monitor_ids 同步为 type=strategy 规则 (统一到监控页)。
+    # 开关与策略池都是**每账户**偏好键, 后台无请求上下文, 必须逐账户扇出并显式传
+    # user_root= —— 不传只会读到部署级默认值 (空池), 迁移等于什么都没做。
     try:
-        if preferences.get_strategy_monitor_enabled():
-            ids = preferences.get_strategy_monitor_ids()
-            if ids:
-                names = {s["id"]: s["name"] for s in strategy_engine.list_strategies()}
-                mr_store.migrate_strategy_monitors(store.data_dir, ids, names)
-                logger.info("strategy monitor migrated: %d strategies", len(ids))
+        names = {s["id"]: s["name"] for s in strategy_engine.list_strategies()}
+        for _account_id, user_root in list(user_paths.iter_user_roots()):
+            try:
+                if not preferences.get_strategy_monitor_enabled(user_root):
+                    continue
+                ids = preferences.get_strategy_monitor_ids(user_root)
+                if not ids:
+                    continue
+                mr_store.migrate_strategy_monitors(ids, names, user_root=user_root)
+                logger.info(
+                    "strategy monitor migrated (账户 %s): %d strategies", _account_id, len(ids),
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("strategy monitor migration failed (账户 %s): %s", _account_id, e)
     except Exception as e:  # noqa: BLE001
         logger.warning("strategy monitor migration failed: %s", e)
 
+    # 规则装载: 逐账户 (规则 id 可由策略 id 派生, 扁平装载会跨账户互相覆盖)
     try:
-        rules = mr_store.load_all(store.data_dir)
-        monitor_engine.set_rules(rules)
-        logger.info("monitor engine loaded: %d rules", monitor_engine.rule_count)
+        logger.info("monitor engine loaded: %d rules", mr_store.reload_engine(monitor_engine))
     except Exception as e:  # noqa: BLE001
         logger.warning("monitor engine load failed: %s", e)
     app.state.monitor_engine = monitor_engine

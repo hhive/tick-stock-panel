@@ -8,6 +8,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from app.services import alert_store
+from app.api.deps import require_account_id
 
 router = APIRouter(prefix="/api/alerts", tags=["alerts"])
 
@@ -101,6 +102,8 @@ def seed_demo_alerts(request: Request, count: int = 12, recent: bool = True):
         recent: True=时间戳设为"刚刚"(用于测试闪烁效果); False=分散在近3天
     """
     count = max(1, min(50, count))
+    # 演示记录属于**发起请求的账户**: 落盘走 contextvar, SSE 投递靠这个标签路由
+    account_id = require_account_id(request)
     now_ms = int(time.time() * 1000)
     events = []
     for i in range(count):
@@ -119,6 +122,7 @@ def seed_demo_alerts(request: Request, count: int = 12, recent: bool = True):
         # recent 模式: 时间戳从现在往前每条错开 30 秒 (最新在前)
         ts = now_ms - (i * 30000) if recent else now_ms - random.randint(60, 4320) * 60 * 1000
         events.append({
+            "account_id": account_id,
             "ts": ts,
             "rule_id": f"demo_rule_{i}",
             "rule_name": message,
@@ -139,6 +143,7 @@ def seed_demo_alerts(request: Request, count: int = 12, recent: bool = True):
     if qs:
         # 转成 SSE 推送格式 (和 _evaluate_monitors 一致)
         sse_alerts = [{
+            "account_id": ev["account_id"],
             "source": ev["source"],
             "type": ev["type"],
             "rule_id": ev.get("rule_id"),

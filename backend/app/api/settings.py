@@ -12,6 +12,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from app import secrets_store
+from app.api.deps import require_account_id
 from app.data_providers.custom.config import MAX_TIMEOUT
 from app.tickflow import client as tf_client
 from app.tickflow.policy import (
@@ -1087,6 +1088,9 @@ def update_realtime_monitor_config(req: RealtimeMonitorConfigIn, request: Reques
         strategy_engine = getattr(request.app.state, "strategy_engine", None)
         if monitor_engine is not None and strategy_engine is not None:
             from app.strategy import monitor_rules as mr_store
+            # 请求身份在 try 之外解析: 下面的 except 会把任何异常当成"同步失败"静默
+            # 放过, 而"没有账户身份"不该被静默放过 (这次改的正是每账户的监控配置)。
+            account_id = require_account_id(request)
             try:
                 if preferences.get_strategy_monitor_enabled():
                     ids = preferences.get_strategy_monitor_ids()
@@ -1095,8 +1099,8 @@ def update_realtime_monitor_config(req: RealtimeMonitorConfigIn, request: Reques
                 else:
                     # 关闭策略监控: 停用所有策略规则
                     mr_store.migrate_strategy_monitors([], {})
-                # reload 规则到引擎
-                monitor_engine.set_rules(mr_store.load_all())
+                # reload **本账户**的规则到引擎 (偏好与规则都是每账户的)
+                monitor_engine.set_rules_for(account_id, mr_store.load_all())
             except Exception:
                 pass
 

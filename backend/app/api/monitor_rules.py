@@ -10,6 +10,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
+from app.api.deps import require_account_id
 from app.strategy import monitor_rules
 from app.strategy.intraday_signals import INTRADAY_SIGNAL_LABELS, uses_intraday_signals
 
@@ -44,15 +45,21 @@ def _reconcile_index_asset_type(rule: dict, repo) -> dict:
 
 
 def _sync_engine(request: Request) -> None:
-    """保存/删除后,把最新规则集 reload 到引擎内存态。"""
+    """保存/删除后,把**本账户**的最新规则集 reload 到引擎内存态。
+
+    只 reload 本账户: 这里只是某个人改了自己的一条规则, 没有必要 (也不该) 去读
+    所有人的规则目录 —— 那既慢, 又让"每次保存都扫全站磁盘"成为攻击面。
+    账户取自请求身份 (require_account_id), 不来自客户端参数。
+    """
     engine = getattr(request.app.state, "monitor_engine", None)
     if engine is not None:
+        account_id = require_account_id(request)
         repo = request.app.state.repo
         rules = [
             _reconcile_index_asset_type(r, repo)
             for r in monitor_rules.load_all()
         ]
-        engine.set_rules(rules)
+        engine.set_rules_for(account_id, rules)
 
 
 # ── Pydantic 模型 ───────────────────────────────────────
@@ -495,8 +502,11 @@ def test_ladder(request: Request):
     })
     mock = mock.join(sealed_df, on="symbol", how="inner")
 
-    # 取所有 ladder 规则, 逐条纯条件判断 (绕过引擎 cooldown, 不污染 _last_fire)
-    ladder_rules = [r for r in engine.rules.values() if r.get("type") == "ladder" and r.get("enabled", True)]
+    # 取**本账户**的 ladder 规则, 逐条纯条件判断 (绕过引擎 cooldown, 不污染 _last_fire)
+    ladder_rules = [
+        r for r in engine.rules_for(require_account_id(request)).values()
+        if r.get("type") == "ladder" and r.get("enabled", True)
+    ]
     all_events = []
     not_triggered = []
 
@@ -614,7 +624,8 @@ def trigger_ladder(request: Request):
     except Exception:  # noqa: BLE001
         pass
 
-    for rule in engine.rules.values():
+    account_id = require_account_id(request)
+    for rule in engine.rules_for(account_id).values():
         if rule.get("type") != "ladder" or not rule.get("enabled", True):
             continue
         sym = rule.get("symbols", [""])[0] if rule.get("symbols") else ""
@@ -640,6 +651,8 @@ def trigger_ladder(request: Request):
             th_text = f"{thr:,.0f} 手"
 
         rule_events.append({
+            # 路由标签: SSE 按它投递给本账户的订阅者
+            "account_id": account_id,
             "ts": int(now * 1000),
             "rule_id": rule["id"],
             "rule_name": rule.get("name", ""),
@@ -670,6 +683,7 @@ def trigger_ladder(request: Request):
     # 2. SSE 推送 (入 pending_alerts 队列)
     if quote_svc:
         sse_alerts = [{
+            "account_id": ev["account_id"],
             "source": ev["source"], "type": ev["type"], "rule_id": ev["rule_id"],
             "strategy_id": None, "symbol": ev["symbol"], "name": ev["name"],
             "message": ev["message"], "price": ev["price"], "change_pct": ev["change_pct"],

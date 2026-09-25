@@ -91,7 +91,7 @@ def test_index_targets_are_evaluated_independently(tmp_path):
     engine.set_sector_monitor_service(service)
     sh = _index_target("000001.SH", "上证指数")
     cyb = _index_target("399006.SZ", "创业板指")
-    engine.set_rules([_sector_rule([sh, cyb])])
+    engine.set_rules_for(1, [_sector_rule([sh, cyb])])
 
     first = pl.DataFrame({
         "symbol": ["000001.SH", "399006.SZ"],
@@ -188,7 +188,7 @@ def test_momentum_rule_triggers_after_complete_window(tmp_path):
     engine = MonitorRuleEngine()
     engine.set_sector_monitor_service(service)
     target = _index_target("000001.SH", "上证指数")
-    engine.set_rules([_sector_rule(
+    engine.set_rules_for(1, [_sector_rule(
         [target],
         sector_trigger="momentum",
         threshold_pct=1.0,

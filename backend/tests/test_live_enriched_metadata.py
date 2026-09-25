@@ -90,7 +90,7 @@ def filter_history(df: pl.DataFrame, params: dict) -> pl.DataFrame:
     monitor = MonitorRuleEngine()
     monitor.set_strategy_engine(StrategyEngine([Path(strategy_dir)]))
     monitor.set_history_loader(lambda _as_of, _lookback: history)
-    monitor.set_rules([{
+    monitor.set_rules_for(1, [{
         "id": "history_strategy_monitor",
         "name": "历史策略监控",
         "type": "strategy",
@@ -101,4 +101,4 @@ def filter_history(df: pl.DataFrame, params: dict) -> pl.DataFrame:
 
     monitor.evaluate(current)
 
-    assert monitor.latest_strategy_results()["history_strategy"]["total"] == 1
+    assert monitor.latest_strategy_results(1)["history_strategy"]["total"] == 1

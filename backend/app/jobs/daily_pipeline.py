@@ -25,6 +25,8 @@ from app.indicators.pipeline import filter_halt_days, run_pipeline
 from app.market_time import cn_today
 from app.services import index_sync, instrument_sync, kline_sync
 from app.services import preferences as _prefs
+from app.services import user_paths
+from app.services.user_paths import MissingUserContextError
 from app.tickflow.capabilities import Cap, CapabilitySet
 from app.tickflow.pools import DEMO_SYMBOLS, get_pool
 from app.tickflow.repository import KlineRepository
@@ -913,7 +915,8 @@ def _push_phase_change_alert(data_dir) -> None:
     app_state = _get_app_state()
     qs = getattr(app_state, "quote_service", None) if app_state else None
     if qs:
-        qs.push_alerts([{
+        # 市场级通知: 内容读的是共享行情, 与账户无关, 但投递要逐账户复制
+        qs.push_system_alerts([{
             "source": "market",
             "type": "phase_change",
             "message": msg,
@@ -996,8 +999,23 @@ async def _run_scheduled_review(repo) -> None:
         from app.services import market_recap_reports
         from app import secrets_store as ss
 
-        # AI Key 未配置时跳过(避免每日报错刷日志)
-        if not ss.get_ai_key():
+        # AI Key 未配置时跳过(避免每日报错刷日志)。
+        # ★ 未决问题 (见交付说明): AI Key 是**每账户**凭据 (<user_root>/user_data/
+        #   secrets.json), 而本 job 是部署级共享任务, 没有账户上下文。于是有两个都
+        #   需要产品决策的口径, 这里刻意不擅自选一个:
+        #     ① 用谁的 key 生成 —— 用 A 的 key 生成再发给所有人, 等于让 A 为全站付费;
+        #     ② 生成几份 —— 逐账户各生成一份则 LLM 成本 ×N。
+        #   在定夺之前 fail-closed: 明确跳过并留日志, 而不是拿某个账户的凭据去跑
+        #   全站广播 (也顺便让 MissingUserContextError 不再以异常栈的形式出现)。
+        try:
+            has_ai_key = bool(ss.get_ai_key())
+        except MissingUserContextError:
+            logger.warning(
+                "定时复盘跳过: 后台无账户上下文, 而 AI Key 是每账户凭据 —— "
+                "用谁的 key 生成/生成给谁尚未定夺 (fail-closed)"
+            )
+            return
+        if not has_ai_key:
             logger.info("scheduled review skipped: AI key not configured")
             return
 
@@ -1005,37 +1023,61 @@ async def _run_scheduled_review(repo) -> None:
         quote_service = getattr(app_state, "quote_service", None) if app_state else None
         depth_service = getattr(app_state, "depth_service", None) if app_state else None
 
-        content, meta = await _stream_review_with_retry(repo, quote_service, depth_service)
+        # 账户列表**只解析一次**: 它要读账号注册表 (低频路径), 而复盘流每个 delta 都要
+        # 投递一次 —— 放在内层就是 O(delta × 账户) 次注册表重读。
+        targets = list(user_paths.iter_user_roots())
+        if not targets:
+            logger.info("scheduled review skipped: 当前没有任何面板账号, 无处归档/投递")
+            return
+
+        content, meta = await _stream_review_with_retry(
+            repo, quote_service, depth_service, targets,
+        )
         if not content:
             logger.warning("scheduled review produced no content (meta=%s)", meta)
             # 通知前端进入 error 态(若有页面在听)
             if quote_service:
-                quote_service.push_review_event(json.dumps(
+                quote_service.push_review_event_to_all_accounts(json.dumps(
                     {"type": "error", "message": "复盘生成失败,请稍后手动重试"},
                     ensure_ascii=False))
             return
 
-        # 落盘: 与手动生成完全相同的归档格式
-        market_recap_reports.save_report({
-            "as_of": meta.get("as_of"),
-            "focus": "",
-            "content": content,
-            "summary": meta.get("summary", ""),
-            "emotion_score": meta.get("emotion_score"),
-            "emotion_label": meta.get("emotion_label", ""),
-        })
-        logger.info("scheduled review saved: as_of=%s", meta.get("as_of"))
+        # 落盘 + 外发推送: 逐账户扇出。
+        # 报告本身是**每账户**私有数据 (<user_root>/user_data/ai_market_recaps.json),
+        # 推送渠道/开关 (review_push_channels / review_push_mode) 同样是每账户偏好键。
+        # 后台线程没有请求上下文, 全部显式传 user_root= —— 不传就是读部署默认值
+        # (归档会直接抛 MissingUserContextError, 推送会静默失效)。
+        # 复盘内容生成**一次**、复制给每个账户: 输入只有共享行情, 抄送给谁都不改变内容。
+        saved = 0
+        for account_id, user_root in targets:
+            try:
+                # 与手动生成完全相同的归档格式
+                market_recap_reports.save_report({
+                    "as_of": meta.get("as_of"),
+                    "focus": "",
+                    "content": content,
+                    "summary": meta.get("summary", ""),
+                    "emotion_score": meta.get("emotion_score"),
+                    "emotion_label": meta.get("emotion_label", ""),
+                }, user_root=user_root)
+                saved += 1
+                # 推送门控: review_push_mode=manual 时定时复盘只归档不推送,
+                # 由用户对当日报告显式确认后才推; auto 时保持既有自动推送行为。
+                # 失败静默降级, 不影响已归档的报告。
+                if _prefs.get_review_push_mode(user_root) == "auto":
+                    _maybe_push_review(content, meta, user_root=user_root)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("scheduled review fan-out failed (账户 %s): %s", account_id, e)
+        if not saved:
+            logger.warning(
+                "定时复盘已生成但未归档: 当前没有任何面板账号 (每账户存储不存在)",
+            )
+        logger.info("scheduled review saved: as_of=%s (账户数=%d)", meta.get("as_of"), saved)
 
         # 通知前端: 生成完成且已归档(archived=true 让前端只刷新列表, 不重复归档)
         if quote_service:
-            quote_service.push_review_event(json.dumps(
+            quote_service.push_review_event_to_all_accounts(json.dumps(
                 {"type": "done", "archived": True}, ensure_ascii=False))
-
-        # 推送门控: review_push_mode=manual 时定时复盘只归档不推送,
-        # 由用户对当日报告显式确认后才推; auto 时保持既有自动推送行为。
-        # 失败静默降级, 不影响已归档的报告。
-        if _prefs.get_review_push_mode() == "auto":
-            _maybe_push_review(content, meta)
     except Exception as e:  # noqa: BLE001
         logger.exception("scheduled review failed: %s", e)
         # 兜底: 异常时通知前端停止「生成中」状态, 避免页面卡在 streaming
@@ -1044,18 +1086,24 @@ async def _run_scheduled_review(repo) -> None:
             qs = getattr(app_state, "quote_service", None) if app_state else None
             if qs:
                 import json as _json
-                qs.push_review_event(_json.dumps(
+                qs.push_review_event_to_all_accounts(_json.dumps(
                     {"type": "error", "message": "复盘生成异常,请稍后手动重试"},
                     ensure_ascii=False))
         except Exception:  # noqa: BLE001
             pass
 
 
-async def _stream_review_with_retry(repo, quote_service, depth_service) -> tuple[str, dict]:
+async def _stream_review_with_retry(
+    repo, quote_service, depth_service, targets: list[tuple[int, Path]],
+) -> tuple[str, dict]:
     """流式生成复盘, 每个事件推 SSE + 累积内容。LLM 断流时最多重试 2 次。
 
     返回 (content, meta)。重试时推一个 retry 事件让前端清空已累积内容重新开始。
     成功(收到 done/无 error)或耗尽重试后返回。
+
+    targets: 该发的 (account_id, user_root) 列表 (调用方解析一次后传进来)。
+    复盘读的是共享行情, 内容对所有账户一致, 但**投递**必须逐账户打标签 —— 订阅者
+    只收本账户的事件 (复盘报告本身也是每账户私有数据)。
     """
     import asyncio
     import json
@@ -1073,9 +1121,13 @@ async def _stream_review_with_retry(repo, quote_service, depth_service) -> tuple
                 evt = json.loads(evt_json)
                 t = evt.get("type")
 
-                # 推给前端(让开着页面的用户实时看到, 与手动一致)
+                # 推给前端(让开着页面的用户实时看到, 与手动一致)。
+                # 定时复盘读的是**共享行情**, 内容对所有账户一致 → 逐账户复制投递。
+                # 不能"广播给所有订阅者": 订阅者按账户收事件, 复盘报告又是每账户私有
+                # 数据, 无标签广播会让 A 的复盘页显示 B 正在生成的报告。
                 if quote_service:
-                    quote_service.push_review_event(evt_json)
+                    for _account_id, _root in targets:
+                        quote_service.push_review_event(_account_id, evt_json)
 
                 if t == "meta":
                     last_meta = evt
@@ -1103,7 +1155,7 @@ async def _stream_review_with_retry(repo, quote_service, depth_service) -> tuple
             logger.info("scheduled review retrying in 3s (attempt %d → %d)", attempt, attempt + 1)
             # 通知前端: 即将重试, 清空已累积内容重新开始
             if quote_service:
-                quote_service.push_review_event(json.dumps(
+                quote_service.push_review_event_to_all_accounts(json.dumps(
                     {"type": "retry", "attempt": attempt + 1}, ensure_ascii=False))
             await asyncio.sleep(3)
 
@@ -1111,18 +1163,21 @@ async def _stream_review_with_retry(repo, quote_service, depth_service) -> tuple
     return "".join(content_parts), last_meta
 
 
-def _maybe_push_review(content: str, meta: dict) -> None:
+def _maybe_push_review(content: str, meta: dict, user_root: Path | None = None) -> None:
     """复盘报告归档后, 按 review_push_channels 选定的外部工具逐个推送完整报告。
 
     定时生成与手动生成共用本函数 (手动归档端点 POST /api/market-recap/reports 也会调用)。
-    channels 为空则不推送; 复用监控中心的全局外部渠道配置。
+    channels 为空则不推送; 渠道地址与凭据都是**每账户**私有配置。
     推送失败静默降级 (Webhook 是辅助通道), 不影响已归档的报告。
+
+    user_root: 定时复盘 (后台线程) **必须**显式传该账户的根 —— 不传会退回到
+    contextvar (请求路径), 后台线程下读到的是部署级默认值 ⇒ 推送静默失效。
     """
     try:
         from app import secrets_store
         from app.services import email_adapter, preferences, webhook_adapter
 
-        channels = preferences.get_review_push_channels()
+        channels = preferences.get_review_push_channels(user_root)
         if not channels:
             return
 
@@ -1132,17 +1187,17 @@ def _maybe_push_review(content: str, meta: dict) -> None:
 
         for ch in channels:
             if ch == "feishu":
-                url = preferences.get_feishu_webhook_url()
+                url = preferences.get_feishu_webhook_url(user_root)
                 if not url:
                     logger.info("review push(feishu) skipped: webhook not configured")
                     continue
-                secret = preferences.get_feishu_webhook_secret()
+                secret = preferences.get_feishu_webhook_secret(user_root)
                 ok = webhook_adapter.send_feishu_card(
                     url, "每日复盘", subtitle, content, secret
                 )
                 logger.info("review push(feishu) %s", "sent" if ok else "failed")
             elif ch == "wecom":
-                url = preferences.get_wecom_webhook_url()
+                url = preferences.get_wecom_webhook_url(user_root)
                 if not url:
                     logger.info("review push(wecom) skipped: webhook not configured")
                     continue
@@ -1153,7 +1208,7 @@ def _maybe_push_review(content: str, meta: dict) -> None:
                 )
                 logger.info("review push(wecom) %s", "sent" if ok else "failed")
             elif ch == "custom":
-                url = preferences.get_custom_webhook_url()
+                url = preferences.get_custom_webhook_url(user_root)
                 if not url:
                     logger.info("review push(custom) skipped: webhook not configured")
                     continue
@@ -1163,18 +1218,18 @@ def _maybe_push_review(content: str, meta: dict) -> None:
                     content,
                     "market_review",
                     meta,
-                    secrets_store.get_custom_webhook_secret(),
+                    secrets_store.get_custom_webhook_secret(user_root),
                 )
                 logger.info("review push(custom) %s", "sent" if ok else "failed")
             elif ch == "email":
-                config = preferences.get_email_smtp_config()
+                config = preferences.get_email_smtp_config(user_root)
                 if not email_adapter.is_configured(config):
                     logger.info("review push(email) skipped: SMTP not configured")
                     continue
                 email_body = (f"{subtitle}\n\n{content}" if subtitle else content)
                 ok = email_adapter.send_email(
                     config,
-                    secrets_store.get_email_smtp_password(),
+                    secrets_store.get_email_smtp_password(user_root),
                     "每日复盘",
                     email_body,
                 )

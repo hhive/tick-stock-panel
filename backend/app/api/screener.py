@@ -21,6 +21,7 @@ from app.db_safe import is_valid_ext_ident, quote_ident
 from app.services import strategy_cache, strategy_run_queue
 from app.services.screener import ScreenerService
 from app.strategy import config as strategy_config
+from app.api.deps import require_account_id
 
 logger = logging.getLogger(__name__)
 
@@ -385,7 +386,8 @@ def _cached_with_realtime(request: Request) -> dict:
     # 叠加监控引擎内存里的实时结果 (若有), 用新鲜数据覆盖同策略的盘后结果
     monitor_engine = getattr(request.app.state, "monitor_engine", None)
     if monitor_engine is not None:
-        realtime_results = monitor_engine.latest_strategy_results()
+        # 按**本账户**读: 合并所有账户会让 A 的策略页显示 B 的选股结果
+        realtime_results = monitor_engine.latest_strategy_results(require_account_id(request))
         if realtime_results:
             results = dict(cached.get("results") or {})
             results.update(realtime_results)

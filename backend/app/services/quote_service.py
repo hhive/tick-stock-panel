@@ -37,7 +37,7 @@ from app.market_time import CN_TZ, cn_now, cn_today
 from app.parquet import scan_daily_parquet
 from app.polars_guard import guarded_collect
 from app.services.index_const import CORE_INDEX_SYMBOLS
-from app.services.user_paths import MissingUserContextError
+from app.services.user_paths import MissingUserContextError, validate_account_id
 from app.strategy.intraday_signals import IntradaySignalEvaluator
 from app.strategy.monitor import format_alert_quote
 
@@ -100,9 +100,14 @@ class QuoteSubscriber:
     多客户端 (多标签页/多设备) 时告警只会被先醒来的连接消费, 其余永远
     收不到; 共享 Event 的 clear/wait 也存在互相吞信号的竞态。
     改为每连接独立订阅者后, 事件对所有客户端广播。
+
+    订阅者绑定**一个面板账号** (account_id): 告警与复盘事件按账户投递, 只有账户
+    一致的订阅者收到 (行情/五档这类共享数据的刷新信号仍广播给所有人)。
     """
 
-    def __init__(self, max_alerts: int = 1000, max_reviews: int = 200) -> None:
+    def __init__(self, account_id: int, max_alerts: int = 1000, max_reviews: int = 200) -> None:
+        # 面板账号 id (正整数主键), 由认证中间件注入的请求身份决定
+        self.account_id = validate_account_id(account_id)
         self._event = threading.Event()
         self._lock = threading.Lock()
         self._max_alerts = max_alerts
@@ -199,6 +204,34 @@ def _persist_last_fetch(fetched_at_ms: float) -> None:
         _last_fetch_written_at_ms = fetched_at_ms
     except Exception as e:  # noqa: BLE001
         logger.debug("last_fetch_ms 持久化失败 (不影响行情): %s", e)
+
+
+def _group_by_account(events: list[dict], what: str) -> dict[int, list[dict]]:
+    """把事件按 ``account_id`` 分组, 丢弃缺标签的事件并记日志 (fail-closed)。
+
+    告警的每一条下游出口 (SSE / 落盘 / 外部推送 / 系统通知) 都要先知道"这是谁的",
+    才能决定发给哪个订阅者、读哪份配置、写哪个目录。拿不到账户就什么都不能猜 ——
+    猜错的代价是把 A 的告警送进 B 的飞书群、或写进 B 的触发历史; 漏掉一条至少
+    是可观测的 (这里记 WARNING), 越界不可观测。事件标签由 MonitorRuleEngine 评估时
+    打上, 调用方不得自行推断。
+
+    注: 模拟盘成交事件的 ``account_id`` 是**字符串模拟盘账户名** (见
+    app.strategy.paper 的"两个 account_id 不是一回事"), 与这里的整数面板账号主键
+    命名空间不同, 因此会被本函数按"非法标签"拒收 —— 这是刻意的, 它还没有按面板
+    账户分家的迁移 (后台线程拿不到 user_root), 误当成面板账号会把随机一个字符串
+    当成账户 id 去读配置。
+    """
+    grouped: dict[int, list[dict]] = {}
+    for ev in events:
+        account_id = ev.get("account_id")
+        if isinstance(account_id, bool) or not isinstance(account_id, int) or account_id <= 0:
+            logger.warning(
+                "%s 跳过缺少合法账户标签的事件 (source=%s, type=%s, account_id=%r)",
+                what, ev.get("source"), ev.get("type"), account_id,
+            )
+            continue
+        grouped.setdefault(account_id, []).append(ev)
+    return grouped
 
 
 def _monitor_name_map(repo) -> dict[str, str]:
@@ -415,9 +448,13 @@ class QuoteService:
     # SSE 订阅管理 — 每个 /stream 连接一个订阅者, 事件广播
     # ================================================================
 
-    def subscribe(self) -> QuoteSubscriber:
-        """注册一个 SSE 订阅者 (连接建立时调用)。"""
-        sub = QuoteSubscriber()
+    def subscribe(self, account_id: int) -> QuoteSubscriber:
+        """注册一个 SSE 订阅者 (连接建立时调用)。
+
+        account_id **必传**: 它决定这个连接能收到谁的告警。旧签名 (无参) 刻意不保留
+        —— 少传一个参数应该当场 TypeError, 而不是静默变成"谁都收得到"。
+        """
+        sub = QuoteSubscriber(account_id)
         with self._lock:
             self._subscribers.add(sub)
         return sub
@@ -442,10 +479,17 @@ class QuoteService:
         for sub in self._snapshot_subscribers():
             sub.notify_quote()
 
-    def notify_strategy_results_updated(self) -> None:
-        """策略监控完成实时结果更新后调用，仅刷新策略页结果缓存。"""
+    def notify_strategy_results_updated(self, account_ids: set[int]) -> None:
+        """策略监控完成实时结果更新后调用，仅刷新**变化账户**的策略页结果缓存。
+
+        传入账户集合而不是无参广播: A 的策略重算不该去刷新 B 的页面 (B 的 /cached
+        读的是 B 自己的结果, 唤醒纯属噪声)。集合为空 = 无人需要刷新。
+        """
+        if not account_ids:
+            return
         for sub in self._snapshot_subscribers():
-            sub.notify_strategy_results()
+            if sub.account_id in account_ids:
+                sub.notify_strategy_results()
 
     def notify_depth_updated(self) -> None:
         """五档盘口修正完成后调用: 通知 SSE 推送 depth_updated, 触发连板梯队刷新。
@@ -456,24 +500,68 @@ class QuoteService:
             sub.notify_depth()
 
     def _broadcast_alerts(self, alerts: list[dict]) -> None:
+        """按事件自带的 ``account_id`` 分组投递 —— 账户标签是**唯一**路由依据。
+
+        没有合法账户标签的事件一律丢弃并记日志 (fail-closed): 丢弃只让一条告警少了
+        收件人, 而"投给所有人"会把 A 的告警显示在 B 的页面上, 后者严重得多。
+        事件里的 account_id 由 MonitorRuleEngine 评估时打上, 调用方不得自行猜测。
+        """
+        by_account = _group_by_account(alerts, "SSE 告警投递")
+        if not by_account:
+            return
         for sub in self._snapshot_subscribers():
-            sub.push_alerts(alerts)
+            chunk = by_account.get(sub.account_id)
+            if chunk:
+                sub.push_alerts(chunk)
 
     def push_alerts(self, alerts: list[dict]) -> None:
+        """推入一批告警事件 (按事件自带的 account_id 路由, 见 _broadcast_alerts)。"""
         self._broadcast_alerts(alerts)
+
+    def push_system_alerts(self, alerts: list[dict]) -> None:
+        """把**市场级/部署级**通知 (情绪周期切换、五档轮询接管等) 发给每个账户。
+
+        这类事件读的是共享行情, 内容与账户无关, 但投递仍必须逐账户打标签: 订阅者
+        只收本账户的事件, 不扇出就等于全站都收不到。账户列表来自注册表, 属低频路径
+        (这两类通知一天至多数次), 不触碰「iter_user_roots 不进热路径」的约束。
+        """
+        from app.services import user_paths
+
+        stamped = [
+            {**ev, "account_id": account_id}
+            for account_id, _root in list(user_paths.iter_user_roots())
+            for ev in alerts
+        ]
+        self._broadcast_alerts(stamped)
 
     def clear_pending_alerts(self) -> None:
         for sub in self._snapshot_subscribers():
             sub.clear_alerts()
 
-    def push_review_event(self, event_json: str) -> None:
-        """广播一条复盘进度事件(JSON 字符串), 唤醒所有 SSE generator。
+    def push_review_event(self, account_id: int, event_json: str) -> None:
+        """把一条复盘进度事件(JSON 字符串) 推给**该账户**的 SSE generator。
 
         事件格式与 recap_market_stream 的产出一致(meta/delta/error/done),
         前端 reviewStore 直接消费。背压在订阅者队列内做 (丢弃最旧)。
+
+        复盘报告是每账户私有数据 (<user_root>/user_data/ai_market_recaps.json),
+        因此进度事件也必须按账户投递 —— 否则 A 的复盘页会显示 B 正在生成的报告。
         """
+        account_id = validate_account_id(account_id)
         for sub in self._snapshot_subscribers():
-            sub.push_review(event_json)
+            if sub.account_id == account_id:
+                sub.push_review(event_json)
+
+    def push_review_event_to_all_accounts(self, event_json: str) -> None:
+        """把同一条复盘进度事件发给**每个账户**。
+
+        专供**共享**复盘流 (定时复盘: 输入只有共享行情, 内容对所有账户一致) ——
+        逐账户复制投递, 保证每个账户只收到打了自己标签的那一份, 路由规则仍只有一条。
+        """
+        from app.services import user_paths
+
+        for account_id, _root in list(user_paths.iter_user_roots()):
+            self.push_review_event(account_id, event_json)
 
     # ================================================================
     # 档位感知间隔限制
@@ -936,12 +1024,15 @@ class QuoteService:
     # ================================================================
 
     def _collect_monitor_index_symbols(self) -> set[str]:
-        """启用中的指数监控规则标的 (asset_type=index & scope=symbols)。"""
+        """启用中的指数监控规则标的 (asset_type=index & scope=symbols)。
+
+        全账户并集: 这只决定"要拉哪些指数实时行情" (共享数据), 不影响告警归属。
+        """
         engine = getattr(self._app_state, "monitor_engine", None) if self._app_state else None
         if not engine:
             return set()
         out: set[str] = set()
-        for _r in list(engine.rules.values()):
+        for _account_id, _r in list(engine.iter_rules()):
             if _r.get("enabled", True) and _r.get("asset_type") == "index" and _r.get("scope") == "symbols":
                 out.update(s for s in _r.get("symbols", []) if s)
         return out
@@ -1215,8 +1306,9 @@ class QuoteService:
                             eval_df = self._inject_volume_delta(eval_df)
                         eval_df = self._inject_intraday_signals(eval_df, engine, "stock")
                         rule_events = engine.evaluate(eval_df, asset_type="stock")
-                        if engine.consume_strategy_result_updates():
-                            self.notify_strategy_results_updated()
+                        updated_accounts = engine.consume_strategy_result_updates()
+                        if updated_accounts:
+                            self.notify_strategy_results_updated(updated_accounts)
                     if engine.has_rule_type("sector"):
                         rule_events += engine.evaluate_sectors(
                             enriched_today if stock_ready else pl.DataFrame(),
@@ -1276,17 +1368,16 @@ class QuoteService:
                             logger.warning("指数监控评估失败 (不影响股票/ETF 告警): %s", e)
                     if rule_events:
                         rule_events = self._format_extension_notifications(rule_events)
-                        # 落盘到 alerts.jsonl
-                        try:
-                            from app.services import alert_store
-                            alert_store.append_many(
-                                self._app_state.repo.store.data_dir, rule_events,
-                            )
-                        except Exception as e:  # noqa: BLE001
-                            logger.warning("告警落盘失败: %s", e)
+                        # 落盘到**各账户自己的** alerts.jsonl。
+                        # 触发记录是每账户私有数据 (<user_root>/user_data/alerts.jsonl),
+                        # 必须按账户分组并显式传 user_root —— 后台线程没有请求上下文,
+                        # 而写进共享文件等于把 A 的触发记录给所有人看。
+                        self._persist_alerts_by_account(rule_events)
                         # 转为 SSE 推送格式 (兼容旧 alert schema)
                         for ev in rule_events:
                             alert = {
+                                # 路由标签: SSE 按它决定投给哪个账户的订阅者
+                                "account_id": ev.get("account_id"),
                                 "source": ev["source"],
                                 "type": ev["type"],
                                 "rule_id": ev.get("rule_id"),
@@ -1368,6 +1459,13 @@ class QuoteService:
                     # 成交/自动跟单下单推送 (V3): 复用监控中心既有管道 —— SSE toast /
                     # 语音 (前端按 source 拼文案) / 系统通知 / alert_store 留痕 /
                     # Webhook。全部静默降级。
+                    #
+                    # 注: 本块仍属**未迁移**的模拟盘域 (上面 _warn_paper_scope_once 已说明:
+                    # 后台线程拿不到账户 → account_ids 恒为空, 这里从不真的执行)。迁移时
+                    # 必须按面板账户扇出并显式传 user_root=: paper 事件的 account_id 是
+                    # **字符串模拟盘账户名**, 不是面板账号主键, 直接喂给
+                    # _broadcast_alerts 会被当作缺标签拒收 (见 _group_by_account),
+                    # 这正是我们要的 fail-closed, 而不是把随机字符串当账户 id 用。
                     if paper_events:
                         self._broadcast_alerts(paper_events)
                         try:
@@ -1382,6 +1480,20 @@ class QuoteService:
 
         except Exception as e:  # noqa: BLE001
             logger.warning("监控评估失败: %s", e)
+
+    def _persist_alerts_by_account(self, rule_events: list[dict]) -> None:
+        """把触发记录按账户分别追加到各自的 alerts.jsonl。
+
+        没有 account_id 的事件不落盘并记日志: 落盘位置本身就是账户边界, 猜一个账户
+        写进去会让另一个账户的触发历史里出现不属于它的记录。
+        """
+        from app.services import alert_store, user_paths
+
+        for account_id, events in _group_by_account(rule_events, "告警落盘").items():
+            try:
+                alert_store.append_many(events, user_root=user_paths.user_root(account_id))
+            except Exception as e:  # noqa: BLE001
+                logger.warning("告警落盘失败 (账户 %s): %s", account_id, e)
 
     def _format_extension_notifications(self, events: list[dict]) -> list[dict]:
         """Apply optional copy formatters after evaluation and before every output channel."""
@@ -1419,41 +1531,54 @@ class QuoteService:
             formatted_events.append(formatted)
         return formatted_events
 
-    def _enrich_alerts_ext(self, alerts: list[dict]) -> None:
-        """就地给告警事件按 symbol 追加行业/概念 ext 字段。
+    @staticmethod
+    def _ext_field_columns(fields: dict) -> list[str]:
+        """ext 字段配置 → 要拉取的列名列表。
 
-        读 preferences.get_monitor_ext_fields() 取字段配置, 用 screener._load_ext_value_maps
-        (带 parquet mtime 缓存) 富化。富化失败静默降级 (告警照常推送, 只是没标签)。
+        配置里 concept/industry 各自可能是新结构 {field, maxTags, hiddenIndices} 或
+        旧字符串格式; 两种都归一化成列名。
+        """
+        parts: list[str] = []
+        for key in ("concept", "industry"):
+            item = fields.get(key)
+            if isinstance(item, dict) and item.get("field"):
+                parts.append(item["field"])
+            elif isinstance(item, str) and item:
+                parts.append(item)  # 兼容旧格式
+        return parts
+
+    def _enrich_alerts_ext(self, alerts: list[dict]) -> None:
+        """就地给告警事件按 symbol 追加行业/概念 ext 字段 —— **按各自账户的字段配置**。
+
+        monitor_ext_fields 是每用户偏好键 (要展示哪几个 ext 字段), 而后台线程没有账户
+        上下文: 一次性读全局配置只会拿到部署默认值 (通常是空) ⇒ 所有账户的告警标签一起
+        消失, 且只有一条"without account context"警告。因此逐账户显式传 user_root 读取。
+        ext 的**值**来自共享 parquet (与账户无关), 按账户分的是"取哪几列"。
+        富化失败静默降级 (告警照常推送, 只是没标签)。
         每条事件新增 {configId}__{fieldName} 键 (与 watchlist/screener 输出约定一致)。
         """
         if not alerts or not self._app_state or self._repo is None:
             return
-        try:
-            from app.services import preferences
-            fields = preferences.get_monitor_ext_fields()
-            # 新结构 {field, maxTags, hiddenIndices}, 后端只需 .field
-            parts = []
-            for key in ("concept", "industry"):
-                item = fields.get(key)
-                if isinstance(item, dict) and item.get("field"):
-                    parts.append(item["field"])
-                elif isinstance(item, str) and item:
-                    parts.append(item)  # 兼容旧格式
-            if not parts:
-                return
-            ext_columns = ",".join(parts)
-            from app.api.screener import _load_ext_value_maps
-            value_maps = _load_ext_value_maps(self._repo, ext_columns)
-            if not value_maps:
-                return
-            for ev in alerts:
-                sym = ev.get("symbol")
-                if not sym:
+        from app.services import preferences, user_paths
+
+        for account_id, events in _group_by_account(alerts, "告警 ext 富化").items():
+            try:
+                fields = preferences.get_monitor_ext_fields(user_paths.user_root(account_id))
+                parts = self._ext_field_columns(fields)
+                if not parts:
                     continue
-                for out_col, vmap in value_maps.items():
-                    ev[out_col] = vmap.get(str(sym))
-        except Exception as e:  # noqa: BLE001
-            logger.debug("告警 ext 富化失败 (不影响推送): %s", e)
+                from app.api.screener import _load_ext_value_maps
+                value_maps = _load_ext_value_maps(self._repo, ",".join(parts))
+                if not value_maps:
+                    continue
+                for ev in events:
+                    sym = ev.get("symbol")
+                    if not sym:
+                        continue
+                    for out_col, vmap in value_maps.items():
+                        ev[out_col] = vmap.get(str(sym))
+            except Exception as e:  # noqa: BLE001
+                logger.debug("告警 ext 富化失败 (账户 %s, 不影响推送): %s", account_id, e)
 
     def _inject_intraday_signals(self, enriched: pl.DataFrame, engine, asset_type: str) -> pl.DataFrame:
         """每分钟为分时信号规则批量获取一次数据并注入临时布尔列。"""
@@ -1646,7 +1771,7 @@ class QuoteService:
             return enriched_today
 
     def _maybe_send_webhook(self, rule_events: list[dict], engine) -> None:
-        """把告警通过 Webhook 推送到外部 IM (由规则 webhook_channels 指定渠道)。
+        """把告警通过 Webhook 推送到外部 IM (按**账户**扇出, 渠道由规则 webhook_channels 指定)。
 
         - 飞书 / 企业微信 / 第三方 Webhook / 邮件均按规则独立选择
         - 仅推送 webhook_channels 非空的规则触发的告警, 且只投递被勾选的渠道
@@ -1655,74 +1780,95 @@ class QuoteService:
 
         注意: 用 rule_events (含 rule_id) 而非重建后的 all_alerts,
         以便反查引擎规则判断是否启用推送。
+
+        账户维度是这段的关键: 推送地址、签名密钥、SMTP 密码都是**每账户**私有配置
+        (<user_root>/user_data/preferences.json 与 secrets.json), 且只应推送本账户规则
+        触发的告警。旧实现一次性读全局配置再遍历全部事件 —— 后果是 A 配的飞书群收到
+        B 的告警, 而 B 没配地址时读到的默认值是空串, 推送静默失效且没有任何报错。
         """
-        try:
-            from app import secrets_store
-            from app.services import email_adapter, preferences, webhook_adapter
+        for account_id, events in _group_by_account(rule_events, "Webhook 推送").items():
+            try:
+                self._webhook_for_account(account_id, events, engine)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "Webhook 提交异常 (账户 %s, 不影响告警主流程): %s", account_id, e,
+                )
 
-            feishu_url = preferences.get_feishu_webhook_url()
-            feishu_secret = preferences.get_feishu_webhook_secret()
-            wecom_url = preferences.get_wecom_webhook_url()
-            custom_url = preferences.get_custom_webhook_url()
-            custom_secret = secrets_store.get_custom_webhook_secret()
-            email_config = preferences.get_email_smtp_config()
-            email_password = secrets_store.get_email_smtp_password()
-            if not any((feishu_url, wecom_url, custom_url, email_adapter.is_configured(email_config))):
-                return
+    def _webhook_for_account(self, account_id: int, rule_events: list[dict], engine) -> None:
+        """把**某一个账户**的告警投递到该账户自己配置的外部渠道。"""
+        from app import secrets_store
+        from app.services import (
+            email_adapter,
+            preferences,
+            user_paths,
+            webhook_adapter,
+        )
 
-            # 反查规则, 过滤出启用推送的事件
-            rules = engine.rules if engine is not None else {}
-            enqueued = 0
-            for ev in rule_events:
-                rule = rules.get(ev.get("rule_id"))
-                # webhook_channels 指定本规则需要投递的外部渠道。
-                # 空列表 = 该规则不推送。仅推送「渠道已选 + 对应地址已配置」的组合。
-                channels = rule.get("webhook_channels") if rule else None
-                if not channels:
-                    continue
-                source = ev.get("source", "")
-                source_label = SOURCE_LABELS.get(source, source or "通知")
-                symbol = ev.get("symbol") or ""
-                name = ev.get("name") or ""
-                message = ev.get("message") or ""
-                title = source_label
-                body = f"{symbol} {name} {message}".strip() if symbol else (message or name)
-                # 补上触发时的现价/涨跌幅, 让推送可执行 (止损到底触发在哪个价位)
-                body = _body_with_quote(body, ev)
-                # 提交到独立线程池, 不阻塞行情轮询线程 (webhook 慢/重试不拖累实时行情+告警)。
-                # 按渠道独立投递: 只投递同时“已勾选 + 已配置”的渠道。
-                # 应用内 alerts.jsonl 记录与 SSE 已在前面完成, 不依赖 webhook 成败,
-                # 失败由 webhook_adapter 记 WARNING(可见)。
-                if feishu_url and "feishu" in channels:
-                    _WEBHOOK_EXECUTOR.submit(webhook_adapter.send_feishu, feishu_url, title, body, feishu_secret)
-                    enqueued += 1
-                if wecom_url and "wecom" in channels:
-                    _WEBHOOK_EXECUTOR.submit(webhook_adapter.send_wecom, wecom_url, title, body)
-                    enqueued += 1
-                if custom_url and "custom" in channels:
-                    _WEBHOOK_EXECUTOR.submit(
-                        webhook_adapter.send_custom,
-                        custom_url,
-                        title,
-                        body,
-                        "monitor_alert",
-                        ev,
-                        custom_secret,
-                    )
-                    enqueued += 1
-                if email_adapter.is_configured(email_config) and "email" in channels:
-                    _WEBHOOK_EXECUTOR.submit(
-                        email_adapter.send_email,
-                        email_config,
-                        email_password,
-                        title,
-                        body,
-                    )
-                    enqueued += 1
-            if enqueued:
-                logger.info("Webhook 已提交 %d 条 (异步投递, 按渠道独立投递, 失败记 WARNING)", enqueued)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("Webhook 提交异常 (不影响告警主流程): %s", e)
+        user_root = user_paths.user_root(account_id)
+        feishu_url = preferences.get_feishu_webhook_url(user_root)
+        feishu_secret = preferences.get_feishu_webhook_secret(user_root)
+        wecom_url = preferences.get_wecom_webhook_url(user_root)
+        custom_url = preferences.get_custom_webhook_url(user_root)
+        custom_secret = secrets_store.get_custom_webhook_secret(user_root)
+        email_config = preferences.get_email_smtp_config(user_root)
+        email_password = secrets_store.get_email_smtp_password(user_root)
+        if not any((feishu_url, wecom_url, custom_url, email_adapter.is_configured(email_config))):
+            return
+
+        # 反查**本账户**规则 (rules_for 而非"全部规则合并"), 过滤出启用推送的事件
+        rules = engine.rules_for(account_id) if engine is not None else {}
+        enqueued = 0
+        for ev in rule_events:
+            rule = rules.get(ev.get("rule_id"))
+            # webhook_channels 指定本规则需要投递的外部渠道。
+            # 空列表 = 该规则不推送。仅推送「渠道已选 + 对应地址已配置」的组合。
+            channels = rule.get("webhook_channels") if rule else None
+            if not channels:
+                continue
+            source = ev.get("source", "")
+            source_label = SOURCE_LABELS.get(source, source or "通知")
+            symbol = ev.get("symbol") or ""
+            name = ev.get("name") or ""
+            message = ev.get("message") or ""
+            title = source_label
+            body = f"{symbol} {name} {message}".strip() if symbol else (message or name)
+            # 补上触发时的现价/涨跌幅, 让推送可执行 (止损到底触发在哪个价位)
+            body = _body_with_quote(body, ev)
+            # 提交到独立线程池, 不阻塞行情轮询线程 (webhook 慢/重试不拖累实时行情+告警)。
+            # 按渠道独立投递: 只投递同时“已勾选 + 已配置”的渠道。
+            # 应用内 alerts.jsonl 记录与 SSE 已在前面完成, 不依赖 webhook 成败,
+            # 失败由 webhook_adapter 记 WARNING(可见)。
+            if feishu_url and "feishu" in channels:
+                _WEBHOOK_EXECUTOR.submit(webhook_adapter.send_feishu, feishu_url, title, body, feishu_secret)
+                enqueued += 1
+            if wecom_url and "wecom" in channels:
+                _WEBHOOK_EXECUTOR.submit(webhook_adapter.send_wecom, wecom_url, title, body)
+                enqueued += 1
+            if custom_url and "custom" in channels:
+                _WEBHOOK_EXECUTOR.submit(
+                    webhook_adapter.send_custom,
+                    custom_url,
+                    title,
+                    body,
+                    "monitor_alert",
+                    ev,
+                    custom_secret,
+                )
+                enqueued += 1
+            if email_adapter.is_configured(email_config) and "email" in channels:
+                _WEBHOOK_EXECUTOR.submit(
+                    email_adapter.send_email,
+                    email_config,
+                    email_password,
+                    title,
+                    body,
+                )
+                enqueued += 1
+        if enqueued:
+            logger.info(
+                "Webhook 已提交 %d 条 (账户 %s, 异步投递, 按渠道独立投递, 失败记 WARNING)",
+                enqueued, account_id,
+            )
 
     def _maybe_send_paper_webhook(self, events: list[dict]) -> None:
         """模拟盘成交 → 已配置的飞书/企业微信/自定义 Webhook (异步投递, 失败静默)。
@@ -1762,41 +1908,44 @@ class QuoteService:
             logger.warning("模拟盘 Webhook 提交异常 (不影响主流程): %s", e)
 
     def _maybe_send_system_notifications(self, all_alerts: list[dict]) -> None:
-        """把告警转发到操作系统通知中心 (由 preferences 开关控制)。
+        """把告警转发到操作系统通知中心 (按**账户**各自的开关)。
 
-        - 开关关闭: 直接返回
+        - 开关关闭: 该账户跳过
         - 开关开启: 逐条发系统通知; 失败静默, 不阻断主流程
         - 去重: 复用 MonitorRuleEngine 的 cooldown, 此处不重复去重
         - 批量策略事件 (symbol="") 聚合为一条通知, 避免刷屏
+
+        开关是每用户偏好键 (system_notify_enabled), 必须显式传该账户的 user_root 读;
+        否则后台线程读到的是部署级默认值 (False), 用户明明开了系统通知却一条都收不到。
         """
-        try:
-            from app.services import preferences
-            from app.services import notify_adapter
+        from app.services import notify_adapter, preferences, user_paths
 
-            if not preferences.get_system_notify_enabled():
-                return
+        for account_id, events in _group_by_account(all_alerts, "系统通知").items():
+            try:
+                user_root = user_paths.user_root(account_id)
+                if not preferences.get_system_notify_enabled(user_root):
+                    continue
+                for ev in events:
+                    # 通知标题: 用 source 分类 (策略/信号/价格/异动)
+                    source = ev.get("source", "")
+                    source_label = SOURCE_LABELS.get(source, source or "通知")
 
-            for ev in all_alerts:
-                # 通知标题: 用 source 分类 (策略/信号/价格/异动)
-                source = ev.get("source", "")
-                source_label = SOURCE_LABELS.get(source, source or "通知")
+                    name = ev.get("name") or ""
+                    symbol = ev.get("symbol") or ""
+                    message = ev.get("message") or ""
 
-                name = ev.get("name") or ""
-                symbol = ev.get("symbol") or ""
-                message = ev.get("message") or ""
+                    # 正文: 优先用现成 message, 拼上 symbol/name 让用户一眼定位
+                    if symbol:
+                        body = f"{symbol} {name} {message}".strip()
+                    else:
+                        body = message or name
+                    # 补上触发时的现价/涨跌幅 (日期提醒无行情, 自然为空)
+                    body = _body_with_quote(body, ev)
 
-                # 正文: 优先用现成 message, 拼上 symbol/name 让用户一眼定位
-                if symbol:
-                    body = f"{symbol} {name} {message}".strip()
-                else:
-                    body = message or name
-                # 补上触发时的现价/涨跌幅 (日期提醒无行情, 自然为空)
-                body = _body_with_quote(body, ev)
-
-                title = f"TickFlow · {source_label}"
-                notify_adapter.notify(title, body)
-        except Exception as e:  # noqa: BLE001
-            logger.debug("系统通知发送异常 (不影响告警主流程): %s", e)
+                    title = f"TickFlow · {source_label}"
+                    notify_adapter.notify(title, body)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("系统通知发送异常 (账户 %s, 不影响告警主流程): %s", account_id, e)
 
     @staticmethod
     def _get_strategy_monitor():

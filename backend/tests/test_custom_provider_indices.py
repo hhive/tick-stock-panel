@@ -100,6 +100,10 @@ def test_custom_provider_monitor_indices_join_fetch(monkeypatch):
             "r3": {"enabled": True, "asset_type": "stock", "scope": "symbols", "symbols": ["600519.SH"]},
         }
 
+        def iter_rules(self):
+            """引擎按账户分家后, 全局只读判断走 iter_rules, 产出 (account_id, rule)。"""
+            return [(1, rule) for rule in self.rules.values()]
+
     service._app_state = SimpleNamespace(monitor_engine=_Engine())
     service._fetch_full_market_quotes()
 

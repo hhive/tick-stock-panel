@@ -42,7 +42,7 @@ class _Repo:
 
 def _run(etf_date: date) -> list[dict]:
     engine = MonitorRuleEngine()
-    engine.set_rules([{
+    engine.set_rules_for(1, [{
         "id": "etf_px", "name": "ETF 价格提醒", "type": "price", "asset_type": "etf",
         "scope": "symbols", "symbols": ["510300.SH"], "logic": "and",
         "conditions": [{"field": "close", "op": ">=", "value": 4.0}],

@@ -56,18 +56,26 @@ class _MonitorEngine:
     def __init__(self) -> None:
         self.invalidations = 0
         self.rules: list[dict] = []
+        self.account_id: int | None = None
 
     def invalidate_strategy_state(self) -> None:
         self.invalidations += 1
 
-    def set_rules(self, rules: list[dict]) -> None:
+    def set_rules_for(self, account_id: int, rules: list[dict]) -> None:
+        # 规则按账户分家: 删策略后的 reload 必须带上是哪个账户
+        self.account_id = account_id
         self.rules = rules
 
 
 def _request(data_dir: Path, engine: StrategyEngine, monitor: _MonitorEngine | None = None):
     repo = SimpleNamespace(store=SimpleNamespace(data_dir=data_dir))
     state = SimpleNamespace(repo=repo, strategy_engine=engine, monitor_engine=monitor)
-    return SimpleNamespace(app=SimpleNamespace(state=state))
+    # request.state.account_id = 面板账号身份 (认证中间件注入); 删策略后按账户
+    # reload 监控规则需要它, 缺了会 403
+    return SimpleNamespace(
+        state=SimpleNamespace(account_id=1),
+        app=SimpleNamespace(state=state),
+    )
 
 
 def test_delete_strategy_is_not_blocked_by_another_broken_file(monkeypatch, tmp_path, user_root):

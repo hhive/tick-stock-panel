@@ -59,7 +59,7 @@ def test_evaluate_index_round_triggers_and_isolates():
     from app.strategy.monitor import MonitorRuleEngine
 
     eng = MonitorRuleEngine()
-    eng.set_rules([_signal_rule("r_idx", "index", "000001.SH"),
+    eng.set_rules_for(1, [_signal_rule("r_idx", "index", "000001.SH"),
                    _signal_rule("r_stock", "stock", "000001.SH")])
     eng.set_name_map({"000001.SH": "上证指数"})
     df = pl.DataFrame({"symbol": ["000001.SH"], "close": [3000.0],
@@ -69,7 +69,7 @@ def test_evaluate_index_round_triggers_and_isolates():
     assert any(e["rule_id"] == "r_idx" for e in events)
     assert all(e["rule_id"] != "r_stock" for e in events)
     assert events[0]["name"] == "上证指数"
-    assert eng.latest_strategy_results() == {}  # 策略结果缓存未被触碰
+    assert eng.latest_strategy_results(1) == {}  # 策略结果缓存未被触碰
 
 
 # ---- 资产类型纠正: 误存为 stock 的指数规则 ----
@@ -176,7 +176,7 @@ def test_evaluate_monitors_stock_round_runs_when_snapshot_ready():
     engine.has_asset_rules.return_value = False
     engine.has_rule_type.return_value = False
     engine.evaluate.return_value = []
-    engine.consume_strategy_result_updates.return_value = False
+    engine.consume_strategy_result_updates.return_value = set()
 
     svc._app_state = MagicMock()
     svc._app_state.monitor_engine = engine

@@ -73,7 +73,7 @@ def _monkey_today(monkeypatch, iso: str):
 def test_date_engine_fires_in_window(monkeypatch):
     _monkey_today(monkeypatch, "2026-08-28")
     eng = MonitorRuleEngine()
-    eng.set_rules([_rule()])
+    eng.set_rules_for(1, [_rule()])
     evs = eng.evaluate_date_rules()
     assert len(evs) == 1
     ev = evs[0]
@@ -90,7 +90,7 @@ def test_date_engine_fires_in_window(monkeypatch):
 def test_date_engine_today_expiry_wording(monkeypatch):
     _monkey_today(monkeypatch, "2026-08-30")
     eng = MonitorRuleEngine()
-    eng.set_rules([_rule(lead_days=0)])
+    eng.set_rules_for(1, [_rule(lead_days=0)])
     evs = eng.evaluate_date_rules()
     assert len(evs) == 1
     assert "今日到期" in evs[0]["message"]
@@ -99,14 +99,14 @@ def test_date_engine_today_expiry_wording(monkeypatch):
 def test_date_engine_skips_outside_window(monkeypatch):
     _monkey_today(monkeypatch, "2026-08-31")  # 过期
     eng = MonitorRuleEngine()
-    eng.set_rules([_rule()])
+    eng.set_rules_for(1, [_rule()])
     assert eng.evaluate_date_rules() == []
 
 
 def test_date_engine_ignores_disabled_and_non_date(monkeypatch):
     _monkey_today(monkeypatch, "2026-08-28")
     eng = MonitorRuleEngine()
-    eng.set_rules([_rule(enabled=False), _rule(id="price1", type="price", conditions=[
+    eng.set_rules_for(1, [_rule(enabled=False), _rule(id="price1", type="price", conditions=[
         {"field": "close", "op": ">=", "value": 100.0},
     ], message="")])
     assert eng.evaluate_date_rules() == []
@@ -115,7 +115,7 @@ def test_date_engine_ignores_disabled_and_non_date(monkeypatch):
 def test_date_engine_once_per_day(monkeypatch):
     _monkey_today(monkeypatch, "2026-08-28")
     eng = MonitorRuleEngine()
-    eng.set_rules([_rule()])
+    eng.set_rules_for(1, [_rule()])
     assert len(eng.evaluate_date_rules()) == 1
     assert eng.evaluate_date_rules() == []          # 同日 cooldown 去重
     # 跨天: 窗口内仍命中 → 再提醒一次
@@ -127,7 +127,7 @@ def test_date_engine_alerts_handler_called(monkeypatch):
     _monkey_today(monkeypatch, "2026-08-28")
     seen: list[dict] = []
     eng = MonitorRuleEngine(alert_handler=seen.append)
-    eng.set_rules([_rule()])
+    eng.set_rules_for(1, [_rule()])
     eng.evaluate_date_rules()
     assert len(seen) == 1 and seen[0]["source"] == "date"
 
@@ -136,7 +136,7 @@ def test_date_not_evaluated_by_quote_evaluate(monkeypatch):
     """date 规则不走 evaluate(df) 主循环, 避免与 date_rule 专用路径双触发。"""
     _monkey_today(monkeypatch, "2026-08-28")
     eng = MonitorRuleEngine()
-    eng.set_rules([_rule()])
+    eng.set_rules_for(1, [_rule()])
     df = pl.DataFrame({"symbol": ["600519.SH"], "close": [1500.0]})
     assert eng.evaluate(df) == []
     assert len(eng.evaluate_date_rules()) == 1

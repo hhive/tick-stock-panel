@@ -30,7 +30,7 @@ def _df(**cols):
 
 
 def _fire(eng, rule, df):
-    eng.set_rules([rule])
+    eng.set_rules_for(1, [rule])
     events = eng.evaluate(df, asset_type="stock", reset_strategy_results=False)
     assert len(events) == 1
     return events[0]["message"]

@@ -30,6 +30,7 @@ from app.strategy.scoring import (
     effective_scoring_directions,
 )
 from app.services.ndjson_heartbeat import with_heartbeat
+from app.api.deps import require_account_id
 
 router = APIRouter(prefix="/api/strategies", tags=["strategies"])
 logger = logging.getLogger(__name__)
@@ -108,6 +109,9 @@ def _cleanup_deleted_strategy(request: Request, strategy_id: str) -> list[str]:
     from app.services import preferences
     from app.strategy import monitor_rules
 
+    # 账户在请求路径上就解析好: 下面的清理块各自 try/except 收警告, 若把
+    # require_account_id 放进 try 里, 403 会被当成一条 warning 吞掉。
+    account_id = require_account_id(request)
     user_root = _user_root(request)
     warnings: list[str] = []
 
@@ -145,7 +149,8 @@ def _cleanup_deleted_strategy(request: Request, strategy_id: str) -> list[str]:
 
         monitor_engine = getattr(request.app.state, "monitor_engine", None)
         if rules_changed and monitor_engine is not None:
-            monitor_engine.set_rules(monitor_rules.load_all())
+            # 只 reload 本账户的规则: 删的是本账户的策略, 别的账户内存态无关
+            monitor_engine.set_rules_for(account_id, monitor_rules.load_all())
     except Exception as e:
         warnings.append(f"关联监控清理失败: {e}")
 

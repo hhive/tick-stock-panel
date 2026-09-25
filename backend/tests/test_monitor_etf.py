@@ -59,7 +59,7 @@ def _etf_df():
 def test_evaluate_asset_type_filters_rules():
     """evaluate(asset_type=etf) 只评估 ETF 规则; 股票规则被过滤。"""
     eng = MonitorRuleEngine()
-    eng.set_rules([_signal_rule("r_etf", "etf", "510300"),
+    eng.set_rules_for(1, [_signal_rule("r_etf", "etf", "510300"),
                    _signal_rule("r_stock", "stock", "510300")])
     df = _etf_df()
 
@@ -73,7 +73,7 @@ def test_evaluate_asset_type_filters_rules():
 
 def test_has_asset_rules():
     eng = MonitorRuleEngine()
-    eng.set_rules([_signal_rule("r_etf", "etf", "510300")])
+    eng.set_rules_for(1, [_signal_rule("r_etf", "etf", "510300")])
     assert eng.has_asset_rules("etf") is True
     assert eng.has_asset_rules("stock") is False
 
@@ -81,7 +81,7 @@ def test_has_asset_rules():
 def test_evaluate_default_asset_type_is_stock():
     """不传 asset_type 时默认只评估股票规则 (向后兼容旧调用)。"""
     eng = MonitorRuleEngine()
-    eng.set_rules([_signal_rule("r_etf", "etf", "510300")])
+    eng.set_rules_for(1, [_signal_rule("r_etf", "etf", "510300")])
     # 默认 asset_type=stock → ETF 规则不评估
     assert eng.evaluate(_etf_df()) == []
 

@@ -202,25 +202,29 @@ def test_cache_invalidated_after_write(user_root):
     assert preferences.load(user_root)["nav_order"] == ["second"]
 
 
-def test_scheduled_review_push_is_broken_until_fanout_lands(caplog):
-    """已知缺陷钉子: 定时复盘推送在 S3 扇出落地前**读不到**每用户配置。
+def test_per_user_getter_without_context_warns_and_returns_default(caplog):
+    """每用户 getter 在**无账户上下文**时必须大声告警并返回默认值。
 
-    这条测试断言的是**缺陷本身**, 不是期望行为 —— 属于特征化测试(characterization
-    test)。它存在的意义有两条:
+    这是 fail-loud 的底线: 拿不到该账户的真值就说出来, 不要静默返回一个看起来
+    合理的默认值 —— 后者会让"推送地址变空串 ⇒ 告警悄悄停止工作"这类失效无从发现。
 
-      ① 把"这个功能现在是坏的"变成可追踪的事实, 而不是没人知道的空洞;
-        实现中有个陷阱: 只要给测试设上账户上下文, getter 就会返回配置,
-         于是测试全绿、而生产后台线程依然拿不到值(它没有 contextvar)。
-         那种"为生产不存在的条件开绿灯"的假绿, 比测试失败更危险。
-      ② S3 修好后本测试会**失败**, 强制有人来更新它并确认功能真的恢复。
+    **一条被证伪的预测, 留档**: 本用例原为特征化测试(characterization test), 断言
+    "定时复盘推送是坏的", 并预期"后台扇出落地后它会失败、从而强制有人回来更新"。
+    实际没有 —— 因为**它断言的层次与修复的层次不同**: 这里测的是 getter 自身的
+    行为(无上下文 ⇒ 默认值 + 告警, 扇出落地后依然如此), 而修复发生在**调用方**
+    (`daily_pipeline._run_scheduled_review` 改为逐账户扇出并显式传 user_root)。
+    调用方那一层由 `tests/test_review_push_mode.py` 的
+    `test_scheduled_review_manual_archives_without_push` /
+    `test_scheduled_review_auto_pushes` 覆盖(断言扇出时把账户根传了下去)。
 
-    刻意不 xfail / skip —— 那会让它悄悄从视野里消失。
+    教训: "修好后这个测试会失败"只在**测试与修复处于同一层**时才成立; 跨层写这种
+    钉子会得到一个永远通过、且叙述逐渐失真的测试。
     """
     preferences._warned_missing_context.clear()
     with caplog.at_level(logging.WARNING):
         mode = preferences.get_review_push_mode()
         channels = preferences.get_review_push_channels()
-    # 后台(APScheduler 线程)没有账户上下文 ⇒ 退化为默认值, 推送不会发生
+    # 无账户上下文 ⇒ 退化为默认值, 且**必须**留下告警
     assert mode == "manual"
     assert channels == []
     assert "without account context" in caplog.text

@@ -93,13 +93,13 @@ def test_validate_accepts_symbols_scope():
 def test_apply_scope_sector_fails_closed():
     """历史遗留 sector 规则在评估时应返回空(绝不退化为全市场)。"""
     df = pl.DataFrame({"symbol": ["600000.SH", "000001.SZ"], "close": [10.0, 20.0]})
-    out = MonitorRuleEngine._apply_scope(df, {"id": "r_old", "scope": "sector"})
+    out = MonitorRuleEngine._apply_scope(df, {"id": "r_old", "scope": "sector"}, 1)
     assert out.is_empty()
 
     # 对照: scope=all 返回全量, symbols 过滤子集
-    assert MonitorRuleEngine._apply_scope(df, {"scope": "all"}).height == 2
+    assert MonitorRuleEngine._apply_scope(df, {"scope": "all"}, 1).height == 2
     picked = MonitorRuleEngine._apply_scope(
-        df, {"scope": "symbols", "symbols": ["600000.SH"]}
+        df, {"scope": "symbols", "symbols": ["600000.SH"]}, 1,
     )
     assert picked.height == 1
 
@@ -112,20 +112,22 @@ def test_ladder_webhook_uses_chinese_title_without_brand(monkeypatch):
             calls.append((fn, args))
 
     monkeypatch.setattr(quote_service, "_WEBHOOK_EXECUTOR", CaptureExecutor())
-    monkeypatch.setattr("app.services.preferences.get_feishu_webhook_url", lambda: "https://open.feishu.cn/open-apis/bot/v2/hook/test")
-    monkeypatch.setattr("app.services.preferences.get_feishu_webhook_secret", lambda: "secret")
-    monkeypatch.setattr("app.services.preferences.get_wecom_webhook_url", lambda: "wecom-key")
-    monkeypatch.setattr("app.services.preferences.get_custom_webhook_url", lambda: "")
-    monkeypatch.setattr("app.services.preferences.get_email_smtp_config", lambda: {})
-    monkeypatch.setattr("app.secrets_store.get_custom_webhook_secret", lambda: "")
-    monkeypatch.setattr("app.secrets_store.get_email_smtp_password", lambda: "")
+    monkeypatch.setattr("app.services.preferences.get_feishu_webhook_url", lambda user_root=None: "https://open.feishu.cn/open-apis/bot/v2/hook/test")
+    monkeypatch.setattr("app.services.preferences.get_feishu_webhook_secret", lambda user_root=None: "secret")
+    monkeypatch.setattr("app.services.preferences.get_wecom_webhook_url", lambda user_root=None: "wecom-key")
+    monkeypatch.setattr("app.services.preferences.get_custom_webhook_url", lambda user_root=None: "")
+    monkeypatch.setattr("app.services.preferences.get_email_smtp_config", lambda user_root=None: {})
+    monkeypatch.setattr("app.secrets_store.get_custom_webhook_secret", lambda user_root=None: "")
+    monkeypatch.setattr("app.secrets_store.get_email_smtp_password", lambda user_root=None: "")
 
     engine = type("Engine", (), {
         "rules": {"r_ladder": {"webhook_channels": ["feishu", "wecom"]}},
+        "rules_for": lambda self, account_id: self.rules,
     })()
     QuoteService._maybe_send_webhook(
         object.__new__(QuoteService),
         [{
+            "account_id": 1,
             "rule_id": "r_ladder",
             "source": "ladder",
             "symbol": "600000.SH",
@@ -153,18 +155,20 @@ def test_ladder_dispatches_custom_webhook_and_email(monkeypatch):
         "to_addresses": ["alerts@example.com"],
     }
     monkeypatch.setattr(quote_service, "_WEBHOOK_EXECUTOR", CaptureExecutor())
-    monkeypatch.setattr("app.services.preferences.get_feishu_webhook_url", lambda: "")
-    monkeypatch.setattr("app.services.preferences.get_feishu_webhook_secret", lambda: "")
-    monkeypatch.setattr("app.services.preferences.get_wecom_webhook_url", lambda: "")
-    monkeypatch.setattr("app.services.preferences.get_custom_webhook_url", lambda: "https://example.com/hook")
-    monkeypatch.setattr("app.services.preferences.get_email_smtp_config", lambda: email_config)
-    monkeypatch.setattr("app.secrets_store.get_custom_webhook_secret", lambda: "hook-secret")
-    monkeypatch.setattr("app.secrets_store.get_email_smtp_password", lambda: "smtp-password")
+    monkeypatch.setattr("app.services.preferences.get_feishu_webhook_url", lambda user_root=None: "")
+    monkeypatch.setattr("app.services.preferences.get_feishu_webhook_secret", lambda user_root=None: "")
+    monkeypatch.setattr("app.services.preferences.get_wecom_webhook_url", lambda user_root=None: "")
+    monkeypatch.setattr("app.services.preferences.get_custom_webhook_url", lambda user_root=None: "https://example.com/hook")
+    monkeypatch.setattr("app.services.preferences.get_email_smtp_config", lambda user_root=None: email_config)
+    monkeypatch.setattr("app.secrets_store.get_custom_webhook_secret", lambda user_root=None: "hook-secret")
+    monkeypatch.setattr("app.secrets_store.get_email_smtp_password", lambda user_root=None: "smtp-password")
 
     engine = type("Engine", (), {
         "rules": {"r_ladder": {"webhook_channels": ["custom", "email"]}},
+        "rules_for": lambda self, account_id: self.rules,
     })()
     event = {
+        "account_id": 1,
         "rule_id": "r_ladder",
         "source": "ladder",
         "symbol": "600000.SH",
@@ -180,10 +184,10 @@ def test_ladder_dispatches_custom_webhook_and_email(monkeypatch):
 
 def test_review_webhooks_use_title_without_brand(monkeypatch):
     calls = []
-    monkeypatch.setattr("app.services.preferences.get_review_push_channels", lambda: ["feishu", "wecom"])
-    monkeypatch.setattr("app.services.preferences.get_feishu_webhook_url", lambda: "feishu-url")
-    monkeypatch.setattr("app.services.preferences.get_feishu_webhook_secret", lambda: "secret")
-    monkeypatch.setattr("app.services.preferences.get_wecom_webhook_url", lambda: "wecom-url")
+    monkeypatch.setattr("app.services.preferences.get_review_push_channels", lambda user_root=None: ["feishu", "wecom"])
+    monkeypatch.setattr("app.services.preferences.get_feishu_webhook_url", lambda user_root=None: "feishu-url")
+    monkeypatch.setattr("app.services.preferences.get_feishu_webhook_secret", lambda user_root=None: "secret")
+    monkeypatch.setattr("app.services.preferences.get_wecom_webhook_url", lambda user_root=None: "wecom-url")
     monkeypatch.setattr(
         "app.services.webhook_adapter.send_feishu_card",
         lambda *args: calls.append(("feishu", args)) or True,
@@ -207,11 +211,11 @@ def test_review_pushes_custom_webhook_and_email(monkeypatch):
         "from_address": "bot@example.com",
         "to_addresses": ["alerts@example.com"],
     }
-    monkeypatch.setattr("app.services.preferences.get_review_push_channels", lambda: ["custom", "email"])
-    monkeypatch.setattr("app.services.preferences.get_custom_webhook_url", lambda: "https://example.com/hook")
-    monkeypatch.setattr("app.services.preferences.get_email_smtp_config", lambda: email_config)
-    monkeypatch.setattr("app.secrets_store.get_custom_webhook_secret", lambda: "hook-secret")
-    monkeypatch.setattr("app.secrets_store.get_email_smtp_password", lambda: "smtp-password")
+    monkeypatch.setattr("app.services.preferences.get_review_push_channels", lambda user_root=None: ["custom", "email"])
+    monkeypatch.setattr("app.services.preferences.get_custom_webhook_url", lambda user_root=None: "https://example.com/hook")
+    monkeypatch.setattr("app.services.preferences.get_email_smtp_config", lambda user_root=None: email_config)
+    monkeypatch.setattr("app.secrets_store.get_custom_webhook_secret", lambda user_root=None: "hook-secret")
+    monkeypatch.setattr("app.secrets_store.get_email_smtp_password", lambda user_root=None: "smtp-password")
     monkeypatch.setattr(
         "app.services.webhook_adapter.send_custom",
         lambda *args: calls.append(("custom", args)) or True,

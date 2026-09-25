@@ -601,7 +601,9 @@ class DepthService:
             "message": msg,
         }
         try:
-            qs.push_alerts([alert])
+            # 系统级通知 (五档轮询间隔被接管, 与账户无关, 所有人都在同一条轮询线程上):
+            # 逐账户复制投递 —— 订阅者只收本账户的事件, 不扇出等于全站都收不到。
+            qs.push_system_alerts([alert])
         except Exception as e:  # noqa: BLE001
             logger.debug("depth 接管通知推送失败: %s", e)
 

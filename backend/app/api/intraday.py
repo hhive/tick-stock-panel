@@ -16,6 +16,8 @@ import time
 from fastapi import APIRouter, Query, Request
 from sse_starlette.sse import EventSourceResponse
 
+from app.api.deps import require_account_id
+
 router = APIRouter(prefix="/api/intraday", tags=["quotes"])
 
 
@@ -123,10 +125,14 @@ async def quote_stream(request: Request):
     - 内置 ping 心跳，保持连接活跃
 
     每个连接注册一个独立订阅者 (QuoteSubscriber: 独立事件 + 独立队列),
-    事件由 QuoteService 广播 — 多客户端 (多标签页/设备) 各自收到全量事件。
-    此前四通道共用服务级 Event + pop 取走语义, 告警只会被先醒的连接消费。
+    告警与复盘事件按**该连接的账户**投递 —— 订阅者带上账户, 才不会收到别人的告警。
+    账户取自认证中间件注入的请求身份 (require_account_id), **绝不**来自客户端参数:
+    接受客户端传的 account_id 等于让任何登录用户读别人的告警。
+    行情/五档这类共享数据的刷新信号仍广播给所有连接。
     """
     qs = _get_quote_service(request)
+    # 在进入 generator 之前解析: 无账户身份要当场回 403, 而不是连接建立后在流里断
+    account_id = require_account_id(request)
 
     async def event_generator():
         if qs is None:
@@ -134,7 +140,7 @@ async def quote_stream(request: Request):
             while True:
                 await asyncio.sleep(30)
 
-        sub = qs.subscribe()
+        sub = qs.subscribe(account_id)
         try:
             while True:
                 # 等待任一通道有新信号 (5s 超时保持循环, 便于断线时尽快退出)

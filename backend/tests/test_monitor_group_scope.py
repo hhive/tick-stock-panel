@@ -25,11 +25,17 @@ def _user_ctx(tmp_path, monkeypatch):
     真实请求由认证中间件注入 contextvar, 这里手工注入同一路; 没有它存储会
     fail-closed 而不是回退到共享目录。
     """
-    from app.services import preferences
+    from app.services import preferences, user_paths
 
     monkeypatch.setattr(settings, "data_dir", tmp_path)
-    token = preferences.set_current_user_root(tmp_path)
-    yield tmp_path
+    # 账户根 = <data_dir>/users/1, 与生产布局一致: 引擎在后台按 account_id **自行**
+    # 解析账户根 (user_paths.user_root), 只有把测试的 contextvar 也指到同一个根,
+    # "请求视角"与"引擎视角"才指向同一份数据。指到 tmp_path 本身会让引擎去读
+    # tmp_path/users/1 (空) 而测试写的是 tmp_path —— 那是布局不一致的假失败。
+    account_root = user_paths.user_root(1)
+    account_root.mkdir(parents=True, exist_ok=True)
+    token = preferences.set_current_user_root(account_root)
+    yield account_root
     preferences.reset_current_user_root(token)
 
 
@@ -93,7 +99,7 @@ def test_engine_group_scope_dynamic_members(monkeypatch, tmp_path):
     watchlist.add("000001.SZ", group_id=gid)
 
     eng = MonitorRuleEngine()
-    eng.set_rules([_group_rule(group_id=gid)])
+    eng.set_rules_for(1, [_group_rule(group_id=gid)])
     df = _stock_df()
 
     events = eng.evaluate(df)
@@ -116,7 +122,7 @@ def test_engine_group_scope_missing_group_fail_closed(monkeypatch, tmp_path):
     watchlist.create_group("核心池")  # 让分组文件存在, 但规则绑定的 id 不在其中
 
     eng = MonitorRuleEngine()
-    eng.set_rules([_group_rule(group_id="ghost")])
+    eng.set_rules_for(1, [_group_rule(group_id="ghost")])
     assert eng.evaluate(_stock_df()) == []
 
 
@@ -125,7 +131,7 @@ def test_engine_group_scope_empty_group(monkeypatch, tmp_path):
     _, group = watchlist.create_group("空组")
 
     eng = MonitorRuleEngine()
-    eng.set_rules([_group_rule(group_id=group["id"])])
+    eng.set_rules_for(1, [_group_rule(group_id=group["id"])])
     assert eng.evaluate(_stock_df()) == []
 
 
@@ -143,7 +149,7 @@ def test_abnormal_group_scope_filtering(monkeypatch, tmp_path):
         }
 
     eng = MonitorRuleEngine()
-    eng.set_rules([_group_rule(
+    eng.set_rules_for(1, [_group_rule(
         rid="r_ab", group_id=gid, type="abnormal",
         scope="watchlist_group", threshold_pct=70, direction="both",
         conditions=[], symbols=[],

@@ -16,12 +16,15 @@ import logging
 import math
 import threading
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import polars as pl
 
 from app.market_time import cn_today
+from app.services import user_paths
+from app.services.user_paths import validate_account_id
 from app.strategy import config as _strategy_config
 from app.strategy.custom_signals import _OP_BUILDERS  # type: ignore  # 复用运算符构造器
 from app.strategy.custom_signals import signal_names as _custom_signal_names
@@ -236,26 +239,40 @@ class StrategyMonitorService:
 _SIGNAL_PREFIXES = ("signal_", "csg_")
 
 
-# ── 自选分组作用域: group_id → 成员集合解析 (进程内缓存) ────
+# ── 自选分组作用域: (账户, group_id) → 成员集合解析 (进程内缓存) ────
+# 缓存**按账户分家**: 自选分组是每账户私有数据 (都在 <user_root>/user_data 下),
+# 用全局修订号 + 单份快照做键会让**第一个被评估的账户把自己的分组钉死给所有人**
+# —— 之后每个账户的 watchlist_group 规则都拿别人的成员集评估。
 # 缓存按 watchlist 数据版本号失效: 版本不变时零磁盘 IO; 自选页任何增删
 # 分组/成员的操作都会 bump 版本号, 下一轮评估立即拿到新成员 (无需等 TTL)。
+# 注: watchlist.revision() 是**进程级**计数 (任何账户写入都 bump), 因此这里只会
+# 多失效、不会漏失效 —— 多失效的代价只是重读一次本账户文件, 不跨账户。
 _group_cache_lock = threading.Lock()
-_group_cache: dict[str, Any] = {}
-# 已告警过的「分组已删除」(rule_id, group_id), 防止每轮评估刷日志
-_warned_missing_groups: set[tuple[str, str]] = set()
+_group_cache: dict[int, dict[str, Any]] = {}  # account_id → {"_rev": int, "groups": {...}}
+# 已告警过的「分组已删除」(account_id, rule_id, group_id), 防止每轮评估刷日志
+_warned_missing_groups: set[tuple[int, str, str]] = set()
 
 
-def _watchlist_groups_snapshot() -> dict[str, frozenset[str]]:
-    """返回 {group_id: 成员symbol集}。读前后版本一致才写缓存, 避免缓存住写竞态下的旧数据。"""
-    from app.services import watchlist
+def _watchlist_groups_snapshot(account_id: int) -> dict[str, frozenset[str]]:
+    """返回**该账户**的 {group_id: 成员symbol集}。
 
+    读前后版本一致才写缓存, 避免缓存住写竞态下的旧数据。账户根必须显式传给
+    watchlist 的每个读函数: 本函数跑在行情轮询线程, 没有请求上下文, 走 contextvar
+    会抛 MissingUserContextError (旧实现在这里 fail-closed 跳过, 于是
+    watchlist_group 规则在后台永不评估)。
+    """
+    from app.services import user_paths, watchlist
+
+    user_root = user_paths.user_root(account_id)
     rev_before = watchlist.revision()
     with _group_cache_lock:
-        cached = _group_cache.get("groups")
-        if cached is not None and _group_cache.get("_rev") == rev_before:
-            return cached
-    groups: dict[str, set[str]] = {g["id"]: set() for g in watchlist.list_groups()}
-    for row in watchlist.list_symbols():
+        cached = _group_cache.get(account_id)
+        if cached is not None and cached.get("_rev") == rev_before:
+            return cached["groups"]
+    groups: dict[str, set[str]] = {
+        g["id"]: set() for g in watchlist.list_groups(user_root=user_root)
+    }
+    for row in watchlist.list_symbols(user_root=user_root):
         for gid in row.get("group_ids") or []:
             members = groups.get(gid)
             if members is not None:
@@ -263,27 +280,30 @@ def _watchlist_groups_snapshot() -> dict[str, frozenset[str]]:
     frozen = {gid: frozenset(syms) for gid, syms in groups.items()}
     if watchlist.revision() == rev_before:
         with _group_cache_lock:
-            _group_cache["_rev"] = rev_before
-            _group_cache["groups"] = frozen
+            _group_cache[account_id] = {"_rev": rev_before, "groups": frozen}
     return frozen
 
 
-def _group_members_or_none(rule: dict) -> frozenset[str] | None:
-    """解析规则绑定的分组成员; 分组已删除返回 None, 解析异常返回 None 并记日志。"""
+def _group_members_or_none(rule: dict, account_id: int) -> frozenset[str] | None:
+    """解析规则绑定的**本账户**分组成员; 分组已删除返回 None, 解析异常返回 None 并记日志。"""
     group_id = str(rule.get("group_id") or "")
     try:
-        groups = _watchlist_groups_snapshot()
+        groups = _watchlist_groups_snapshot(account_id)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("自选分组数据读取失败, 规则 %s 本轮跳过: %s", rule.get("id"), exc)
+        logger.warning(
+            "自选分组数据读取失败, 账户 %s 规则 %s 本轮跳过: %s",
+            account_id, rule.get("id"), exc,
+        )
         return None
     members = groups.get(group_id)
     if members is None:
-        key = (str(rule.get("id") or ""), group_id)
+        key = (account_id, str(rule.get("id") or ""), group_id)
         if key not in _warned_missing_groups:
             _warned_missing_groups.add(key)
             logger.warning(
-                "监控规则 %s 绑定的自选分组 %s 已删除, 本轮跳过 (fail-closed, 恢复分组后自动生效)",
-                rule.get("id"), group_id,
+                "监控规则 %s (账户 %s) 绑定的自选分组 %s 已删除, 本轮跳过 "
+                "(fail-closed, 恢复分组后自动生效)",
+                rule.get("id"), account_id, group_id,
             )
     return members
 
@@ -329,27 +349,38 @@ class MonitorRuleEngine:
       - 支持 scope (symbols/all/sector) 过滤作用域
       - 支持 conditions + logic (AND/OR) 任意组合
       - ★ cooldown 去重: 同一 (rule_id, symbol, event_type) 在冷却期内不重复触发
+      - ★ **按账户分家**: 规则与全部派生状态都以 panel account_id (正整数主键) 为
+        第一维。规则 id 可由策略 id 派生 (monitor_rules.strategy_rule_id), 两个账户
+        建同名策略会得到同一个 rule_id —— 扁平表会让它们互相覆盖, 且 A 的冷却会
+        吞掉 B 的告警。因此这里不做「扁平表 + 归属映射」, 而是直接嵌套分家:
+        ``self._rules[account_id][rule_id]``, 状态映射的键一律以 account_id 打头。
+
+    后台线程没有请求上下文, 所有评估入口**都**显式带 account_id 参数 (不是从规则
+    dict 里读、也不是 contextvar): 调用方少传一个参数会直接 TypeError, 不会静默
+    落到某个"默认账户"上。
     """
 
     def __init__(self, alert_handler: Callable[[dict], None] | None = None):
         self._alert_handler = alert_handler
-        self._rules: dict[str, dict] = {}  # rule_id → rule
-        # (rule_id, symbol, event_type) → 上次触发时间戳(秒)。用于 cooldown 去重。
-        self._last_fire: dict[tuple[str, str, str], float] = {}
+        # account_id → {rule_id: rule}
+        self._rules: dict[int, dict[str, dict]] = {}
+        # (account_id, rule_id, symbol, event_type) → 上次触发时间戳(秒)。cooldown 去重。
+        self._last_fire: dict[tuple[int, str, str, str], float] = {}
         # date 规则每个交易日只在首个轮询评估一次; 规则集变更时失效重评
         self._date_eval_day: str | None = None
         self._date_eval_rules_version = -1
-        self._rules_version = 0  # set/add/remove/clear 递增, 供 date 缓存失效
+        self._rules_version = 0  # set/remove/clear 递增, 供 date 缓存失效
         self._strategy_engine = None  # 延迟注入, type=strategy 规则用它跑选股
         # symbol → 股票名 (enriched DataFrame 已 drop name 列, 触发时从此映射回填)
         self._name_map: dict[str, str] = {}
-        # 策略选股池状态: (rule_id, strategy_id, asset_type) → 上期选股符号集合
-        self._strategy_pools: dict[tuple[str, str, str], set[str]] = {}
-        # 策略信号状态: (rule_id, strategy_id, asset_type, event_type) → (K线日期, 命中集合)
-        self._strategy_signal_state: dict[tuple[str, str, str, str], tuple[str, set[str]]] = {}
+        # 策略选股池状态: (account_id, rule_id, strategy_id, asset_type) → 上期选股符号集合
+        self._strategy_pools: dict[tuple[int, str, str, str], set[str]] = {}
+        # 策略信号状态:
+        # (account_id, rule_id, strategy_id, asset_type, event_type) → (K线日期, 命中集合)
+        self._strategy_signal_state: dict[tuple[int, str, str, str, str], tuple[str, set[str]]] = {}
         # 同一根 K 线的信号即使盘中回落后再次命中也只通知一次。
-        self._strategy_signal_seen: dict[tuple[str, str, str, str, str], str] = {}
-        # 数据目录 (用于加载策略 overrides)
+        self._strategy_signal_seen: dict[tuple[int, str, str, str, str, str], str] = {}
+        # 数据目录 (用于加载自定义信号命名; 策略覆盖配置走各账户自己的 user_root)
         self._data_dir = None
         # 历史窗口加载器: (target_date, lookback_days) → 多日 enriched DataFrame。
         # 用于声明 filter_history 的策略 (如反包), 实时监控时拼历史窗口 + 今日行情跑选股。
@@ -357,29 +388,37 @@ class MonitorRuleEngine:
         self._history_loader: Callable[[_dt.date, int], "pl.DataFrame"] | None = None
         # ETF 版历史窗口加载器 (asset_type=etf 的规则用)。为 None 时 ETF filter_history 策略跳过。
         self._history_loader_etf: Callable[[_dt.date, int], "pl.DataFrame"] | None = None
-        self._active_matrix_snapshots: dict[str, Any] = {}
-        # 本轮 evaluate() 产出的策略选股结果: strategy_id → {rows, total, as_of}
-        # 供策略页实时回显复用 (/api/screener/cached 端点直接读取, 避免重跑)。
+        # (account_id, asset_type) → 本轮实时矩阵快照。矩阵策略的 overrides 来自各账户
+        # 自己的策略覆盖配置, 因此快照也必须按账户分家 (否则 A 的参数会喂给 B 的规则)。
+        self._active_matrix_snapshots: dict[tuple[int, str], Any] = {}
+        # 本轮 evaluate() 产出的策略选股结果: account_id → {strategy_id: {rows, total, as_of}}
+        # 供策略页实时回显复用 (/api/screener/cached 端点按**本账户**读取, 避免重跑)。
         # 注意: 始终是「完整」的 dict —— evaluate 重算时先写到 _building_strategy_results,
         # 算完后整体替换此属性, 保证 /cached 并发读取永远拿到完整结果, 不会读到空中间态。
-        self._latest_strategy_results: dict[str, dict] = {}
+        self._latest_strategy_results: dict[int, dict[str, dict]] = {}
         # 本轮重算的临时容器 (_match_strategy 写入它); reset 轮开始时初始化为空 dict,
         # evaluate 结束后一次性替换 _latest_strategy_results。
-        self._building_strategy_results: dict[str, dict] = {}
-        # 本轮成功写入股票策略实时结果的策略 ID, 供 QuoteService 在计算完成后精确通知策略页。
-        self._latest_strategy_result_ids: set[str] = set()
+        self._building_strategy_results: dict[int, dict[str, dict]] = {}
+        # 本轮成功写入股票策略实时结果的 (account_id → 策略 ID 集合),
+        # 供 QuoteService 在计算完成后**只通知变化账户**的策略页。
+        self._latest_strategy_result_ids: dict[int, set[str]] = {}
         self._sector_monitor_service = None
-        self._sector_condition_state: dict[tuple[str, str], bool] = {}
-        # abnormal 规则边缘触发状态: (rule_id, symbol) → 上一轮是否已达阈值。
+        # sector 规则边缘状态: (account_id, rule_id, target_key) → 上轮是否已达标
+        self._sector_condition_state: dict[tuple[int, str, str], bool] = {}
+        # abnormal 规则边缘触发状态: (account_id, rule_id, symbol) → 上一轮是否已达阈值。
         # 只在 False → True 跳变时告警 (首轮观测不触发, 防止新建规则瞬间刷屏)。
-        self._abnormal_condition_state: dict[tuple[str, str], bool] = {}
+        self._abnormal_condition_state: dict[tuple[int, str, str], bool] = {}
 
     def set_strategy_engine(self, engine) -> None:
         """注入 StrategyEngine, type=strategy 规则据此跑选股。"""
         self._strategy_engine = engine
 
     def set_data_dir(self, data_dir) -> None:
-        """注入数据目录, 用于加载策略的用户覆盖配置。"""
+        """注入**共享**数据目录 (仅用于自定义信号命名等与账户无关的读取)。
+
+        注意: 策略的用户覆盖配置是每账户私有的, 早已**不**从这里读 —— 评估时按
+        规则的 account_id 解析 ``<user_root>/user_data/strategy_overrides/``。
+        """
         self._data_dir = data_dir
 
     def _signal_label(self, field: str) -> str:
@@ -398,7 +437,12 @@ class MonitorRuleEngine:
         self._sector_monitor_service = service
 
     def invalidate_strategy_state(self) -> None:
-        """策略注册表变更后清除选股池、结果和矩阵快照。"""
+        """策略注册表变更后清除选股池、结果和矩阵快照。
+
+        刻意**清全部账户**: 策略注册表 (源码/参数) 是进程级共享的, 改一条策略会让
+        所有账户基于它算出的结果过期。多清只是让下一轮重算 (这些全是纯缓存, 重算
+        即恢复), 少清则会让某个账户的页面继续显示旧口径的结果且没有任何提示。
+        """
         self._strategy_pools.clear()
         self._strategy_signal_state.clear()
         self._strategy_signal_seen.clear()
@@ -461,123 +505,146 @@ class MonitorRuleEngine:
             rule.get("lead_days"),
         )
 
-    def set_rules(self, rules: list[dict]) -> None:
-        """批量设置规则 (覆盖)。用于启动时 reload。
+    def set_rules_for(self, account_id: int, rules: list[dict]) -> None:
+        """批量设置**该账户**的规则 (覆盖该账户原有规则, 其它账户不受影响)。
 
-        先构建完整 dict 再原子替换 self._rules, 避免评估线程 (行情轮询)
-        读到装载了一半的规则表。
+        启动/全量 reload 由调用方按 ``user_paths.iter_user_roots()`` 逐账户调用;
+        请求路径下的单账户增删改由 ``app.api.monitor_rules._sync_engine`` 调用。
+
+        先构建完整 dict 再原子替换 ``self._rules[account_id]``, 避免评估线程 (行情轮询)
+        读到装载了一半的规则表。account_id 走 user_paths 的统一校验: 非法 id 当场抛,
+        不会在内存里留下一份"谁都取不到"的规则 —— 那种规则照样会被评估并触发告警。
         """
+        account_id = validate_account_id(account_id)
         new_rules: dict[str, dict] = {}
         for r in rules:
             if r.get("enabled") is not False:
                 new_rules[r["id"]] = r
+        previous = self._rules.get(account_id) or {}
         changed_ids = {
             rule_id
             for rule_id, rule in new_rules.items()
-            if rule_id in self._rules
-            and self._rule_state_signature(self._rules[rule_id])
+            if rule_id in previous
+            and self._rule_state_signature(previous[rule_id])
             != self._rule_state_signature(rule)
         }
-        self._rules = new_rules
+        self._rules[account_id] = new_rules
         active_ids = set(new_rules) - changed_ids
-        self._last_fire = {
-            key: value for key, value in list(self._last_fire.items()) if key[0] in active_ids
-        }
-        self._strategy_pools = {
-            key: value for key, value in list(self._strategy_pools.items()) if key[0] in active_ids
-        }
+        self._prune_state(account_id, active_ids)
+        logger.info("MonitorRuleEngine: 账户 %s 装载 %d 条规则", account_id, len(new_rules))
+        self._rules_version += 1
+
+    def _prune_state(self, account_id: int, active_ids: set[str]) -> None:
+        """丢弃**该账户**上不在 active_ids 的派生状态 (已删除或参数已变的规则)。
+
+        全部状态映射的键一律以 ``(account_id, rule_id, …)`` 开头 —— 这就是"账户是
+        第一维"的落点: 清理只碰本账户, 别的账户即使撞上同名 rule_id, 状态也原样保留。
+        """
+        def keep(key: tuple) -> bool:
+            return not (key[0] == account_id and key[1] not in active_ids)
+
+        self._last_fire = {k: v for k, v in list(self._last_fire.items()) if keep(k)}
+        self._strategy_pools = {k: v for k, v in list(self._strategy_pools.items()) if keep(k)}
         self._strategy_signal_state = {
-            key: value
-            for key, value in list(self._strategy_signal_state.items())
-            if key[0] in active_ids
+            k: v for k, v in list(self._strategy_signal_state.items()) if keep(k)
         }
         self._strategy_signal_seen = {
-            key: value
-            for key, value in list(self._strategy_signal_seen.items())
-            if key[0] in active_ids
+            k: v for k, v in list(self._strategy_signal_seen.items()) if keep(k)
         }
         self._sector_condition_state = {
-            key: value
-            for key, value in list(self._sector_condition_state.items())
-            if key[0] in active_ids
+            k: v for k, v in list(self._sector_condition_state.items()) if keep(k)
         }
         self._abnormal_condition_state = {
-            key: value
-            for key, value in list(self._abnormal_condition_state.items())
-            if key[0] in active_ids
+            k: v for k, v in list(self._abnormal_condition_state.items()) if keep(k)
         }
-        logger.info("MonitorRuleEngine: 装载 %d 条规则", len(self._rules))
-        self._rules_version += 1
 
-    def add_rule(self, rule: dict) -> None:
-        if rule.get("enabled") is not False:
-            self._rules[rule["id"]] = rule
-        else:
-            self._rules.pop(rule["id"], None)
-        self._rules_version += 1
-
-    def remove_rule(self, rule_id: str) -> None:
-        self._rules.pop(rule_id, None)
-        self._last_fire = {k: v for k, v in list(self._last_fire.items()) if k[0] != rule_id}
-        self._strategy_pools = {
-            k: v for k, v in list(self._strategy_pools.items()) if k[0] != rule_id
-        }
-        self._strategy_signal_state = {
-            k: v for k, v in list(self._strategy_signal_state.items()) if k[0] != rule_id
-        }
-        self._strategy_signal_seen = {
-            k: v for k, v in list(self._strategy_signal_seen.items()) if k[0] != rule_id
-        }
-        self._sector_condition_state = {
-            k: v for k, v in self._sector_condition_state.items() if k[0] != rule_id
-        }
+    def remove_rule(self, account_id: int, rule_id: str) -> None:
+        """移除**该账户**的一条规则及其派生状态 (只影响本账户)。"""
+        account_id = validate_account_id(account_id)
+        remaining = self._rules.get(account_id) or {}
+        remaining.pop(rule_id, None)
+        self._prune_state(account_id, set(remaining))
         self._rules_version += 1
 
     def clear(self) -> None:
+        """清空**全部账户**的规则与派生状态 (进程级重置)。
+
+        单账户清空用 ``set_rules_for(account_id, [])``: 本方法是"整个引擎归零",
+        没有账户维度可言, 因此刻意保持无参。
+        """
         self._rules.clear()
         self._last_fire.clear()
         self._strategy_pools.clear()
         self._strategy_signal_state.clear()
         self._strategy_signal_seen.clear()
         self._sector_condition_state.clear()
+        self._abnormal_condition_state.clear()
+        self._latest_strategy_results.clear()
+        self._building_strategy_results.clear()
+        self._latest_strategy_result_ids.clear()
+        self._active_matrix_snapshots.clear()
         self._rules_version += 1
 
+    def iter_rules(self) -> Iterator[tuple[int, dict]]:
+        """遍历全部账户的 ``(account_id, rule)``。
+
+        供"是否需要为某类规则准备数据"这类全局只读判断使用。刻意**不**提供
+        "合并成扁平 dict[rule_id, rule]"的口子: 两个账户的同名策略会得到同一个
+        rule_id, 合并即互相覆盖 (这正是本次要修的缺陷)。
+        """
+        for account_id, rules in list(self._rules.items()):
+            for rule in list(rules.values()):
+                yield account_id, rule
+
+    def rules_for(self, account_id: int) -> dict[str, dict]:
+        """返回**该账户**的规则副本 ``{rule_id: rule}``。"""
+        return dict(self._rules.get(validate_account_id(account_id)) or {})
+
     @property
-    def rules(self) -> dict[str, dict]:
-        return dict(self._rules)
+    def account_ids(self) -> set[int]:
+        """当前内存中持有规则的账户 id 集合。"""
+        return set(self._rules)
 
     @property
     def rule_count(self) -> int:
-        return len(self._rules)
+        """全部账户的规则总数。"""
+        return sum(len(rules) for rules in self._rules.values())
 
-    def latest_strategy_results(self) -> dict[str, dict]:
-        """返回本轮 evaluate() 产出的策略选股结果 (strategy_id → {rows, total, as_of})。
+    def latest_strategy_results(self, account_id: int) -> dict[str, dict]:
+        """返回**该账户**本轮 evaluate() 产出的策略选股结果
+        (strategy_id → {rows, total, as_of})。
 
-        供策略页实时回显复用: /api/screener/cached 端点直接读取此内存结果,
-        避免对被监控的策略重跑第二遍。无 type=strategy 规则时返回空 dict。
+        供策略页实时回显复用: /api/screener/cached 端点按本账户读取此内存结果,
+        避免对被监控的策略重跑第二遍。该账户无 type=strategy 规则时返回空 dict。
+        必须传 account_id —— 合并所有账户会让 A 的策略页显示 B 的选股结果。
         """
-        return self._latest_strategy_results
+        return self._latest_strategy_results.get(validate_account_id(account_id)) or {}
 
-    def consume_strategy_result_updates(self) -> bool:
-        """返回并清除本轮成功写入的股票策略实时结果标记。"""
-        updated = bool(self._latest_strategy_result_ids)
+    def consume_strategy_result_updates(self) -> set[int]:
+        """返回并清除本轮成功写入股票策略实时结果的**账户集合**。
+
+        返回账户维度而非布尔值: 通知 SSE 时只唤醒真正有结果变化的账户, A 的策略重算
+        不去刷新 B 的页面 (B 的 /cached 读的是 B 自己的结果, 唤醒纯属噪声)。
+        """
+        updated = {aid for aid, sids in self._latest_strategy_result_ids.items() if sids}
         self._latest_strategy_result_ids.clear()
         return updated
 
     def has_rule_type(self, rtype: str) -> bool:
         """是否存在指定类型的 (已启用) 规则。供 quote_service 判断是否需要注入特殊数据。"""
-        if not self._rules:
-            return False
-        # list() 快照: API 线程可能并发增删规则, 直接迭代 dict 会抛 RuntimeError
         return any(
             r.get("enabled", True) and r.get("type") == rtype
-            for r in list(self._rules.values())
+            for _account_id, r in self.iter_rules()
         )
 
     def intraday_signal_symbols(self, asset_type: str) -> set[str]:
-        """返回启用的分时信号规则所需标的并集。"""
+        """返回启用的分时信号规则所需标的并集。
+
+        全账户并集: 分时信号注入喂的是**共享**行情快照, 每个账户的规则各自在自己的
+        作用域内命中, 并集不会让谁看到别人的标的 (标的列表只是"要拉哪些分钟K")。
+        """
         symbols: set[str] = set()
-        for rule in list(self._rules.values()):
+        for _account_id, rule in self.iter_rules():
             if (
                 rule.get("enabled", True)
                 and rule.get("asset_type", "stock") == asset_type
@@ -590,27 +657,28 @@ class MonitorRuleEngine:
     # ── 评估 ───────────────────────────────────────────
     def has_asset_rules(self, asset_type: str) -> bool:
         """是否存在指定资产类型的 (已启用) 规则。供 quote_service 判断是否需要 ETF 评估轮。"""
-        if not self._rules:
-            return False
         return any(
             r.get("enabled", True) and r.get("asset_type", "stock") == asset_type
-            for r in list(self._rules.values())
+            for _account_id, r in self.iter_rules()
         )
 
     def evaluate(self, df: pl.DataFrame, asset_type: str = "stock",
                  reset_strategy_results: bool = True) -> list[dict]:
-        """行情更新后评估规则。
+        """行情更新后**逐账户**评估规则。
 
         按 asset_type 只评估匹配资产类型的规则; ETF 规则应传 ETF enriched 快照。
-        股票/ETF 分两轮评估时, 仅股票轮重置 _latest_strategy_results (它供股票策略页
-        /cached 回显; ETF 策略页走实时单跑, 不依赖它)。
+        股票/ETF 分两轮评估时, 仅股票轮重置策略结果缓存 (它供股票策略页 /cached 回显;
+        ETF 策略页走实时单跑, 不依赖它)。
+
+        df 是**共享**行情快照 (全市场一份), 分账户的是规则与派生状态 —— 每个账户的
+        规则只在自己的作用域内命中, 事件一律带 account_id 供下游按账户路由。
 
         Args:
             df: 实时 enriched 数据 (含 signal_/csg_/指标列)
             asset_type: 只评估该资产类型的规则 (默认 stock, 向后兼容)
             reset_strategy_results: 是否重置策略结果缓存 (多轮评估时仅首轮 True)
         Returns:
-            触发的 AlertEvent dict 列表 (含 ts/rule_id/source/type/symbol/...)
+            触发的 AlertEvent dict 列表 (含 account_id/ts/rule_id/source/type/symbol/...)
         """
         if not self._rules or df.is_empty():
             return []
@@ -625,102 +693,147 @@ class MonitorRuleEngine:
             self._building_strategy_results = {}
             self._latest_strategy_result_ids.clear()
 
-        matrix_rules: list[dict] = []
-        params_map: dict[str, dict] = {}
-        overrides_map: dict[str, dict] = {}
-        if self._strategy_engine is not None:
-            for rule in list(self._rules.values()):
-                if (
-                    not rule.get("enabled", True)
-                    or rule.get("type") != "strategy"
-                    or rule.get("asset_type", "stock") != asset_type
-                ):
-                    continue
-                sid = rule.get("strategy_id")
-                if not sid:
-                    continue
-                try:
-                    strategy = self._strategy_engine.get(sid)
-                except Exception:
-                    continue
-                if getattr(strategy, "execution_backend", "polars_expr") != "matrix_native":
-                    continue
-                overrides = {}
-                if self._data_dir:
-                    # 监控引擎是进程级后台服务, 暂无账户上下文: 仍用共享 data_dir,
-                    # 需改为按账户扇出。
-                    overrides = _strategy_config.load_override(sid, user_root=self._data_dir)
-                matrix_rules.append(rule)
-                overrides_map[sid] = overrides
-                params_map[sid] = dict(overrides.get("params") or {})
-        if matrix_rules:
-            try:
-                history_loader = self._history_loader_for(matrix_rules[0])
-                if history_loader is None:
-                    raise ValueError("matrix strategy monitor requires history loader")
-                matrix_ids = [str(rule["strategy_id"]) for rule in matrix_rules]
-                history_bars = self._strategy_engine.required_history_bars(
-                    matrix_ids,
-                    params_map=params_map,
-                    overrides_map=overrides_map,
-                )
-                from app.strategy.engine import StrategyDataContext
-                context = StrategyDataContext(
-                    asset_type=asset_type,
-                    timeframe="1d",
-                    as_of=cn_today(),
-                    current=df,
-                    cache_key=f"monitor:{asset_type}",
-                )
-                try:
-                    snapshot = self._strategy_engine.prepare_realtime_matrix(
-                        context,
-                        matrix_ids,
-                        params_map=params_map,
-                        overrides_map=overrides_map,
-                    )
-                except ValueError as exc:
-                    if "requires history data" not in str(exc):
-                        raise
-                    history = history_loader(cn_today(), history_bars)
-                    snapshot = self._strategy_engine.prepare_realtime_matrix(
-                        StrategyDataContext(
-                            asset_type=asset_type,
-                            timeframe="1d",
-                            as_of=cn_today(),
-                            current=df,
-                            history=history,
-                            cache_key=f"monitor:{asset_type}",
-                        ),
-                        matrix_ids,
-                        params_map=params_map,
-                        overrides_map=overrides_map,
-                    )
-                self._active_matrix_snapshots[asset_type] = snapshot
-            except Exception as e:
-                self._active_matrix_snapshots.pop(asset_type, None)
-                logger.warning("%s 矩阵策略实时缓存准备失败: %s", asset_type, e)
-
-        # list() 快照: 本方法跑在行情轮询线程, API 线程同时 add/remove 规则
-        # 会触发 "dictionary changed size during iteration", 整轮告警丢失
-        for rule_id, rule in list(self._rules.items()):
-            if rule.get("asset_type", "stock") != asset_type:
-                continue
-            if rule.get("type") in ("sector", "abnormal", "date"):
-                # 三者不走行情 DataFrame 评估, 各走 evaluate_sectors / evaluate_abnormal /
-                # evaluate_date_rules 专用路径
+        # list() 快照: 本方法跑在行情轮询线程, API 线程同时增删规则/账户
+        # 会触发 "dictionary changed size during iteration", 整轮告警丢失。
+        # 单个账户评估失败只丢该账户本轮, 不影响其它账户。
+        for account_id, account_rules in list(self._rules.items()):
+            rules = list(account_rules.items())
+            if not rules:
                 continue
             try:
-                events.extend(self._evaluate_rule(df, rule, now))
-            except Exception as e:
-                logger.warning("规则评估失败 %s: %s", rule_id, e)
+                self._evaluate_account(df, account_id, rules, asset_type, now, events)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("账户 %s 本轮规则评估失败 (不影响其他账户): %s", account_id, e)
 
         # 一次性提交本轮结果 (原子替换): /cached 读方要么拿到上一轮完整结果,
         # 要么拿到本轮完整结果, 不会读到空中间态。
         self._latest_strategy_results = self._building_strategy_results
-        self._active_matrix_snapshots.pop(asset_type, None)
 
         return events
+
+    def _evaluate_account(
+        self,
+        df: pl.DataFrame,
+        account_id: int,
+        rules: list[tuple[str, dict]],
+        asset_type: str,
+        now: float,
+        events: list[dict],
+    ) -> None:
+        """评估**单个账户**在某资产类型下的规则, 事件就地追加到 events。
+
+        矩阵快照按 (账户, 资产类型) 准备并在本轮末尾清理: 矩阵策略的 overrides 读的是
+        该账户自己的策略覆盖配置, 跨账户复用同一份快照会把 A 的参数喂给 B 的规则。
+        """
+        snapshot_key = (account_id, asset_type)
+        self._prepare_matrix_snapshot(df, account_id, rules, asset_type, snapshot_key)
+        try:
+            for rule_id, rule in rules:
+                if rule.get("asset_type", "stock") != asset_type:
+                    continue
+                if rule.get("type") in ("sector", "abnormal", "date"):
+                    # 三者不走行情 DataFrame 评估, 各走 evaluate_sectors / evaluate_abnormal /
+                    # evaluate_date_rules 专用路径
+                    continue
+                try:
+                    events.extend(self._evaluate_rule(df, rule, now, account_id))
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("规则评估失败 %s (账户 %s): %s", rule_id, account_id, e)
+        finally:
+            self._active_matrix_snapshots.pop(snapshot_key, None)
+
+    def _prepare_matrix_snapshot(
+        self,
+        df: pl.DataFrame,
+        account_id: int,
+        rules: list[tuple[str, dict]],
+        asset_type: str,
+        snapshot_key: tuple[int, str],
+    ) -> None:
+        """为**该账户**的 matrix_native 策略型规则准备本轮实时矩阵快照。
+
+        只用到 overrides 的账户维度: 覆盖配置在 ``<user_root>/user_data`` 下, 必须按
+        账户读, 否则两个账户对同一策略的不同参数会互相顶替。
+        """
+        if self._strategy_engine is None:
+            return
+        user_root = user_paths.user_root(account_id)
+        matrix_rules: list[dict] = []
+        params_map: dict[str, dict] = {}
+        overrides_map: dict[str, dict] = {}
+        for _rule_id, rule in rules:
+            if (
+                not rule.get("enabled", True)
+                or rule.get("type") != "strategy"
+                or rule.get("asset_type", "stock") != asset_type
+            ):
+                continue
+            sid = rule.get("strategy_id")
+            if not sid:
+                continue
+            try:
+                strategy = self._strategy_engine.get(sid)
+            except Exception:  # noqa: BLE001
+                continue
+            if getattr(strategy, "execution_backend", "polars_expr") != "matrix_native":
+                continue
+            try:
+                overrides = _strategy_config.load_override(sid, user_root=user_root)
+            except Exception:  # noqa: BLE001
+                overrides = {}
+            matrix_rules.append(rule)
+            overrides_map[sid] = overrides
+            params_map[sid] = dict(overrides.get("params") or {})
+        if not matrix_rules:
+            return
+        try:
+            history_loader = self._history_loader_for(matrix_rules[0])
+            if history_loader is None:
+                raise ValueError("matrix strategy monitor requires history loader")
+            matrix_ids = [str(rule["strategy_id"]) for rule in matrix_rules]
+            history_bars = self._strategy_engine.required_history_bars(
+                matrix_ids,
+                params_map=params_map,
+                overrides_map=overrides_map,
+            )
+            from app.strategy.engine import StrategyDataContext
+            context = StrategyDataContext(
+                asset_type=asset_type,
+                timeframe="1d",
+                as_of=cn_today(),
+                current=df,
+                cache_key=f"monitor:{account_id}:{asset_type}",
+            )
+            try:
+                snapshot = self._strategy_engine.prepare_realtime_matrix(
+                    context,
+                    matrix_ids,
+                    params_map=params_map,
+                    overrides_map=overrides_map,
+                )
+            except ValueError as exc:
+                if "requires history data" not in str(exc):
+                    raise
+                history = history_loader(cn_today(), history_bars)
+                snapshot = self._strategy_engine.prepare_realtime_matrix(
+                    StrategyDataContext(
+                        asset_type=asset_type,
+                        timeframe="1d",
+                        as_of=cn_today(),
+                        current=df,
+                        history=history,
+                        cache_key=f"monitor:{account_id}:{asset_type}",
+                    ),
+                    matrix_ids,
+                    params_map=params_map,
+                    overrides_map=overrides_map,
+                )
+            self._active_matrix_snapshots[snapshot_key] = snapshot
+        except Exception as e:  # noqa: BLE001
+            self._active_matrix_snapshots.pop(snapshot_key, None)
+            logger.warning(
+                "%s 矩阵策略实时缓存准备失败 (账户 %s): %s", asset_type, account_id, e,
+            )
 
     def evaluate_date_rules(self, now: float | None = None) -> list[dict]:
         """纯日历评估 date 规则: 窗口命中 + 每天最多一次, 无行情条件。
@@ -728,6 +841,9 @@ class MonitorRuleEngine:
         由行情轮询在盘中调用 (quote_service._evaluate_monitors), 事件与 _evaluate_rule 同构。
         窗口按自然日; 到期落在休市/节假日时需 lead_days 覆盖 (交易日历口径待 issue 定夺)。
         每个交易日只在首个轮询完整评估一次, 其余轮次命中缓存直接跳过。
+
+        "每天一次"是**进程级**闸门 (所有账户同一轮一起评估), 但按天 cooldown 键带
+        account_id: A 的日期提醒触发过, 不会把 B 的同名规则一并吞掉。
         """
         now = now if now is not None else time.time()
         today_iso = cn_today().isoformat()
@@ -737,61 +853,63 @@ class MonitorRuleEngine:
         self._last_fire = {
             key: value
             for key, value in self._last_fire.items()
-            if not (key[1].startswith("_date_") and key[1] != f"_date_{today_iso}")
+            if not (key[2].startswith("_date_") and key[2] != f"_date_{today_iso}")
         }
 
         today_d = _dt.date.fromisoformat(today_iso)
         events: list[dict] = []
-        for rule in list(self._rules.values()):
-            if rule.get("type") != "date" or rule.get("enabled") is False:
-                continue
-            remind = rule.get("remind_date") or ""
-            if not date_rule_in_window(remind, int(rule.get("lead_days", 0)), today_iso):
-                continue
-            # 按天隔离: 窗口内每天最多触发一次
-            key = (rule["id"], f"_date_{today_iso}", "date")
-            cooldown = int(rule.get("cooldown_seconds") or 86400)
-            last = self._last_fire.get(key)
-            if last is not None and (now - last) < cooldown:
-                continue
-            self._last_fire[key] = now
+        for account_id, account_rules in list(self._rules.items()):
+            for rule in list(account_rules.values()):
+                if rule.get("type") != "date" or rule.get("enabled") is False:
+                    continue
+                remind = rule.get("remind_date") or ""
+                if not date_rule_in_window(remind, int(rule.get("lead_days", 0)), today_iso):
+                    continue
+                # 按天隔离: 窗口内每天最多触发一次 (键含账户, 账户之间互不压制)
+                key = (account_id, rule["id"], f"_date_{today_iso}", "date")
+                cooldown = int(rule.get("cooldown_seconds") or 86400)
+                last = self._last_fire.get(key)
+                if last is not None and (now - last) < cooldown:
+                    continue
+                self._last_fire[key] = now
 
-            symbols = [s for s in rule.get("symbols", []) if s]
-            single_symbol = symbols[0] if len(symbols) == 1 else None
-            msg = rule.get("message") or f"日期提醒 · {today_iso}"
-            try:
-                remain = (_dt.date.fromisoformat(remind) - today_d).days
-            except ValueError:
-                remain = 0
-            msg += " · 今日到期" if remain <= 0 else f" · {remain}天后到期"
-            # 单标的由 ev.symbol 携带; 仅多标的时拼列表
-            if len(symbols) > 1:
-                shown = "、".join(symbols[:3]) + ("等" if len(symbols) > 3 else "")
-                msg = f"{msg} · {shown}"
-
-            ev = {
-                "ts": int(now * 1000),
-                "rule_id": rule["id"],
-                "rule_name": rule.get("name", ""),
-                "strategy_id": None,
-                "source": "date",
-                "type": "date_reminder",
-                "symbol": single_symbol or "",
-                "name": (self._name_map.get(single_symbol) or single_symbol) if single_symbol else None,
-                "message": msg,
-                "price": None,
-                "change_pct": None,
-                "signals": [],
-                "severity": rule.get("severity", "info"),
-                "conditions": [],
-                "logic": "and",
-            }
-            events.append(ev)
-            if self._alert_handler:
+                symbols = [s for s in rule.get("symbols", []) if s]
+                single_symbol = symbols[0] if len(symbols) == 1 else None
+                msg = rule.get("message") or f"日期提醒 · {today_iso}"
                 try:
-                    self._alert_handler(ev)
-                except Exception as e:  # noqa: BLE001
-                    logger.warning("alert handler failed: %s", e)
+                    remain = (_dt.date.fromisoformat(remind) - today_d).days
+                except ValueError:
+                    remain = 0
+                msg += " · 今日到期" if remain <= 0 else f" · {remain}天后到期"
+                # 单标的由 ev.symbol 携带; 仅多标的时拼列表
+                if len(symbols) > 1:
+                    shown = "、".join(symbols[:3]) + ("等" if len(symbols) > 3 else "")
+                    msg = f"{msg} · {shown}"
+
+                ev = {
+                    "account_id": account_id,
+                    "ts": int(now * 1000),
+                    "rule_id": rule["id"],
+                    "rule_name": rule.get("name", ""),
+                    "strategy_id": None,
+                    "source": "date",
+                    "type": "date_reminder",
+                    "symbol": single_symbol or "",
+                    "name": (self._name_map.get(single_symbol) or single_symbol) if single_symbol else None,
+                    "message": msg,
+                    "price": None,
+                    "change_pct": None,
+                    "signals": [],
+                    "severity": rule.get("severity", "info"),
+                    "conditions": [],
+                    "logic": "and",
+                }
+                events.append(ev)
+                if self._alert_handler:
+                    try:
+                        self._alert_handler(ev)
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("alert handler failed: %s", e)
         self._date_eval_day = today_iso
         self._date_eval_rules_version = self._rules_version
         return events
@@ -803,24 +921,29 @@ class MonitorRuleEngine:
         *,
         now: float | None = None,
     ) -> list[dict]:
-        """按板块聚合快照评估 type=sector 规则。"""
+        """按板块聚合快照评估 type=sector 规则 (逐账户)。
+
+        板块快照本身来自**共享**数据 (指数/概念/行业), 因此只构建一份 (取各账户监控
+        对象的并集); 分账户的是规则与边缘/冷却状态。
+        """
         if self._sector_monitor_service is None:
             return []
-        rules = [
-            rule for rule in list(self._rules.values())
-            if rule.get("enabled", True) and rule.get("type") == "sector"
-        ]
-        if not rules:
+        rules_by_account: dict[int, list[dict]] = {}
+        for account_id, rule in self.iter_rules():
+            if rule.get("enabled", True) and rule.get("type") == "sector":
+                rules_by_account.setdefault(account_id, []).append(rule)
+        if not rules_by_account:
             return []
 
         targets_by_key: dict[str, dict] = {}
         windows: set[int] = set()
-        for rule in rules:
-            for target in rule.get("sector_targets", []):
-                if target.get("key"):
-                    targets_by_key[str(target["key"])] = target
-            if rule.get("sector_trigger") == "momentum":
-                windows.add(int(rule.get("window_minutes", 5)))
+        for rules in rules_by_account.values():
+            for rule in rules:
+                for target in rule.get("sector_targets", []):
+                    if target.get("key"):
+                        targets_by_key[str(target["key"])] = target
+                if rule.get("sector_trigger") == "momentum":
+                    windows.add(int(rule.get("window_minutes", 5)))
 
         timestamp = time.time() if now is None else now
         snapshots = self._sector_monitor_service.build_snapshots(
@@ -831,14 +954,21 @@ class MonitorRuleEngine:
             now=timestamp,
         )
         events: list[dict] = []
-        for rule in rules:
-            try:
-                events.extend(self._evaluate_sector_rule(rule, snapshots, timestamp))
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("板块规则评估失败 %s: %s", rule.get("id"), exc)
+        for account_id, rules in rules_by_account.items():
+            for rule in rules:
+                try:
+                    events.extend(
+                        self._evaluate_sector_rule(rule, snapshots, timestamp, account_id),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "板块规则评估失败 %s (账户 %s): %s", rule.get("id"), account_id, exc,
+                    )
         return events
 
-    def _evaluate_sector_rule(self, rule: dict, snapshots: dict[str, dict], now: float) -> list[dict]:
+    def _evaluate_sector_rule(
+        self, rule: dict, snapshots: dict[str, dict], now: float, account_id: int,
+    ) -> list[dict]:
         events: list[dict] = []
         direction = rule.get("direction", "up")
         trigger = rule.get("sector_trigger", "change_pct")
@@ -858,14 +988,14 @@ class MonitorRuleEngine:
             condition = value is not None and (
                 value >= threshold if direction == "up" else value <= -threshold
             )
-            state_key = (rule["id"], target_key)
+            state_key = (account_id, rule["id"], target_key)
             previous = self._sector_condition_state.get(state_key)
             self._sector_condition_state[state_key] = condition
             if previous is None or previous or not condition:
                 continue
 
             event_type = f"sector_{trigger}_{direction}"
-            cooldown_key = (rule["id"], target_key, event_type)
+            cooldown_key = (account_id, rule["id"], target_key, event_type)
             last = self._last_fire.get(cooldown_key)
             cooldown = int(rule.get("cooldown_seconds", 3600))
             if last is not None and now - last < cooldown:
@@ -875,6 +1005,7 @@ class MonitorRuleEngine:
                 snapshot, trigger, direction, threshold, window, value,
             )
             event = {
+                "account_id": account_id,
                 "ts": int(now * 1000),
                 "rule_id": rule["id"],
                 "rule_name": rule.get("name", ""),
@@ -953,7 +1084,7 @@ class MonitorRuleEngine:
         """
         thresholds = [
             float(r.get("threshold_pct", 70)) / 100
-            for r in list(self._rules.values())
+            for _account_id, r in self.iter_rules()
             if r.get("enabled", True) and r.get("type") == "abnormal"
         ]
         return min(thresholds) if thresholds else 1.0
@@ -965,22 +1096,29 @@ class MonitorRuleEngine:
         min_abnormal_closeness 预过滤)。rows 为空也照常评估 —— 用于把
         已消失标的的边缘状态清理回 False。
         """
-        rules = [
-            rule for rule in list(self._rules.values())
-            if rule.get("enabled", True) and rule.get("type") == "abnormal"
-        ]
-        if not rules:
+        rules_by_account: dict[int, list[dict]] = {}
+        for account_id, rule in self.iter_rules():
+            if rule.get("enabled", True) and rule.get("type") == "abnormal":
+                rules_by_account.setdefault(account_id, []).append(rule)
+        if not rules_by_account:
             return []
         timestamp = time.time() if now is None else now
         events: list[dict] = []
-        for rule in rules:
-            try:
-                events.extend(self._evaluate_abnormal_rule(rule, rows, timestamp))
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("异动规则评估失败 %s: %s", rule.get("id"), exc)
+        for account_id, rules in rules_by_account.items():
+            for rule in rules:
+                try:
+                    events.extend(
+                        self._evaluate_abnormal_rule(rule, rows, timestamp, account_id),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "异动规则评估失败 %s (账户 %s): %s", rule.get("id"), account_id, exc,
+                    )
         return events
 
-    def _evaluate_abnormal_rule(self, rule: dict, rows: list[dict], now: float) -> list[dict]:
+    def _evaluate_abnormal_rule(
+        self, rule: dict, rows: list[dict], now: float, account_id: int,
+    ) -> list[dict]:
         events: list[dict] = []
         threshold = float(rule.get("threshold_pct", 70)) / 100
         if not 0 < threshold <= 1.5:
@@ -991,7 +1129,7 @@ class MonitorRuleEngine:
             scope_symbols = {str(s) for s in rule.get("symbols", []) if s}
         elif rule.get("scope") == "watchlist_group":
             # 异动规则同样支持动态分组; 分组已删除返回 None → 本轮整体跳过
-            members = _group_members_or_none(rule)
+            members = _group_members_or_none(rule, account_id)
             if members is None:
                 return events
             scope_symbols = set(members)
@@ -1020,20 +1158,21 @@ class MonitorRuleEngine:
                 if best is None or closeness > best[1]:
                     best = (key, closeness, float(value), float(win.get("threshold") or 0))
             condition = best is not None and best[1] >= threshold
-            state_key = (rule["id"], symbol)
+            state_key = (account_id, rule["id"], symbol)
             previous = self._abnormal_condition_state.get(state_key)
             self._abnormal_condition_state[state_key] = condition
             if previous is None or previous or not condition:
                 continue
 
             event_type = f"abnormal_{'up' if best[2] > 0 else 'down'}"
-            cooldown_key = (rule["id"], symbol, event_type)
+            cooldown_key = (account_id, rule["id"], symbol, event_type)
             last = self._last_fire.get(cooldown_key)
             cooldown = int(rule.get("cooldown_seconds", 3600))
             if last is not None and now - last < cooldown:
                 continue
             self._last_fire[cooldown_key] = now
             event = {
+                "account_id": account_id,
                 "ts": int(now * 1000),
                 "rule_id": rule["id"],
                 "rule_name": rule.get("name", ""),
@@ -1063,7 +1202,7 @@ class MonitorRuleEngine:
         # 本轮未出现的标的 (跌出预过滤区间) 状态置 False 而非删除:
         # 删除会被当成「首轮观测」而不触发, 置 False 才能在回升穿过阈值时再次告警。
         for key, value in list(self._abnormal_condition_state.items()):
-            if key[0] == rule["id"] and key[1] not in seen and value:
+            if key[0] == account_id and key[1] == rule["id"] and key[2] not in seen and value:
                 self._abnormal_condition_state[key] = False
         return events
 
@@ -1079,10 +1218,12 @@ class MonitorRuleEngine:
             f"接近度{closeness * 100:.0f}%, {state}"
         )
 
-    def _evaluate_rule(self, df: pl.DataFrame, rule: dict, now: float) -> list[dict]:
-        """评估单条规则,返回触发的 events。"""
-        # 1. 按 scope 过滤作用域
-        scoped = self._apply_scope(df, rule)
+    def _evaluate_rule(
+        self, df: pl.DataFrame, rule: dict, now: float, account_id: int,
+    ) -> list[dict]:
+        """评估单条规则,返回触发的 events (每条都带 account_id)。"""
+        # 1. 按 scope 过滤作用域 (watchlist_group 读**该账户**的分组)
+        scoped = self._apply_scope(df, rule, account_id)
         if scoped.is_empty():
             return []
 
@@ -1093,13 +1234,13 @@ class MonitorRuleEngine:
         rtype = rule.get("type", "signal")
         if rtype == "strategy":
             # 策略类型: 跑策略选股, 同时产出所选的信号和结果池变更事件
-            hit_rows = self._match_strategy(scoped, rule)
+            hit_rows = self._match_strategy(scoped, rule, account_id)
         elif rtype == "ladder":
             # 连板梯队封单监控: 独立处理 (需带预警封单值, 走专属 message)
-            return self._evaluate_ladder(scoped, rule, now)
+            return self._evaluate_ladder(scoped, rule, now, account_id)
         elif rtype == "volume_delta":
             # 轮询放量监控: 相邻两次全市场快照的成交量差值, 独立处理走专属 message
-            return self._evaluate_volume_delta(scoped, rule, now)
+            return self._evaluate_volume_delta(scoped, rule, now, account_id)
         else:
             # signal / price / market: 通用条件匹配
             for sym, name, price, pct, hit_sigs in self._match_conditions(scoped, rule):
@@ -1118,7 +1259,7 @@ class MonitorRuleEngine:
             # cooldown 键包含事件类型, 同股不同策略事件互不压制。
             is_batch = sym == "_batch"
             key_symbol = f"_{ev_type}_batch" if is_batch else sym
-            key = (rule["id"], key_symbol, ev_type)
+            key = (account_id, rule["id"], key_symbol, ev_type)
             last = self._last_fire.get(key)
             if last is not None and (now - last) < cooldown:
                 continue  # 冷却期内, 跳过
@@ -1138,6 +1279,7 @@ class MonitorRuleEngine:
                 )
 
             ev = {
+                "account_id": account_id,
                 "ts": int(now * 1000),
                 "rule_id": rule["id"],
                 "rule_name": rule.get("name", ""),
@@ -1166,7 +1308,7 @@ class MonitorRuleEngine:
         return events
 
     @staticmethod
-    def _apply_scope(df: pl.DataFrame, rule: dict) -> pl.DataFrame:
+    def _apply_scope(df: pl.DataFrame, rule: dict, account_id: int) -> pl.DataFrame:
         """按 scope 过滤 DataFrame。"""
         scope = rule.get("scope", "symbols")
         if scope == "all":
@@ -1179,7 +1321,7 @@ class MonitorRuleEngine:
         if scope == "watchlist_group":
             # 动态绑定自选分组: 每轮评估按分组当前成员过滤 (带版本号缓存)。
             # 分组已删除/暂时为空 → fail-closed 返回空, 绝不退化为全市场。
-            members = _group_members_or_none(rule)
+            members = _group_members_or_none(rule, account_id)
             if not members:
                 return df.head(0)
             return df.filter(pl.col("symbol").is_in(list(members)))
@@ -1194,13 +1336,16 @@ class MonitorRuleEngine:
         return df
 
     def _match_strategy(
-        self, df: pl.DataFrame, rule: dict,
+        self, df: pl.DataFrame, rule: dict, account_id: int,
     ) -> list[tuple[str, str, Any, Any, Any, list[str]]]:
         """策略类型评估: 一次执行同时产出交易信号和结果池变更事件。
 
         返回 [(event_type, symbol, name, price, pct, signals)]
         event_type: buy_signal | sell_signal | pool_entry | pool_exit
         同类事件超过 5 只时合并为一条批量事件 (symbol="_batch")
+
+        账户既进 pool_key (选股池/信号状态按账户分家), 也决定策略覆盖配置从哪个
+        user_root 读 —— 两个账户各自调过参数的同名策略不会互相顶替。
         """
         if self._strategy_engine is None:
             return []
@@ -1208,7 +1353,7 @@ class MonitorRuleEngine:
         if not sid:
             return []
         at = rule.get("asset_type", "stock")
-        pool_key = (str(rule.get("id", sid)), sid, at)
+        pool_key = (account_id, str(rule.get("id", sid)), sid, at)
         try:
             s = self._strategy_engine.get(sid)
         except Exception:
@@ -1216,15 +1361,15 @@ class MonitorRuleEngine:
         if s is None:
             return []
 
-        # 运行策略选股: 复用当前 enriched DataFrame 跳过数据加载
+        # 运行策略选股: 复用当前 enriched DataFrame 跳过数据加载。
+        # 覆盖配置读**本账户**的 user_root (每用户私有), 读失败按"无覆盖"继续。
         overrides = {}
-        if self._data_dir:
-            try:
-                # 监控引擎是进程级后台服务, 暂无账户上下文: 仍用共享 data_dir,
-                # 需改为按账户扇出。
-                overrides = _strategy_config.load_override(sid, user_root=self._data_dir)
-            except Exception:
-                pass
+        try:
+            overrides = _strategy_config.load_override(
+                sid, user_root=user_paths.user_root(account_id),
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
         # 声明 filter_history 的策略 (如反包) 需要多日历史窗口才能判定形态。
         # 旧实现因"实时监控不支持 history loader"直接跳过 → 反包等策略盘中永不触发。
@@ -1244,7 +1389,7 @@ class MonitorRuleEngine:
             logger.debug("叠加策略 %s 暂不支持实时监控, 跳过", sid)
             return []
         if getattr(s, "execution_backend", "polars_expr") == "matrix_native":
-            matrix = self._active_matrix_snapshots.get(at)
+            matrix = self._active_matrix_snapshots.get((account_id, at))
             if matrix is None:
                 logger.debug("策略 %s 缺少本轮实时矩阵快照, 跳过", sid)
                 return []
@@ -1316,7 +1461,7 @@ class MonitorRuleEngine:
         # 避免并发读到半填充状态。
         if at == "stock":
             try:
-                self._building_strategy_results[sid] = {
+                self._building_strategy_results.setdefault(account_id, {})[sid] = {
                     "total": result.total,
                     "as_of": str(cn_today()),
                     "rows": [
@@ -1325,7 +1470,7 @@ class MonitorRuleEngine:
                         for row in result.rows
                     ],
                 }
-                self._latest_strategy_result_ids.add(sid)
+                self._latest_strategy_result_ids.setdefault(account_id, set()).add(sid)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -1432,13 +1577,13 @@ class MonitorRuleEngine:
 
     def _new_strategy_signals(
         self,
-        pool_key: tuple[str, str, str],
+        pool_key: tuple[int, str, str, str],
         event_type: str,
         as_of: Any,
         hits: list[dict],
     ) -> set[str]:
-        rule_id, strategy_id, asset_type = pool_key
-        state_key = (rule_id, strategy_id, asset_type, event_type)
+        account_id, rule_id, strategy_id, asset_type = pool_key
+        state_key = (account_id, rule_id, strategy_id, asset_type, event_type)
         date_key = str(as_of)
         current = {str(hit["symbol"]) for hit in hits}
         previous = self._strategy_signal_state.get(state_key)
@@ -1515,7 +1660,9 @@ class MonitorRuleEngine:
             return None
         return pl.all_horizontal(masks)
 
-    def _evaluate_volume_delta(self, scoped: pl.DataFrame, rule: dict, now: float) -> list[dict]:
+    def _evaluate_volume_delta(
+        self, scoped: pl.DataFrame, rule: dict, now: float, account_id: int,
+    ) -> list[dict]:
         """评估轮询放量监控: 相邻两次全市场快照的成交量/成交额差值。
 
         差值列 _volume_delta(手)/_volume_delta_amount(元)/间隔列 _volume_delta_span
@@ -1567,6 +1714,7 @@ class MonitorRuleEngine:
 
         def _event(symbol: str, name: str, message: str, *, delta=None, price=None, pct=None) -> dict:
             ev = {
+                "account_id": account_id,
                 "ts": int(now * 1000),
                 "rule_id": rule["id"],
                 "rule_name": rule.get("name", ""),
@@ -1595,7 +1743,7 @@ class MonitorRuleEngine:
                 f"放量 · 单轮增量 >= {th_text}{span_text} · "
                 f"共 {len(hit_rows)} 只: {top}{suffix}"
             )
-            key = (rule["id"], "_volume_delta_batch", "volume_delta")
+            key = (account_id, rule["id"], "_volume_delta_batch", "volume_delta")
             last = self._last_fire.get(key)
             if last is not None and (now - last) < cooldown:
                 return []
@@ -1605,7 +1753,7 @@ class MonitorRuleEngine:
         events: list[dict] = []
         for row in hit_rows:
             sym = row.get("symbol", "")
-            key = (rule["id"], sym, "volume_delta")
+            key = (account_id, rule["id"], sym, "volume_delta")
             last = self._last_fire.get(key)
             if last is not None and (now - last) < cooldown:
                 continue
@@ -1618,7 +1766,9 @@ class MonitorRuleEngine:
             ))
         return events
 
-    def _evaluate_ladder(self, scoped: pl.DataFrame, rule: dict, now: float) -> list[dict]:
+    def _evaluate_ladder(
+        self, scoped: pl.DataFrame, rule: dict, now: float, account_id: int,
+    ) -> list[dict]:
         """评估连板梯队封单监控规则。
 
         封单量从注入的临时列 _sealed_vol (手) 读取 (由 quote_service 评估前注入)。
@@ -1655,7 +1805,7 @@ class MonitorRuleEngine:
         events: list[dict] = []
         for row in hit.iter_rows(named=True):
             sym = row.get("symbol", "")
-            key = (rule["id"], sym, "ladder")
+            key = (account_id, rule["id"], sym, "ladder")
             last = self._last_fire.get(key)
             if last is not None and (now - last) < cooldown:
                 continue
@@ -1678,6 +1828,7 @@ class MonitorRuleEngine:
             message = f"{warn_label} · 封单 {sv_text} ≤ {th_text}"
 
             events.append({
+                "account_id": account_id,
                 "ts": int(now * 1000),
                 "rule_id": rule["id"],
                 "rule_name": rule.get("name", ""),

@@ -63,6 +63,7 @@ def _setup_engine(tmp_path):
     engine = StrategyEngine(strategy_dirs=[custom_dir, comp_dir])
     repo = SimpleNamespace(store=SimpleNamespace(data_dir=tmp_path))
     request = SimpleNamespace(
+        state=SimpleNamespace(account_id=1),
         app=SimpleNamespace(state=SimpleNamespace(repo=repo, strategy_engine=engine))
     )
     return engine, request, custom_dir, comp_dir

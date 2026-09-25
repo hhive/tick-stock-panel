@@ -25,15 +25,22 @@ def _current_user_context(tmp_path):
 class _MonitorEngine:
     def __init__(self, results=None):
         self.results = results or {}
+        self.asked_accounts: list[int] = []
 
-    def latest_strategy_results(self):
+    def latest_strategy_results(self, account_id: int) -> dict:
+        # 实时结果按账户读: 端点必须传 account_id (合并所有账户会串号)
+        self.asked_accounts.append(account_id)
         return self.results
 
 
 def _request(tmp_path, monitor_results=None):
     repo = SimpleNamespace(store=SimpleNamespace(data_dir=tmp_path))
     state = SimpleNamespace(repo=repo, monitor_engine=_MonitorEngine(monitor_results))
-    return SimpleNamespace(app=SimpleNamespace(state=state))
+    # request.state.account_id = 认证中间件注入的面板账号身份
+    return SimpleNamespace(
+        state=SimpleNamespace(account_id=1),
+        app=SimpleNamespace(state=state),
+    )
 
 
 def test_cached_summary_omits_rows_and_counts_realtime_expirations(monkeypatch, tmp_path):

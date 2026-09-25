@@ -61,7 +61,7 @@ def test_intraday_signals_flow_through_monitor_engine():
         "symbol": ["600000.SH"], "close": [11.0], "change_pct": [0.1],
     })
     engine = MonitorRuleEngine()
-    engine.set_rules([{**_intraday_rule(), "cooldown_seconds": 0}])
+    engine.set_rules_for(1, [{**_intraday_rule(), "cooldown_seconds": 0}])
     events = engine.evaluate(evaluator.inject(enriched, signals))
     assert len(events) == 1
     assert events[0]["rule_id"] == "intraday_rule"
@@ -138,7 +138,7 @@ def _intraday_rule(scope: str = "symbols") -> dict:
 def test_intraday_rule_pool_is_derived_from_enabled_rules():
     engine = MonitorRuleEngine()
     disabled = {**_intraday_rule(), "id": "disabled", "enabled": False, "symbols": ["000001.SZ"]}
-    engine.set_rules([_intraday_rule(), disabled])
+    engine.set_rules_for(1, [_intraday_rule(), disabled])
     assert engine.intraday_signal_symbols("stock") == {"600000.SH"}
     assert engine.intraday_signal_symbols("etf") == set()
 
