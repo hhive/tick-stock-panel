@@ -158,18 +158,18 @@ def test_custom_signal_survives_a_torn_write(data_dir: Path, torn_write) -> None
     assert custom_signals.load_all() == [sig]
 
 
-def test_custom_factor_survives_a_torn_write(user_root: Path, torn_write) -> None:
+def test_custom_factor_survives_a_torn_write(data_dir: Path, torn_write) -> None:
     """factors.store.load_all 跳过损坏文件 —— 半截文件会让该因子静默消失。"""
     definition = {"id": "uf_mom", "kind": "custom", "label": "动量", "status": "draft"}
-    factor_store.save_one(definition, user_root)
-    assert (user_root / "user_data" / "custom_factors" / "uf_mom.json").exists()
-    assert [d["id"] for d in factor_store.load_all(user_root)] == ["uf_mom"]
+    factor_store.save_one(definition)
+    assert (data_dir / "user_data" / "custom_factors" / "uf_mom.json").exists()
+    assert [d["id"] for d in factor_store.load_all()] == ["uf_mom"]
 
     torn_write()
     with pytest.raises(OSError):
-        factor_store.save_one({**definition, "label": "动量2"}, user_root)
+        factor_store.save_one({**definition, "label": "动量2"})
 
-    assert factor_store.load_all(user_root) == [definition]
+    assert factor_store.load_all() == [definition]
 
 
 def test_analysis_menu_survives_a_torn_write(data_dir: Path, torn_write) -> None:
@@ -239,11 +239,11 @@ def test_no_tmp_file_is_left_behind(data_dir: Path, user_root: Path) -> None:
     secrets_store.save({"a": "1"})
     strat_config.save_override("s1", {"params": {}}, user_root=user_root)
     custom_signals.save_one({"id": "vol_up", "conditions": []})
-    factor_store.save_one({"id": "uf_mom", "label": "动量"}, user_root)
+    factor_store.save_one({"id": "uf_mom", "label": "动量"})
     custom_loader.save_config("demo", {"name": "demo", "datasets": {}})
 
     # 账户根在 data_dir 之下, rglob 覆盖到每用户存储 —— 断言扫描不是空转
     assert (user_root / "user_data" / "secrets.json").exists()
-    assert (user_root / "user_data" / "custom_factors" / "uf_mom.json").exists()
+    assert (data_dir / "user_data" / "custom_factors" / "uf_mom.json").exists()
     leftovers = sorted(p.name for p in data_dir.rglob("*.tmp"))
     assert leftovers == []

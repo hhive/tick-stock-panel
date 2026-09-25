@@ -112,8 +112,8 @@ async def _application_lifespan(app: FastAPI):
     app.state.datastore = store
     app.state.repo = repo
     # 自定义/复合因子载入注册表 (P3); 单个失败只跳过该因子 (fail-隔离)。
-    # 因子已按账户存放, 启动期没有账户上下文 —— **不回退**到共享目录 (那会把某个
-    # 账户的因子读成所有人的), 这里只留痕; 每账户扇出补齐后再显式传 user_root。
+    # 因子是**部署级**的(产出共享 enriched 帧的列, 见 factors.store 的 docstring),
+    # 因此启动期这一个**没有账户上下文**的调用方能够正确加载, 不需要扇出。
     from app.factors.store import load_into_registry
 
     try:
@@ -502,6 +502,11 @@ _ADMIN_ONLY_EXACT = frozenset({
     # 只读端点(/options、列表)不门控; /intraday/replay 是回放分析, 不改定义。
     "/api/custom-signals",
     "/api/custom-signals/ai/generate",
+    # 自定义/复合因子的**定义**端点。因子同样是部署级(产出共享 enriched 帧的列),
+    # 与信号/策略创作面同类。只读端点(GET 列表、/validate、/trial)不门控 ——
+    # 它们不落定义。
+    "/api/factors/custom",
+    "/api/factors/composite",
 })
 # 带路径参数的端点。**必须按方法分开**:
 #   - `^/api/strategy/[^/]+$` 若对 POST 也生效, 会连 `POST /api/strategy/run`
@@ -509,10 +514,13 @@ _ADMIN_ONLY_EXACT = frozenset({
 #   - DELETE 下它匹配的才是 `DELETE /api/strategy/{id}`(删除策略本体)。
 _ADMIN_ONLY_RE_POST = (
     re.compile(r"^/api/strategy/[^/]+/publish$"),
+    # 因子定义的新增/更新/状态/分组: /api/factors/custom/{id}/update 等
+    re.compile(r"^/api/factors/custom/"),
 )
 _ADMIN_ONLY_RE_DELETE = (
     re.compile(r"^/api/strategy/[^/]+$"),
     re.compile(r"^/api/custom-signals/[^/]+$"),
+    re.compile(r"^/api/factors/custom/[^/]+$"),
 )
 
 # 游客限流额度(按 IP, 滑动窗口 60s)。普通只读 / 重算类分开计量。

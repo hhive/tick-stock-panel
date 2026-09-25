@@ -12,14 +12,44 @@ from app.api.factors import router
 
 
 @pytest.fixture(autouse=True)
-def _user_ctx(tmp_path, monkeypatch):
-    """自定义因子按账户分家: 走 API 的用例需要账户上下文。
+def _reset_custom_factor_registry():
+    """每例前后清掉注册表里的自定义/复合因子条目。
 
-    真实请求由认证中间件注入 user_root; 这里的裸 app (只挂 router) 没有中间件,
-    因此显式设置上下文, 使 store 解析出的账户根目录 == 用例的 tmp_path。
+    因子定义是**部署级**的(见 factors.store 的 docstring), 而 ``factors.registry``
+    是**进程级单例** —— 用例之间会互相污染: 同一 id 反复注册会让版本号累加,
+    实测出现 `assert 3 == 1` 这类与用例意图无关的失败。
+
+    直接遍历 _REGISTRY 而不经 all_factors(): 后者会触发惰性同步, 在 monkeypatch
+    已还原后把真实数据目录的配置注册进来。
     """
+    from app.factors import registry as _registry
+
+    def _purge() -> None:
+        for fid in [k for k in list(_registry._REGISTRY)
+                    if _registry._REGISTRY[k].kind in ("custom", "composite")]:
+            _registry._REGISTRY.pop(fid, None)
+
+    _purge()
+    yield
+    _purge()
+
+
+@pytest.fixture(autouse=True)
+def _user_ctx(tmp_path, monkeypatch):
+    """把共享数据目录指向本用例的 tmp_path。
+
+    自定义因子现在是**部署级**存储(见 factors.store 的 docstring), 位置直接由
+    ``settings.data_dir`` 决定 —— **必须 patch 它**, 否则定义文件会写进真实仓库的
+    ``data/user_data/custom_factors/`` 并跨用例残留(实测: 版本号累加导致
+    `assert 6 == 1`, 且在仓库里留下 uf_*.json)。这不是顺手加一行, 而是本 fixture
+    成立的前提。
+
+    contextvar 一并设置: 其他按账户分家的存储(策略覆写等)走 API 时仍需要它。
+    """
+    from app import config as app_config
     from app.services import preferences
 
+    monkeypatch.setattr(app_config.settings, "data_dir", tmp_path)
     token = preferences.set_current_user_root(tmp_path)
     yield tmp_path
     preferences.reset_current_user_root(token)
@@ -182,7 +212,7 @@ def test_group_and_status_update_after_registry_load(tmp_path, cleanup_registry)
 
     from app.factors import store
 
-    store.load_into_registry(Path(tmp_path))  # 模拟重启后的注册状态
+    store.load_into_registry()  # 模拟重启后的注册状态(部署级, 不需要账户根)
     registered = get_factor(factor_id)
     assert registered is not None and registered.group == "自定义"
 
@@ -191,7 +221,7 @@ def test_group_and_status_update_after_registry_load(tmp_path, cleanup_registry)
     assert renamed.json()["group"] == "我的动量组"
     refreshed = get_factor(factor_id)
     assert refreshed is not None and refreshed.group == "我的动量组"  # 注册表同步
-    on_disk = next(d for d in store.load_all(Path(tmp_path)) if d["id"] == factor_id)
+    on_disk = next(d for d in store.load_all() if d["id"] == factor_id)
     assert on_disk["group"] == "我的动量组"  # 磁盘持久化
 
     activated = client.post(f"/api/factors/custom/{factor_id}/status", json={"status": "active"})
@@ -240,7 +270,7 @@ def test_update_custom_factor_bumps_version(tmp_path, cleanup_registry) -> None:
     assert spec is not None
     assert spec.version == 2 and spec.group == "新分组" and spec.label == "编辑测试v2"
     assert "change_pct" in spec.dependencies
-    on_disk = next(d for d in store.load_all(data_dir) if d["id"] == "uf_edit_test")
+    on_disk = next(d for d in store.load_all() if d["id"] == "uf_edit_test")
     assert on_disk["version"] == 2 and on_disk["status"] == "draft"
 
     # 仅改元数据 (公式不变): 版本仍提升, 状态保留 (不回 draft)
@@ -307,7 +337,7 @@ def test_delete_custom_and_composite_factor(tmp_path, cleanup_registry) -> None:
     assert removed.status_code == 200
     assert removed.json() == {"ok": True, "id": "cf_del_test", "removed_references": []}
     assert get_factor("cf_del_test") is None
-    assert all(d["id"] != "cf_del_test" for d in store.load_all(data_dir))  # 磁盘已删
+    assert all(d["id"] != "cf_del_test" for d in store.load_all())  # 磁盘已删
 
     # 引用解除后成员可正常删除
     freed = client.delete("/api/factors/custom/uf_del_member")

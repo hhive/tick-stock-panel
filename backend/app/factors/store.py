@@ -1,8 +1,14 @@
-"""自定义/复合因子存储 (P3) — `<user_root>/user_data/custom_factors/*.json`。
+"""自定义/复合因子存储 (P3) — `<data_dir>/user_data/custom_factors/*.json`。
 
-**每账户一份**: user_root 由 ``user_paths.resolve_user_root()`` 解析 (请求路径走认证
-中间件注入的 contextvar, 后台线程/子进程必须显式传 user_root=), 因此自定义因子不会
-跨账户互见。
+**部署级一份**(与 custom_signals 同作用域, 理由也相同): 因子列由
+``strategy/scoring.materialize_scoring_columns`` 物化进**共享** enriched 帧, 而共享
+的帧装不下每个账户各自的一套因子列。自定义因子在注册表里也是进程级单例
+(``factors/registry._REGISTRY``), 按账户分家会让 A 的定义出现在 B 的因子列表里,
+且 **B 删得掉 A 的因子**(删除端点的存在性守卫会被全局注册表短接)。
+
+对照原设计: 曾按每账户存放, 但那样共享评分路径无法表达"用谁的因子" —— 与自定义
+信号遇到的是同一个冲突。创作侧因此仅管理员可用(对普通用户隐藏自定义表达式的创作
+入口)。
 
 镜像 custom_signals 的持久化写法; 单文件损坏只禁用该因子并告警, 不影响启动
 (对齐 CONTRIBUTING 第 4 节插件隔离要求)。生命周期状态: draft → active →
@@ -19,7 +25,6 @@ from pathlib import Path
 from app.factors.dsl import compile_formula
 from app.factors.registry import FactorSpec, factor_dependencies, get_factor, register_factor
 from app.services.fs_utils import atomic_write_text
-from app.services.user_paths import resolve_user_root
 
 logger = logging.getLogger(__name__)
 
@@ -29,20 +34,23 @@ MAX_COMPOSITE_MEMBERS = 8
 STATUSES = frozenset({"draft", "active", "watch", "retired"})
 
 
-def _dir(user_root: Path | None = None) -> Path:
-    directory = resolve_user_root(user_root) / "user_data" / "custom_factors"
+def _dir() -> Path:
+    """自定义因子目录 —— **部署级**, 与账户无关(理由见模块 docstring)。"""
+    from app.config import settings
+
+    directory = settings.data_dir / "user_data" / "custom_factors"
     directory.mkdir(parents=True, exist_ok=True)
     return directory
 
 
-def _path(user_root: Path | None, factor_id: str) -> Path:
-    return _dir(user_root) / f"{factor_id}.json"
+def _path(factor_id: str) -> Path:
+    return _dir() / f"{factor_id}.json"
 
 
-def load_all(user_root: Path | None = None) -> list[dict]:
-    """读取**当前账户**的全部自定义/复合因子定义; 损坏文件跳过。"""
+def load_all() -> list[dict]:
+    """读取全部自定义/复合因子定义(部署级一份); 损坏文件跳过。"""
     out: list[dict] = []
-    for file in sorted(_dir(user_root).glob("*.json")):
+    for file in sorted(_dir().glob("*.json")):
         try:
             out.append(json.loads(file.read_text(encoding="utf-8")))
         except Exception as exc:
@@ -50,14 +58,14 @@ def load_all(user_root: Path | None = None) -> list[dict]:
     return out
 
 
-def save_one(definition: dict, user_root: Path | None = None) -> None:
-    target = _path(user_root, str(definition["id"]))
+def save_one(definition: dict) -> None:
+    target = _path(str(definition["id"]))
     target.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(target, json.dumps(definition, ensure_ascii=False, indent=2))
 
 
-def delete_one(factor_id: str, user_root: Path | None = None) -> bool:
-    target = _path(user_root, factor_id)
+def delete_one(factor_id: str) -> bool:
+    target = _path(factor_id)
     if target.exists():
         target.unlink()
         return True
@@ -168,12 +176,12 @@ def register_definition(definition: dict) -> FactorSpec:
     return spec
 
 
-def load_into_registry(user_root: Path | None = None) -> list[str]:
-    """启动期/子进程把**该账户**存储中的因子注册进注册表; 单个失败只跳过并告警。
+def load_into_registry() -> list[str]:
+    """启动期/子进程把存储中的因子注册进注册表; 单个失败只跳过并告警。
 
-    注意: 注册表是进程级单例, 且此处**必须**有账户上下文或显式 user_root ——
-    没有账户的后台调用方 (启动期 main.py、回测子进程 worker.py) 会抛
-    MissingUserContextError, 需要上层的每账户扇出决定用哪个 root。
+    签名**不含 user_root**: 因子是部署级的, 位置由 settings.data_dir 决定 ——
+    这也让启动期(main.py)与回测子进程(worker.py)这两个**没有账户上下文**的调用方
+    能够正确加载, 而不必依赖上层的每账户扇出。
 
 
     多轮加载: composite 成员可能引用尚未加载的 custom/其他 composite (文件按
@@ -181,7 +189,7 @@ def load_into_registry(user_root: Path | None = None) -> list[str]:
     重试用尽仍失败的只告警不阻塞启动。
     """
     loaded: list[str] = []
-    pending = list(load_all(user_root))
+    pending = list(load_all())
     for round_index in range(3):
         deferred: list[dict] = []
         for definition in pending:

@@ -128,12 +128,8 @@ STORES = [
         lambda root: [secrets_store.load(root).get("ai_api_key")],
         [None],
     ),
-    (
-        "自定义因子",
-        lambda root: factors_store.save_one(dict(_FACTOR), root),
-        lambda root: [d["id"] for d in factors_store.load_all(root)],
-        [],
-    ),
+    # 自定义因子**不在此列**: 它是部署级存储(产出共享 enriched 帧的列),
+    # 与自定义信号同作用域, 无上下文时正常读写。
 ]
 
 _IDS = [case[0] for case in STORES]
@@ -245,17 +241,27 @@ def test_report_delete_of_other_account_is_a_no_op(_isolated):
         assert [r["id"] for r in ai_reports.list_reports(root_a)] == [saved["id"]]
 
 
-def test_factor_delete_in_one_account_keeps_the_other(_isolated):
-    with as_account(1) as root_a:
-        factors_store.save_one(dict(_FACTOR), root_a)
-    with as_account(2) as root_b:
-        factors_store.save_one(dict(_FACTOR), root_b)
+def test_custom_factors_are_deployment_level_not_per_account(_isolated):
+    """自定义因子是**部署级**一套 —— 与自定义信号同作用域、同理由。
 
-    with as_account(1) as root_a:
-        assert factors_store.delete_one(_FACTOR["id"], root_a) is True
+    因子列由 ``scoring.materialize_scoring_columns`` 物化进**共享** enriched 帧,
+    一张共享帧装不下每账户一套; 注册表(``factors.registry._REGISTRY``)也是进程级
+    单例, 按账户分家会让 A 的定义出现在 B 的因子列表里, 且 **B 删得掉 A 的因子**
+    (删除端点的存在性守卫被全局注册表短接)。创作侧因此改为管理员专属。
 
-    with as_account(2) as root_b:
-        assert [d["id"] for d in factors_store.load_all(root_b)] == [_FACTOR["id"]]
+    本用例替换原先的"每账户各自保有"断言 —— 那个断言建立在错误的作用域上。
+    """
+    factors_store.save_one(dict(_FACTOR))
+
+    with as_account(1):
+        assert [d["id"] for d in factors_store.load_all()] == [_FACTOR["id"]]
+    with as_account(2):
+        # 另一个账户看到的是**同一份**定义(不是空, 也不是自己的副本)
+        assert [d["id"] for d in factors_store.load_all()] == [_FACTOR["id"]]
+
+    # 落在共享位置, 不在任何账户根之下
+    assert (_isolated / "user_data" / "custom_factors" / f"{_FACTOR['id']}.json").is_file()
+    assert not (_isolated / "users" / "1" / "user_data" / "custom_factors").exists()
 
 
 def test_secrets_are_per_account_and_stay_0600(_isolated):

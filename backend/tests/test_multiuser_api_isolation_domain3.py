@@ -251,29 +251,35 @@ def test_secrets_file_is_written_per_account_with_0600(_isolated, two_accounts):
 # ================================================================
 # 自定义因子 (写路径需要试算门禁, 这里只验证读路径按账户分家)
 # ================================================================
-def test_custom_factors_are_isolated_between_panel_accounts(two_accounts, _isolated):
-    """因子定义按账户存放: 同名的定义各存各的, 删除只作用于自己的账户。
+def test_custom_factor_definition_endpoint_is_admin_only(two_accounts, _isolated):
+    """自定义因子的**定义**端点是管理员专属 —— 普通用户连删除都发不出去。
 
-    创建端点带试算门禁 (需要真实面板), 这里直接放一份定义文件, 用删除端点验证
-    「读的是当前账户的目录」—— 该端点的存在性判定完全取决于 store 的按账户读取。
+    因子是部署级存储(产出共享 enriched 帧的列, 见 factors.store 的 docstring),
+    因此不存在"各账户各存各的"这回事; 保护它的是**角色**, 不是按账户的目录。
+
+    这比原先的断言更强: 原先普通用户的删除返回 404(靠"自己的目录里查不到"),
+    现在是 403(角色不允许) —— 定义文件必须原封不动。
+
+    同时覆盖那个真实的破坏性缺陷: 删除端点的存在性判定曾被全局注册表短接,
+    于是 B 能删掉 A 的因子。现在普通用户根本到不了那一步。
     """
-    factor_id = "uf_orphan_iso"
-    definition = {"id": factor_id, "kind": "custom", "label": "A 的因子", "status": "draft",
+    factor_id = "uf_admin_only"
+    definition = {"id": factor_id, "kind": "custom", "label": "站点因子", "status": "draft",
                   "formula": "close", "version": 1}
-
-    factor_dir_a = _isolated / "users" / "1" / "user_data" / "custom_factors"
-    factor_dir_a.mkdir(parents=True, exist_ok=True)
-    factor_file_a = factor_dir_a / f"{factor_id}.json"
-    factor_file_a.write_text(json.dumps(definition, ensure_ascii=False), encoding="utf-8")
+    factor_file = _isolated / "user_data" / "custom_factors" / f"{factor_id}.json"
+    factor_file.parent.mkdir(parents=True, exist_ok=True)
+    factor_file.write_text(json.dumps(definition, ensure_ascii=False), encoding="utf-8")
 
     a, b = two_accounts
-    # B 看不到 A 的定义 → 删除端点按「不存在」拒绝
-    missing = b.delete(f"/api/factors/custom/{factor_id}")
-    assert missing.status_code == 404, missing.text
-    assert factor_file_a.is_file(), "B 的删除动到了 A 的文件"
+    # 普通用户: 被角色挡住, 定义文件不受影响
+    denied = b.delete(f"/api/factors/custom/{factor_id}")
+    assert denied.status_code == 403, denied.text
+    assert denied.json()["code"] == "ADMIN_REQUIRED"
+    assert factor_file.is_file(), "普通用户的删除竟然动到了定义文件"
 
-    # A 删自己的 → 成功, 文件消失
+    # 管理员: 删除成功
     removed = a.delete(f"/api/factors/custom/{factor_id}")
     assert removed.status_code == 200, removed.text
-    assert not factor_file_a.exists()
-    assert not (_isolated / "user_data" / "custom_factors" / f"{factor_id}.json").exists()
+    assert not factor_file.exists()
+
+
