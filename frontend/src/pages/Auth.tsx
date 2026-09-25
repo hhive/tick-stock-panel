@@ -20,6 +20,7 @@ import {
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { Logo } from '@/components/Logo'
+import { toast } from '@/components/Toast'
 import { cn } from '@/lib/cn'
 import { SUB2API_SITE_URL, getHeldJumpKey, setHeldJumpKey } from '@/lib/account'
 
@@ -53,14 +54,15 @@ export function Auth() {
   const [showPwd, setShowPwd] = useState(false)
   const [localError, setLocalError] = useState('')
 
-  // 取认证状态(是否已设密码)
-  const [status, setStatus] = useState<{ configured: boolean } | null>(null)
+  // 取认证状态(是否已设密码 / 当前是否已登录)
+  const [status, setStatus] = useState<{ configured: boolean; authenticated: boolean } | null>(null)
   useEffect(() => {
     api.authStatus().then(s => {
       setStatus(s)
-      // 已登录的话直接进面板(避免登录页死循环)
+      // 已登录(账号会话或单密码会话)直接进面板, 避免登录页死循环。
+      // authenticated 由服务端同时判定两个会话表, 前端不必再探 /api/account/me。
       if (s.authenticated) navigate('/', { replace: true })
-    }).catch(() => setStatus({ configured: false }))
+    }).catch(() => setStatus({ configured: false, authenticated: false }))
   }, [navigate])
 
   const isSetup = !status?.configured  // configured=false → 设密码模式
@@ -72,8 +74,13 @@ export function Auth() {
     if (pending) {
       try {
         await api.accountBind(pending)
-      } catch {
-        // 绑定失败不阻塞进入面板: 账号本身已登录成功, 失败原因由 api 层 toast 提示
+      } catch (err) {
+        // 绑定失败不阻塞进入面板(账号本身已登录成功)。409(已被别的账号占用)等
+        // 非 401 错误由 api 层 toast; 401 被 api 层静默(它默认交给全局跳登录拦截),
+        // 这里必须自己补一条, 否则用户以为绑定成功却什么也没绑。
+        if ((err as { status?: number } | null)?.status === 401) {
+          toast('API Key 已失效, 未能绑定到当前账号', 'error')
+        }
       } finally {
         setHeldJumpKey(null)
         setHeldKey(null)

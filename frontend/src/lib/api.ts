@@ -2122,13 +2122,25 @@ export interface SectorRotationUniverseItem {
   excluded?: boolean
 }
 
+/** 认证状态 — 单密码应急会话与多用户账号会话共用一份判定 */
+export interface AuthStatus {
+  /** 是否设过单密码(语义仅描述单密码应急入口, 与多用户无关) */
+  configured: boolean
+  /** 账号会话或单密码会话任一有效 */
+  authenticated: boolean
+  /** 面板是否已被认领(设过密码 **或** 已有账号) */
+  claimed: boolean
+  mode: 'account' | 'legacy' | 'guest'
+  role: 'admin' | 'user' | 'guest'
+  email: string | null
+}
+
 // ===== API surface =====
 export const api = {
   health: () => request<{ status: string; version: string; mode: string }>('/health'),
 
   // ===== Auth (访问认证) =====
-  authStatus: () =>
-    request<{ configured: boolean; authenticated: boolean }>('/api/auth/status'),
+  authStatus: () => request<AuthStatus>('/api/auth/status'),
   authSetup: (password: string) =>
     request<{ ok: boolean }>('/api/auth/setup', {
       method: 'POST',

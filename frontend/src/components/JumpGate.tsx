@@ -96,7 +96,7 @@ export function JumpGate() {
     // 凭证必须在首帧渲染前就摘掉: 它是 bearer 凭证, 不能留在地址栏/浏览历史里,
     // 也不能被后续请求带进 Referer。摘取是同步的, 早于任何 await。
     const captured = captureJumpKeyFromUrl()
-    return captured || getHeldJumpKey() ? { kind: 'checking' } : { kind: 'proceed' }
+    return (captured || getHeldJumpKey()) ? { kind: 'checking' } : { kind: 'proceed' }
   })
 
   useEffect(() => {

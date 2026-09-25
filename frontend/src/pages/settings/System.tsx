@@ -4,10 +4,11 @@
  * 独立于实时监控, 放置影响整体应用行为的开关项。
  */
 import { useState, useCallback, useEffect } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useQueryClient } from '@tanstack/react-query'
-import { Settings2, Trash2, RefreshCw, Bell, Volume2, Info, ExternalLink } from 'lucide-react'
+import { Settings2, Trash2, RefreshCw, Bell, Volume2, Info, ExternalLink, LogOut, Loader2, UserRound } from 'lucide-react'
 import { usePreferences, useVersion } from '@/lib/useSharedQueries'
-import { api } from '@/lib/api'
+import { api, type AuthStatus } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
 import { PageHeader } from '@/components/PageHeader'
 import { refreshAlertToastConfig } from '@/components/AlertToast'
@@ -19,9 +20,11 @@ import { loadStockExternalTemplate, saveStockExternalTemplate } from '@/lib/stoc
 
 export function SettingsSystemPanel() {
   const qc = useQueryClient()
+  const navigate = useNavigate()
   const { data: prefs } = usePreferences()
   const { data: versionData } = useVersion()
   const [saving, setSaving] = useState(false)
+  const [signingOut, setSigningOut] = useState(false)
 
   const screenerAutoRun = prefs?.screener_auto_run ?? true
   const [extTpl, setExtTpl] = useState(() => loadStockExternalTemplate())
@@ -87,6 +90,31 @@ export function SettingsSystemPanel() {
     }
   }, [qc])
 
+  // ===== 账号: 当前身份 + 退出登录 =====
+  // 多用户面板下没有这处入口, 登录后就再也退不出去/换不了账号。
+  const [authInfo, setAuthInfo] = useState<{ mode: AuthStatus['mode']; email: string | null } | null>(null)
+  useEffect(() => {
+    api.authStatus()
+      .then(s => setAuthInfo({ mode: s.mode, email: s.email }))
+      .catch(() => setAuthInfo(null))  // 取不到就按最简单的文案展示, 不挡退出
+  }, [])
+
+  const handleLogout = useCallback(async () => {
+    setSigningOut(true)
+    try {
+      // 账号会话与单密码应急会话是两套独立会话, 按当前身份登出对应那一个
+      if (authInfo?.mode === 'legacy') await api.authLogout()
+      else await api.accountLogout()
+    } catch {
+      // 登出接口失败(如会话已过期)也要让本地落到未登录态, 否则用户卡在已登录界面
+    } finally {
+      // 清掉查询缓存: 换账号后不能还看到上一个账号的数据
+      qc.clear()
+      setSigningOut(false)
+      navigate('/login', { replace: true })
+    }
+  }, [authInfo, navigate, qc])
+
   // 刷新前端缓存: 清除 react-query 缓存 + 强制重载 (绕过浏览器缓存)
   // 不动 localStorage (用户列配置/策略池等偏好保留), 也不影响后端的本地股票数据
   const handleClearCache = useCallback(() => {
@@ -106,6 +134,42 @@ export function SettingsSystemPanel() {
       />
 
       <section className="rounded-card border border-border bg-surface p-5">
+        <div className="flex items-center gap-2 mb-4">
+          <UserRound className="h-4 w-4 text-accent" />
+          <h3 className="text-sm font-medium text-foreground">账号</h3>
+        </div>
+
+        <div className="flex items-center justify-between gap-4 py-2">
+          <div className="min-w-0">
+            <div className="text-sm text-foreground truncate">
+              {authInfo?.mode === 'account' ? (authInfo.email || '已登录账号') : '访问密码登录'}
+            </div>
+            <div className="text-[11px] text-muted truncate">
+              {authInfo?.mode === 'account'
+                ? '当前登录的面板账号'
+                : '当前通过单密码应急入口登录'}
+            </div>
+          </div>
+          <button
+            type="button"
+            data-testid="logout"
+            onClick={handleLogout}
+            disabled={signingOut}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-btn text-xs
+                       bg-elevated text-secondary hover:text-foreground transition-colors
+                       disabled:opacity-50 shrink-0"
+          >
+            {signingOut ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <LogOut className="h-3.5 w-3.5" />
+            )}
+            {signingOut ? '退出中…' : '退出登录'}
+          </button>
+        </div>
+      </section>
+
+      <section className="rounded-card border border-border bg-surface p-5 mt-6">
         <div className="flex items-center gap-2 mb-4">
           <Settings2 className="h-4 w-4 text-accent" />
           <h3 className="text-sm font-medium text-foreground">策略页</h3>

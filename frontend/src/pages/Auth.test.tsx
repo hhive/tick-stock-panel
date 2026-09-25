@@ -41,6 +41,11 @@ vi.mock('@/lib/api', () => ({
 
 const m = vi.mocked(api)
 const JUMP_KEY = 'sk-jump-test'
+/** /api/auth/status 的未登录(游客)回包 */
+const GUEST_STATUS = {
+  configured: true, authenticated: false, claimed: true,
+  mode: 'guest' as const, role: 'guest' as const, email: null,
+}
 
 let host: HTMLDivElement
 let root: Root
@@ -53,7 +58,7 @@ beforeEach(() => {
   resetJumpStateForTests()
 
   // 默认: 面板已设过密码, 当前未登录
-  m.authStatus.mockResolvedValue({ configured: true, authenticated: false })
+  m.authStatus.mockResolvedValue({ ...GUEST_STATUS })
   m.accountBind.mockResolvedValue({ ok: true })
 
   // jsdom 的地址栏独立于 router 的 location, 跳转凭证的来源以地址栏为准
@@ -316,6 +321,29 @@ it('401 登录失败显示邮箱或密码错误', async () => {
 
   expect(text()).toContain('邮箱或密码错误')
   expect(host.querySelector('[data-testid="app-home"]')).toBeNull()
+})
+
+it('账号会话仍在时访问登录页直接进入面板 (authenticated 已覆盖账号会话)', async () => {
+  m.authStatus.mockResolvedValue({
+    ...GUEST_STATUS, authenticated: true, mode: 'account', role: 'user', email: 'vip@example.com',
+  })
+
+  await renderAuthOnly()
+
+  expect(host.querySelector('[data-testid="app-home"]')).not.toBeNull()
+  expect(host.querySelector('[data-testid="email-input"]')).toBeNull()
+  // 登录页不再额外探 /api/account/me 当鉴权用
+  expect(m.accountMe).not.toHaveBeenCalled()
+})
+
+it('单密码应急会话 (mode=legacy) 同样直接进入面板', async () => {
+  m.authStatus.mockResolvedValue({
+    ...GUEST_STATUS, authenticated: true, mode: 'legacy', role: 'admin',
+  })
+
+  await renderAuthOnly()
+
+  expect(host.querySelector('[data-testid="app-home"]')).not.toBeNull()
 })
 
 it('旧访问密码通道仍可用 (不回归单密码流程)', async () => {
