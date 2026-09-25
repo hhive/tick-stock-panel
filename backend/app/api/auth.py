@@ -135,11 +135,51 @@ class ChangePasswordIn(BaseModel):
 
 @router.get("/status")
 def auth_status(request: Request) -> dict:
-    """认证状态: 是否已设密码 + 当前请求是否已登录。"""
+    """认证状态: 是否已设密码 + 当前请求是否已登录。
+
+    `authenticated` 必须**同时**检查账号会话与单密码应急会话。只查后者的话,
+    已登录的多用户账号一刷新页面就会被判定为未登录、被打回登录页 —— 前端只能
+    各自再探一次 /api/account/me 绕过, 那是把服务端的契约漏洞转嫁给每个客户端。
+
+    `configured` 语义保持不变(仅"是否设过单密码"), 以免破坏单密码首次设置流程;
+    "面板是否已被认领"另以 `claimed` 表达(设过密码**或**已有账号)。
+    """
+    from app.services import account_sessions, accounts
+
     token = request.cookies.get(COOKIE_NAME)
+
+    # 1) 账号会话优先(多用户主路径)
+    account_id = account_sessions.get_session(token) if token else None
+    if account_id is not None:
+        acc = accounts.get_by_id(account_id)
+        return {
+            "configured": auth.is_configured(),
+            "authenticated": True,
+            "claimed": True,
+            "mode": "account",
+            "role": (acc.role if acc else "user"),
+            "email": (acc.email if acc else None),
+        }
+
+    # 2) 单密码应急入口
+    if token and auth.is_valid_session(token):
+        return {
+            "configured": auth.is_configured(),
+            "authenticated": True,
+            "claimed": True,
+            "mode": "legacy",
+            "role": "admin",
+            "email": None,
+        }
+
+    # 3) 未登录
     return {
         "configured": auth.is_configured(),
-        "authenticated": bool(token and auth.is_valid_session(token)),
+        "authenticated": False,
+        "claimed": auth.is_configured() or accounts.has_accounts(),
+        "mode": "guest",
+        "role": "guest",
+        "email": None,
     }
 
 

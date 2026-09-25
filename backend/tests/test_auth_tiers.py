@@ -150,6 +150,39 @@ def test_public_read_allowed_even_on_unclaimed_panel(client):
 # 单密码应急入口不回归
 # ================================================================
 
+def test_auth_status_recognises_account_session(client):
+    """回归: /api/auth/status 必须把**账号会话**认作已登录。
+
+    原先它只查单密码会话表, 导致已登录的多用户刷新页面即被打回登录页 ——
+    前端只能各自再探 /api/account/me 绕过, 等于把服务端契约漏洞转嫁给每个客户端。
+    """
+    client.post("/api/account/register",
+                json={"email": "owner@example.com", "password": "secret123"})
+    body = client.get("/api/auth/status").json()
+    assert body["authenticated"] is True
+    assert body["mode"] == "account"
+    assert body["role"] == "admin"
+    assert body["email"] == "owner@example.com"
+
+
+def test_auth_status_guest_is_not_authenticated(claimed):
+    body = claimed.get("/api/auth/status").json()
+    assert body["authenticated"] is False
+    assert body["mode"] == "guest"
+    # 已有账号 ⇒ 面板已认领(但 configured 仍只表示"设过单密码", 语义未变)
+    assert body["claimed"] is True
+
+
+def test_auth_status_legacy_session_is_authenticated(client):
+    auth_service.set_password("legacy-pass-123")
+    client.cookies.clear()
+    client.post("/api/auth/login", json={"password": "legacy-pass-123"})
+    body = client.get("/api/auth/status").json()
+    assert body["authenticated"] is True
+    assert body["mode"] == "legacy"
+    assert body["role"] == "admin"
+
+
 def test_legacy_password_session_still_works(client):
     """既有的单密码路径必须继续可用(应急入口), 且行为不变。"""
     auth_service.set_password("legacy-pass-123")
