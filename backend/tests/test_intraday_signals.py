@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import polars as pl
 import pytest
 
+from app import config as app_config
 from app.strategy import custom_signals
 from app.strategy.intraday_features import build_feature_frame
 from app.strategy.intraday_signals import IntradaySignalEvaluator, uses_intraday_signals
@@ -301,7 +302,11 @@ def _engine(tmp_path: Path):
     return StrategyEngine(strategy_dirs=[custom_dir])
 
 
-def test_engine_injects_csgi_columns_into_minute_frame(tmp_path: Path):
+def test_engine_injects_csgi_columns_into_minute_frame(tmp_path: Path, monkeypatch):
+    # 自定义信号是**部署级**存储(见 custom_signals._dir): 位置由 settings.data_dir
+    # 决定, 而不是引擎构造时收到的那个 dir。必须把全局指向 tmp, 否则会读到
+    # 真实仓库 data/ 下的信号(测试之间互相污染, 且可能在真实目录里留文件)。
+    monkeypatch.setattr(app_config.settings, "data_dir", tmp_path)
     sig = _intraday_sig(id="eng_sig", conditions=[{"left": "price", "op": "cross_up", "right": "field:vwap"}])
     sig_dir = tmp_path / "user_data" / "custom_signals"
     sig_dir.mkdir(parents=True, exist_ok=True)
@@ -354,7 +359,11 @@ def _seed_repo(tmp_path: Path):
     return KlineRepository(DataStore(tmp_path))
 
 
-def test_intraday_replay_endpoint(tmp_path: Path):
+def test_intraday_replay_endpoint(tmp_path: Path, monkeypatch):
+    # 自定义信号是**部署级**存储(见 custom_signals._dir): 位置由 settings.data_dir
+    # 决定, 而不是引擎构造时收到的那个 dir。必须把全局指向 tmp, 否则会读到
+    # 真实仓库 data/ 下的信号(测试之间互相污染, 且可能在真实目录里留文件)。
+    monkeypatch.setattr(app_config.settings, "data_dir", tmp_path)
     from app.api.signals import IntradayReplayRequest, intraday_replay
 
     repo = _seed_repo(tmp_path)

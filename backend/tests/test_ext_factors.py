@@ -52,6 +52,26 @@ def data_dir(tmp_path, monkeypatch):
     return tmp_path
 
 
+@pytest.fixture
+def user_root(data_dir):
+    """账户私有根目录 —— 生产形态 ``<data_dir>/users/<账号ID>``。
+
+    扩展表**配置**与行情一样落在共享 data_dir (ExtConfigStore(data_dir)); 策略结果
+    缓存 (``<user_root>/user_data/strategy_cache.json``) 每账户一份 —— data_dir 自身
+    是共享位置, 不能当账户根。
+    """
+    from app.services import accounts, user_paths
+
+    # 必须真实注册账号 1: "共享数据变更 → 清理所有账户的派生缓存"这类操作按**账号
+    # 注册表**扇出(见 user_paths.iter_user_roots), 注册表为空时它遍历不到任何账户,
+    # 于是什么都不会被清。这不是测试的权宜之计, 而是该机制的真实前提 —— 每用户数据
+    # 只属于已注册账号, 无账号时本就没有可清的东西。
+    accounts.reset_state_for_tests()
+    accounts.create_account("u1@example.com", "secret123")
+
+    return user_paths.user_root(1)
+
+
 def _mk_config(data_dir, cid="tags", mode="timeseries", fields=None):
     cfg = ExtConfig(
         id=cid, label="题材标签", mode=mode,
@@ -190,16 +210,20 @@ def test_snapshot_gated_off_history_frames(data_dir):
 # ── 信号消费 / 评分引用 ───────────────────────────────────
 
 def _save_signal(data_dir, sid="ext_hot", left=COL):
+    """信号定义是**部署级**一份 (落 <data_dir>/user_data/custom_signals, 见
+    custom_signals._dir 的论证: 信号列产出在共享 enriched 表上, 装不下每账户一套)。"""
     custom_signals.save_one({
         "id": sid, "name": "题材热度", "kind": "entry", "enabled": True,
         "conditions": [{"left": left, "op": ">", "right": "0.5", "leftDays": 0, "rightDays": 0}],
-    }, user_root=data_dir)
+    })
 
 
 def test_signal_validate_and_inject_with_ext_field(data_dir):
     _mk_config(data_dir, mode="timeseries")
     _save_signal(data_dir)
-    sig = custom_signals.load_all(data_dir)[0]
+    # 落盘在部署级信号目录, 不在账户根之下
+    assert (data_dir / "user_data" / "custom_signals" / "ext_hot.json").exists()
+    sig = custom_signals.load_all()[0]
     custom_signals.validate(sig)  # ext 字段在白名单 → 不抛错
 
     write_ext_parquet(
@@ -241,7 +265,7 @@ def test_write_invalidates_frame_cache(data_dir):
     assert out2[COL].to_list() == [0.8]
 
 
-def test_routine_pull_keeps_strategy_cache_but_default_clears(data_dir):
+def test_routine_pull_keeps_strategy_cache_but_default_clears(data_dir, user_root):
     """定时拉取 (keep_strategy_cache=True) 只失效扩展帧缓存, 不销毁策略结果。
 
     策略页依赖 strategy_cache 秒加载; 周期性拉取每轮全清会让页面在两次
@@ -253,8 +277,10 @@ def test_routine_pull_keeps_strategy_cache_but_default_clears(data_dir):
     strategy_cache.write_cache(
         "2026-01-05",
         {"s1": {"total": 1, "as_of": "2026-01-05", "rows": []}},
-        user_root=data_dir,
+        user_root=user_root,
     )
+    # 缓存落在账户根之下 (生产形态)
+    assert (user_root / "user_data" / "strategy_cache.json").exists()
 
     write_ext_parquet(
         pl.DataFrame({"symbol": ["600000.SH"], "hot": [0.8]}),
@@ -262,7 +288,7 @@ def test_routine_pull_keeps_strategy_cache_but_default_clears(data_dir):
         keep_strategy_cache=True,
     )
     # 策略结果保留; 扩展帧缓存仍失效 → 新值立即可见
-    cached = strategy_cache.read_cache(data_dir) or {}
+    cached = strategy_cache.read_cache(user_root) or {}
     assert cached.get("results", {}).get("s1", {}).get("total") == 1
     frame = _frame([("600000.SH", "2026-01-05", 10.0)])
     out = ext_factors.attach_ext_columns(frame, include_snapshot=False, data_dir=data_dir)
@@ -273,10 +299,10 @@ def test_routine_pull_keeps_strategy_cache_but_default_clears(data_dir):
         pl.DataFrame({"symbol": ["600000.SH"], "hot": [0.9]}),
         cfg, data_dir, snapshot_date=date(2026, 1, 5),
     )
-    assert strategy_cache.read_cache(data_dir) is None
+    assert strategy_cache.read_cache(user_root) is None
 
 
-def test_scheduler_status_upsert_keeps_strategy_cache(data_dir):
+def test_scheduler_status_upsert_keeps_strategy_cache(data_dir, user_root):
     """定时拉取循环的 last_run/next_run 例行回写 (keep_strategy_cache=True)
     不清策略结果缓存; UI 保存配置 (默认) 仍全清。
 
@@ -291,17 +317,17 @@ def test_scheduler_status_upsert_keeps_strategy_cache(data_dir):
     strategy_cache.write_cache(
         "2026-01-05",
         {"s1": {"total": 1, "as_of": "2026-01-05", "rows": []}},
-        user_root=data_dir,
+        user_root=user_root,
     )
 
     # 调度器例行回写 (last_run/next_run): 保留策略结果
     store.upsert(cfg, keep_strategy_cache=True)
-    cached = strategy_cache.read_cache(data_dir) or {}
+    cached = strategy_cache.read_cache(user_root) or {}
     assert cached.get("results", {}).get("s1", {}).get("total") == 1
 
     # UI 保存配置 (字段集可能变化): 默认全清
     store.upsert(cfg)
-    assert strategy_cache.read_cache(data_dir) is None
+    assert strategy_cache.read_cache(user_root) is None
 
 
 def test_config_field_change_invalidates_sync(data_dir):

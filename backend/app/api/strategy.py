@@ -95,7 +95,7 @@ def _missing_custom_signals(user_root: Path, required_features) -> list[str]:
     """
     from app.strategy import custom_signals
 
-    defined = {s.get("id") for s in custom_signals.load_all(user_root)}
+    defined = {s.get("id") for s in custom_signals.load_all()}
     return [
         name for name in (required_features or ())
         if isinstance(name, str) and name.startswith(custom_signals.PREFIX)

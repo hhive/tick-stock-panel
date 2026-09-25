@@ -169,7 +169,7 @@ def get_options():
 
 @router.get("")
 def list_signals(request: Request):
-    sigs = custom_signals.load_all(_user_root(request))
+    sigs = custom_signals.load_all()
     return {"signals": sigs}
 
 
@@ -183,7 +183,7 @@ def save_signal(req: SignalModel, request: Request):
         custom_signals.validate(sig)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    custom_signals.save_one(sig, user_root=_user_root(request))
+    custom_signals.save_one(sig)
     _invalidate(request)
     return {"ok": True, "signal": sig}
 
@@ -230,7 +230,7 @@ async def ai_generate_signal(req: AIGenerateRequest):
 def delete_signal(signal_id: str, request: Request):
     if not custom_signals.ID_RE.match(signal_id):
         raise HTTPException(status_code=400, detail="信号 id 非法")
-    deleted = custom_signals.delete_one(signal_id, user_root=_user_root(request))
+    deleted = custom_signals.delete_one(signal_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="信号不存在")
     _invalidate(request)
@@ -270,7 +270,7 @@ def intraday_replay(req: IntradayReplayRequest, request: Request):
 
     # 信号定义必须存在且为盘中类型
     sig = next(
-        (s for s in custom_signals.load_all(_user_root(request)) if s.get("id") == req.signal_id),
+        (s for s in custom_signals.load_all() if s.get("id") == req.signal_id),
         None,
     )
     if sig is None:

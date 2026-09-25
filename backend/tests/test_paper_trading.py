@@ -16,19 +16,32 @@ from app.tickflow.repository import DataStore, KlineRepository
 SYM = "600519.SH"
 
 
-@pytest.fixture(autouse=True)
-def _user_ctx(tmp_path, monkeypatch):
-    """模拟盘数据按面板账户分家: 域层从账户上下文解析 user_root。
+@pytest.fixture
+def user_root(tmp_path, monkeypatch):
+    """账户私有根目录 —— 生产形态 ``<data_dir>/users/<账号ID>``。
 
-    真实请求由认证中间件注入 user_root; 单测里把 tmp_path 同时当作共享行情目录与
-    该账户的根目录 (生产上 user_root 就在 data_dir 下, 见 user_paths.user_root)。
+    ``tmp_path`` 是**共享**行情目录 (settings.data_dir: 行情/K线/因子所有人一份),
+    账户根必须落在它下面的 ``users/<id>``; data_dir 自身是共享位置, 拿它当账户根
+    会让所有账户读写同一份文件, 会被 user_paths 的校验直接拒掉。
     """
     from app import config as app_config
-    from app.services import preferences
+    from app.services import user_paths
 
     monkeypatch.setattr(app_config.settings, "data_dir", tmp_path)
-    token = preferences.set_current_user_root(tmp_path)
-    yield tmp_path
+    return user_paths.user_root(1)
+
+
+@pytest.fixture(autouse=True)
+def _user_ctx(user_root):
+    """模拟盘数据按面板账户分家: 域层从账户上下文解析 user_root。
+
+    真实请求由认证中间件注入 user_root (它由 data_dir 与账号 ID 算出);
+    单测里手工注入同一 contextvar, 否则没有账户上下文的调用会 fail-closed。
+    """
+    from app.services import preferences
+
+    token = preferences.set_current_user_root(user_root)
+    yield user_root
     preferences.reset_current_user_root(token)
 
 
@@ -121,7 +134,7 @@ def test_create_order_etf_market_converts_to_next_open(tmp_path):
     assert order["order_type"] == "next_open"
 
 
-def test_sell_requires_holding_and_t1(tmp_path, monkeypatch):
+def test_sell_requires_holding_and_t1(tmp_path, monkeypatch, user_root):
     day = date(2026, 9, 24)
     monkeypatch.setattr(paper, "cn_today", lambda: day)
     _cap_account(tmp_path)
@@ -139,7 +152,7 @@ def test_sell_requires_holding_and_t1(tmp_path, monkeypatch):
 
     # 次日可卖
     monkeypatch.setattr(paper, "cn_today", lambda: day + timedelta(days=1))
-    paper._materialize(tmp_path)
+    paper._materialize(user_root)
     sell, err = paper.create_order(SYM, "sell", qty=100)
     assert err is None and sell["status"] == "pending"
 
@@ -202,7 +215,7 @@ def test_limit_up_buy_rejected(tmp_path, monkeypatch):
     assert "涨停" in got["reason"]
 
 
-def test_limit_down_sell_rejected(tmp_path, monkeypatch):
+def test_limit_down_sell_rejected(tmp_path, monkeypatch, user_root):
     day = date(2026, 9, 24)
     monkeypatch.setattr(paper, "cn_today", lambda: day)
     _write_daily(tmp_path, [(day - timedelta(days=1), 10.0, 10.0)])
@@ -211,7 +224,7 @@ def test_limit_down_sell_rejected(tmp_path, monkeypatch):
     assert err is None
     paper.evaluate_intraday(tmp_path, {SYM: 10.0})
     monkeypatch.setattr(paper, "cn_today", lambda: day + timedelta(days=1))
-    paper._materialize(tmp_path)
+    paper._materialize(user_root)
     sell, err = paper.create_order(SYM, "sell", qty=100)
     assert err is None
     # 跌停 9.0; 快照 9 减滑点后不高于跌停价 -> 拒单
@@ -243,7 +256,7 @@ def test_settle_next_open_close_and_postpone_expire(tmp_path):
     assert s["expired"] >= 1
 
 
-def test_pending_sell_occupies_available_quota(tmp_path, monkeypatch):
+def test_pending_sell_occupies_available_quota(tmp_path, monkeypatch, user_root):
     """超卖防护: pending 卖出单占用可卖额度, 第二张超额卖出单在下单时被拒。"""
     day = date(2026, 9, 24)
     monkeypatch.setattr(paper, "cn_today", lambda: day)
@@ -254,7 +267,7 @@ def test_pending_sell_occupies_available_quota(tmp_path, monkeypatch):
     assert len(paper.evaluate_intraday(tmp_path, {SYM: 10.0})) == 1
     # 次日: 可卖 200
     monkeypatch.setattr(paper, "cn_today", lambda: day + timedelta(days=1))
-    paper._materialize(tmp_path)
+    paper._materialize(user_root)
     s1, err = paper.create_order(SYM, "sell", qty=100)
     assert err is None and s1["status"] == "pending"
     # 已 pending 100, 再挂 200 超出可卖 200 → 拒 (基础可卖校验或占用检查, 双闸任一)
@@ -291,7 +304,7 @@ def test_pending_buy_occupies_cash_at_fill(tmp_path, monkeypatch):
     assert cash >= 0
 
 
-def test_position_symbol_cap(tmp_path, monkeypatch):
+def test_position_symbol_cap(tmp_path, monkeypatch, user_root):
     """持仓标的数上限: 第 51 只新开仓买入被拒 (加仓已有持仓不受限)。"""
     day = date(2026, 9, 24)
     monkeypatch.setattr(paper, "cn_today", lambda: day)
@@ -299,13 +312,13 @@ def test_position_symbol_cap(tmp_path, monkeypatch):
     _cap_account(tmp_path, 100_000_000.0)
     # 人为塞满 50 只持仓 (直接写台账, 绕过 100 股 x 价格的资金约束)
     for i in range(50):
-        paper._append_fill(tmp_path, {
+        paper._append_fill(user_root, {
             "seq": i, "ts": "", "date": (day - timedelta(days=1)).isoformat(),
             "order_id": f"seed{i}", "symbol": f"{600000 + i:06d}.SH",
             "asset_type": "stock", "side": "buy", "qty": 100, "price": 1.0, "fee": 1.0,
             "kind": "fill",
         })
-    paper._materialize(tmp_path)
+    paper._materialize(user_root)
     # 新开仓第 51 只 → 拒
     _, err = paper.create_order("601999.SH", "buy", qty=100, ref_price=10.0)
     assert "上限" in err
@@ -355,7 +368,7 @@ def test_corporate_action_adjusts_position_and_idempotent(tmp_path):
     assert len(corp) == 1
 
 
-def test_nav_and_overview_math(tmp_path, monkeypatch):
+def test_nav_and_overview_math(tmp_path, monkeypatch, user_root):
     day = date(2026, 9, 24)
     monkeypatch.setattr(paper, "cn_today", lambda: day)
     _cap_account(tmp_path, 100_000.0)
@@ -374,13 +387,13 @@ def test_nav_and_overview_math(tmp_path, monkeypatch):
 
     # 定版净值: 收盘价写 nav/daily.jsonl, 同日重写幂等
     nav = paper.daily_nav(tmp_path, day.isoformat(), {SYM: 10.5})
-    paper._write_nav_line(tmp_path, day.isoformat(), nav)
-    paper._write_nav_line(tmp_path, day.isoformat(), nav)
+    paper._write_nav_line(user_root, day.isoformat(), nav)
+    paper._write_nav_line(user_root, day.isoformat(), nav)
     lines = paper.load_nav()
     assert len(lines) == 1 and lines[0]["nav"] == pytest.approx(nav["nav"])
 
 
-def test_round_trips_fifo_stats(tmp_path):
+def test_round_trips_fifo_stats(tmp_path, user_root):
     day = date(2026, 9, 1)
     _cap_account(tmp_path)
     _write_daily(tmp_path, [(day, 10.0, 10.0), (day + timedelta(days=1), 12.0, 12.0)])
@@ -392,7 +405,7 @@ def test_round_trips_fifo_stats(tmp_path):
          "asset_type": "stock", "side": "buy", "qty": 100, "price": 11.0, "fee": 5.0, "kind": "fill"},
         {"seq": 3, "ts": "", "date": (day + timedelta(days=1)).isoformat(), "order_id": "o3", "symbol": SYM,
          "asset_type": "stock", "side": "sell", "qty": 150, "price": 12.0, "fee": 5.0 + 18.0, "kind": "fill"}):
-        paper._append_fill(tmp_path, f)
+        paper._append_fill(user_root, f)
     rounds = paper.round_trips()
     assert len(rounds) == 2
     # FIFO: 先平 10 元批次 100 股, 再平 11 元批次 50 股
@@ -562,7 +575,7 @@ def test_limit_queue_fills_when_open_below_limit(tmp_path, monkeypatch):
 
 
 # ── 多账户 (V2) ─────────────────────────────────────────
-def test_multi_account_isolation(tmp_path, monkeypatch):
+def test_multi_account_isolation(tmp_path, monkeypatch, user_root):
     """两账户完全隔离: 订单/持仓/现金/统计互不可见。"""
     day = date(2026, 9, 24)
     monkeypatch.setattr(paper, "cn_today", lambda: day)
@@ -607,6 +620,11 @@ def test_multi_account_isolation(tmp_path, monkeypatch):
     nav2 = paper.load_nav("acc_a")
     assert len(nav1) == 1 and len(nav2) == 1 and nav1[0]["nav"] != nav2[0]["nav"]
 
+    # 落盘在账户根之下 (生产形态 <data_dir>/users/<面板账号ID>/), 不落共享 data_dir
+    assert (user_root / "paper" / "accounts" / "acc_a" / "account.json").exists()
+    assert (user_root / "paper" / "accounts" / "acc_a" / "nav" / "daily.jsonl").exists()
+    assert not (tmp_path / "paper").exists()
+
 
 def test_account_id_validation_blocks_traversal(tmp_path):
     import pytest as _pytest
@@ -617,11 +635,11 @@ def test_account_id_validation_blocks_traversal(tmp_path):
             paper.create_account(100.0, account_id=bad)
 
 
-def test_legacy_single_account_layout_migrates(tmp_path, monkeypatch):
-    """旧版 data/paper/* 单账户布局首次访问自动迁移到 accounts/default/。"""
+def test_legacy_single_account_layout_migrates(tmp_path, monkeypatch, user_root):
+    """旧版 <user_root>/paper/* 单账户布局首次访问自动迁移到 accounts/default/。"""
     monkeypatch.setattr(paper, "_MIGRATED_ROOTS", set())
-    legacy = tmp_path / "paper"
-    legacy.mkdir()
+    legacy = user_root / "paper"
+    legacy.mkdir(parents=True)
     (legacy / "account.json").write_text(
         __import__("json").dumps({
             "id": "default", "initial_cash": 800000.0, "cash": 750000.0,
@@ -634,10 +652,11 @@ def test_legacy_single_account_layout_migrates(tmp_path, monkeypatch):
 
     acc = paper.get_account()
     assert acc is not None and acc["cash"] == 750000.0
-    # 物理迁移到位
-    assert (tmp_path / "paper" / "accounts" / "default" / "account.json").exists()
-    assert (tmp_path / "paper" / "accounts" / "default" / "orders" / "order_x.json").exists()
+    # 物理迁移到位: 落在账户根之下, 不在共享 data_dir
+    assert (user_root / "paper" / "accounts" / "default" / "account.json").exists()
+    assert (user_root / "paper" / "accounts" / "default" / "orders" / "order_x.json").exists()
     assert not (legacy / "account.json").exists()
+    assert not (tmp_path / "paper").exists()
     # 幂等: 重复访问不报错
     assert paper.get_account()["cash"] == 750000.0
 

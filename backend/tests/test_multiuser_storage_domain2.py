@@ -91,11 +91,9 @@ _NO_CONTEXT_CALLS = {
     "结果缓存.clear": lambda: strategy_cache.clear_cache(),
     "运行耗时.load": lambda: strategy_run_queue.load_run_timings(),
     "运行耗时.record": lambda: strategy_run_queue.record_run_timings({"s1": 1.0}),
-    "自定义信号.load_all": lambda: custom_signals.load_all(),
-    "自定义信号.load_intraday_all": lambda: custom_signals.load_intraday_all(),
-    "自定义信号.signal_names": lambda: custom_signals.signal_names(),
-    "自定义信号.save": lambda: custom_signals.save_one({"id": "sig"}),
-    "自定义信号.delete": lambda: custom_signals.delete_one("sig"),
+    # 自定义信号**不在此列**: 它是部署级的, 不需要账户上下文 —— 无上下文时正常读写,
+    # 这正是它区别于每用户存储的地方。见
+    # test_custom_signals_are_deployment_level_not_per_account。
     "候选池.list": lambda: CandidateStore().list(),
     "候选池.create": lambda: CandidateStore().create(
         kind="factor", name="候选", source_id="rsi_14",
@@ -273,47 +271,61 @@ def _intraday_signal(signal_id: str, name: str) -> dict:
     }
 
 
-def test_custom_signals_are_isolated_between_accounts(_isolated):
-    with _as_account(1):
-        custom_signals.save_one({"id": "sig_a", "name": "A的信号"})
-        assert [s["id"] for s in custom_signals.load_all()] == ["sig_a"]
+def test_custom_signals_are_deployment_level_not_per_account(_isolated):
+    """信号是**部署级一套**: 任何账户上下文看到的是同一份。
 
-    with _as_account(2):
-        # 新账户起始为空, 且删不掉/改不了 A 的信号
-        assert custom_signals.load_all() == []
-        assert custom_signals.delete_one("sig_a") is False
+    为什么不是每用户: 信号定义产出的是共享 enriched 表的 ``csg_*`` 列, 而一张共享
+    表装不下每账户各自的一套信号列(共享实时快照同理)。评估过"共享表里装所有账户
+    信号的并集"这一替代方案并在 ``custom_signals._dir`` 里否决 —— A 的表达式会被
+    为所有人计算, 且 B 能通过列集合反推 A 定义了哪些信号, 属跨租户信息泄漏。
 
-    with _as_account(1):
-        assert [s["id"] for s in custom_signals.load_all()] == ["sig_a"]
-
-
-def test_custom_signal_fingerprint_caches_are_keyed_per_account(_isolated):
-    """盘中定义/命名两处缓存是按**解析后的账户根**作键。
-
-    键若用了入参 (contextvar 路径下是 None), 所有账户会共用同一个键 ——
-    同一个进程内 B 就会命中 A 的缓存。这里刻意在同一进程里连续切换账户,
-    不失效缓存: A 先写入并让缓存热起来, B 读到的必须是空。
+    本用例替换原先的"每账户隔离"断言: 那个断言建立在错误的作用域上。
     """
-    with _as_account(1):
-        custom_signals.save_one(_intraday_signal("sig_a", "A的信号"))
-        assert [s["id"] for s in custom_signals.load_intraday_all()] == ["sig_a"]
-        names_a = custom_signals.signal_names()
-        assert names_a[custom_signals.column_name("sig_a")] == "A的信号"
+    custom_signals.save_one({"id": "sig_a", "name": "站点信号"})
 
+    with _as_account(1):
+        assert [s["id"] for s in custom_signals.load_all()] == ["sig_a"]
     with _as_account(2):
-        assert custom_signals.load_intraday_all() == []
-        assert custom_signals.signal_names() == {}
+        # 另一个账户看到的是**同一份**定义(不是空, 也不是自己的副本)
+        assert [s["id"] for s in custom_signals.load_all()] == ["sig_a"]
 
-    with _as_account(1):
-        assert [s["id"] for s in custom_signals.load_intraday_all()] == ["sig_a"]
-        assert custom_signals.signal_names() == names_a
+    # 落在共享位置, 不在任何账户根之下
+    assert (_isolated / "user_data" / "custom_signals" / "sig_a.json").is_file()
+    assert not (_isolated / "users" / "1" / "user_data" / "custom_signals").exists()
 
 
-def test_custom_signals_explicit_user_root_beats_context(_isolated):
-    with _as_account(1):
-        custom_signals.save_one({"id": "sig_b"}, user_root=user_paths.user_root(2))
-        assert custom_signals.load_all() == []
-    assert [s["id"] for s in custom_signals.load_all(user_root=user_paths.user_root(2))] == ["sig_b"]
+def test_intraday_fingerprint_cache_reflects_changes(_isolated):
+    """指纹缓存必须仍能感知增删改(键从"每账户根"变为部署级信号目录, 单一键)。
+
+    这是原来那条"缓存按账户作键"用例的接替者。原用例保护的是跨账户命中, 作用域改成
+    部署级后那个风险不存在了; 但**同一个风险的另一面仍在**: 改了定义却读回旧值 ——
+    缓存若失效不当, 引擎会按旧表达式评估, 且没有任何提示。所以这里在同一进程内连续
+    增删而不主动失效缓存, 验证指纹能自动重载。
+    """
+    custom_signals.save_one(_intraday_signal("sig_a", "A的信号"))
+    assert [s["id"] for s in custom_signals.load_intraday_all()] == ["sig_a"]
+    names = custom_signals.signal_names()
+    assert names[custom_signals.column_name("sig_a")] == "A的信号"
+
+    custom_signals.save_one(_intraday_signal("sig_b", "B的信号"))
+    assert sorted(s["id"] for s in custom_signals.load_intraday_all()) == ["sig_a", "sig_b"]
+
+    custom_signals.delete_one("sig_a")
+    assert [s["id"] for s in custom_signals.load_intraday_all()] == ["sig_b"]
+    assert custom_signals.column_name("sig_a") not in custom_signals.signal_names()
+
+
+def test_custom_signals_rejects_the_removed_user_root_argument(_isolated):
+    """签名已去掉 user_root —— 传它必须**报错**, 不得静默忽略。
+
+    静默忽略会让调用方以为自己传的账户根生效了, 实际写的是站点级位置 ——
+    那正是"以为隔离了、其实没隔离"的形成方式, 也是本仓库里反复出现的一类缺陷。
+    用一个必抛的 TypeError 把它钉成显式失败。
+    """
+    with pytest.raises(TypeError):
+        custom_signals.save_one({"id": "sig_c"}, user_root=_isolated)  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        custom_signals.load_all(user_root=_isolated)  # type: ignore[call-arg]
 
 
 # ================================================================

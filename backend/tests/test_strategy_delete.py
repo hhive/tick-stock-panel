@@ -12,18 +12,30 @@ from app.strategy import monitor_rules
 from app.strategy.engine import StrategyEngine
 
 
-@pytest.fixture(autouse=True)
-def _user_ctx(tmp_path, monkeypatch):
-    """策略/监控规则按账户分家: 测试把账户根目录设为 tmp_path (旧 data_dir 布局)。
+@pytest.fixture
+def user_root(tmp_path, monkeypatch):
+    """账户私有根目录 —— 生产形态 ``<data_dir>/users/<账号ID>``。
 
-    真实请求由认证中间件注入 user_root; 这里手工注入同一 contextvar,
-    否则 delete_strategy 的清理路径会因为拿不到账户根目录而 fail-closed。
+    ``tmp_path`` 是共享数据目录 (settings.data_dir); 策略源码
+    (``<user_root>/strategies/{custom,ai,composite}``)、覆盖配置和策略缓存都落在
+    账户根之下 —— data_dir 自身是共享位置, 不能当账户根。
     """
     from app import config as app_config
+    from app.services import user_paths
 
     monkeypatch.setattr(app_config.settings, "data_dir", tmp_path)
-    token = preferences.set_current_user_root(tmp_path)
-    yield tmp_path
+    return user_paths.user_root(1)
+
+
+@pytest.fixture(autouse=True)
+def _user_ctx(user_root):
+    """策略/监控规则按账户分家: 真实请求由认证中间件注入 user_root。
+
+    这里手工注入同一 contextvar, 否则 delete_strategy 的清理路径会因为拿不到
+    账户根目录而 fail-closed。
+    """
+    token = preferences.set_current_user_root(user_root)
+    yield user_root
     preferences.reset_current_user_root(token)
 
 
@@ -58,8 +70,8 @@ def _request(data_dir: Path, engine: StrategyEngine, monitor: _MonitorEngine | N
     return SimpleNamespace(app=SimpleNamespace(state=state))
 
 
-def test_delete_strategy_is_not_blocked_by_another_broken_file(monkeypatch, tmp_path):
-    custom_dir = tmp_path / "strategies" / "custom"
+def test_delete_strategy_is_not_blocked_by_another_broken_file(monkeypatch, tmp_path, user_root):
+    custom_dir = user_root / "strategies" / "custom"
     custom_dir.mkdir(parents=True)
     strategy_path = custom_dir / "target.py"
     strategy_path.write_text(_strategy_code("target"), encoding="utf-8")
@@ -72,10 +84,10 @@ def test_delete_strategy_is_not_blocked_by_another_broken_file(monkeypatch, tmp_
         engine.reload()
     assert engine.has("target")
 
-    override_path = tmp_path / "user_data" / "strategy_overrides" / "target.json"
+    override_path = user_root / "user_data" / "strategy_overrides" / "target.json"
     override_path.parent.mkdir(parents=True)
     override_path.write_text("{}", encoding="utf-8")
-    cache_path = tmp_path / "user_data" / "strategy_cache.json"
+    cache_path = user_root / "user_data" / "strategy_cache.json"
     cache_path.write_text("{}", encoding="utf-8")
 
     rule = monitor_rules.normalize({
@@ -112,8 +124,8 @@ def test_delete_strategy_is_not_blocked_by_another_broken_file(monkeypatch, tmp_
     assert monitor.rules and monitor.rules[0]["enabled"] is False
 
 
-def test_delete_strategy_reports_read_only_volume_without_unregistering(monkeypatch, tmp_path):
-    custom_dir = tmp_path / "strategies" / "custom"
+def test_delete_strategy_reports_read_only_volume_without_unregistering(monkeypatch, tmp_path, user_root):
+    custom_dir = user_root / "strategies" / "custom"
     custom_dir.mkdir(parents=True)
     strategy_path = custom_dir / "target.py"
     strategy_path.write_text(_strategy_code("target"), encoding="utf-8")

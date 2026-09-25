@@ -83,6 +83,28 @@ def read_cache(user_root: Path | None = None) -> dict | None:
         return _read_cache_unlocked(resolve_user_root(user_root))
 
 
+def clear_all_accounts() -> int:
+    """清除**所有账户**的策略结果缓存, 返回实际清理的账户数。
+
+    用于"**共享**数据变更"的场景 —— 例如扩展数据(概念/行业)变更: 它喂的是所有人
+    共用的计算, 所以每个账户基于它算出的策略结果都已过期。此时只清"当前账户"是
+    **不够的**: 其它账户会继续展示旧口径结果, 且不会有任何提示, 属于静默的错误结论。
+
+    开销: 进程级遍历账号注册表 + 逐账户写盘, 只在低频路径(配置变更)调用。
+    """
+    from app.services import user_paths
+
+    cleared = 0
+    for _account_id, root in user_paths.iter_user_roots():
+        try:
+            clear_cache(root)
+            cleared += 1
+        except Exception as e:  # noqa: BLE001
+            # 单个账户失败不中断整轮扇出 —— 否则一个坏账号会让其余账户永远留旧缓存
+            logger.warning("fan-out clear_cache 失败 root=%s: %s", root, e)
+    return cleared
+
+
 def clear_cache(user_root: Path | None = None) -> None:
     """删除**当前账户**的策略结果缓存；策略代码 reload 后避免继续展示旧公式结果。"""
     import traceback

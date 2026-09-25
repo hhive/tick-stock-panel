@@ -345,10 +345,16 @@ def invalidate_ext_caches(data_dir: Path | None = None, *, keep_strategy_cache: 
     _sync_state = None
     if keep_strategy_cache:
         return
-    from app.config import settings as _settings
     from app.services import strategy_cache
 
+    # 扩展数据(概念/行业)是**共享**的: 它喂的是所有人共用的计算, 所以**每个账户**
+    # 基于它算出的策略结果缓存都已过期。只清"当前账户"会留下其它账户展示旧口径的
+    # 结果, 且没有任何提示 —— 属于静默的错误结论。故按账户扇出。
+    # (原先此处把共享 data_dir 当账户根传入, 拆分后该调用会抛错并被吞成一条警告,
+    #  等于"扩展数据变更后策略缓存再也不会被清理"。)
     try:
-        strategy_cache.clear_cache(Path(data_dir) if data_dir else Path(_settings.data_dir))
-    except Exception as e:
+        cleared = strategy_cache.clear_all_accounts()
+        if cleared:
+            logger.info("扩展数据变更: 已清理 %d 个账户的策略缓存", cleared)
+    except Exception as e:  # noqa: BLE001
         logger.warning("扩展数据变更后策略缓存清理失败: %s", e)

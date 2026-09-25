@@ -389,7 +389,7 @@ class MonitorRuleEngine:
         未注入 data_dir 或查不到时回退原始列名。
         """
         if field.startswith(("csg_", "csgi_")) and self._data_dir is not None:
-            name = _custom_signal_names(self._data_dir).get(field)
+            name = _custom_signal_names().get(field)
             if name:
                 return name
         return _signal_cn_name(field)

@@ -9,6 +9,7 @@ import json
 
 import polars as pl
 
+from app import config as app_config
 from app.strategy.monitor import MonitorRuleEngine
 
 
@@ -62,7 +63,11 @@ def test_message_falls_back_to_conditions_when_no_truth_hit():
     assert "现价 3000.0" in msg
 
 
-def test_message_resolves_custom_signal_cn_name(tmp_path):
+def test_message_resolves_custom_signal_cn_name(tmp_path, monkeypatch):
+    # 自定义信号是**部署级**存储(见 custom_signals._dir): 位置由 settings.data_dir
+    # 决定, 而不是引擎构造时收到的那个 dir。必须把全局指向 tmp, 否则会读到
+    # 真实仓库 data/ 下的信号(测试之间互相污染, 且可能在真实目录里留文件)。
+    monkeypatch.setattr(app_config.settings, "data_dir", tmp_path)
     """csg_ 自定义信号在 message 中显示用户命名, 而非原始列名。"""
     d = tmp_path / "user_data" / "custom_signals"
     d.mkdir(parents=True)

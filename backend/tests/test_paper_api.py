@@ -15,19 +15,30 @@ from fastapi.testclient import TestClient
 from app.api.paper import router
 
 
-@pytest.fixture(autouse=True)
-def _user_ctx(tmp_path, monkeypatch):
-    """每用户存储 (密钥/报告/因子/模拟盘…) 没有共享回退, 需要账户上下文。
+@pytest.fixture
+def user_root(tmp_path, monkeypatch):
+    """账户私有根目录 —— 生产形态 ``<data_dir>/users/<账号ID>``。
 
-    真实请求由认证中间件注入 user_root; 这里的裸 app 没有中间件, 因此显式设置
-    上下文 —— tmp_path 既是本用例的共享数据目录, 也是该账户的根目录。
+    ``tmp_path`` 是共享行情目录 (settings.data_dir); data_dir 自身是共享位置,
+    不能作为账户根 (user_paths 的校验会拒), 每用户存储都在它下面的 users/<id>。
     """
     from app import config as app_config
-    from app.services import preferences
+    from app.services import user_paths
 
     monkeypatch.setattr(app_config.settings, "data_dir", tmp_path)
-    token = preferences.set_current_user_root(tmp_path)
-    yield tmp_path
+    return user_paths.user_root(1)
+
+
+@pytest.fixture(autouse=True)
+def _user_ctx(user_root):
+    """每用户存储 (密钥/报告/因子/模拟盘…) 没有共享回退, 需要账户上下文。
+
+    真实请求由认证中间件注入 user_root; 这里的裸 app 没有中间件, 因此显式设置上下文。
+    """
+    from app.services import preferences
+
+    token = preferences.set_current_user_root(user_root)
+    yield user_root
     preferences.reset_current_user_root(token)
 
 
@@ -48,7 +59,7 @@ def test_overview_before_init(client: TestClient):
     assert r.json() == {"initialized": False, "account_id": "default"}
 
 
-def test_multi_account_isolation_and_settings(client: TestClient):
+def test_multi_account_isolation_and_settings(client: TestClient, tmp_path: Path, user_root: Path):
     """双账户隔离: 订单/概览互不可见; settings 端点切换涨跌停排队。"""
     client.post("/api/paper/account", json={"initial_cash": 1000000})  # default
     r = client.post("/api/paper/account", json={"initial_cash": 500000, "account_id": "acc_a", "name": "策略A"})
@@ -75,6 +86,10 @@ def test_multi_account_isolation_and_settings(client: TestClient):
 
     # 非法账户 id → 400 (路径穿越防护)
     assert client.get("/api/paper/overview?account=../x").status_code == 400
+
+    # 落盘在账户根之下 (生产形态), 不写进共享 data_dir
+    assert (user_root / "paper" / "accounts" / "acc_a" / "account.json").exists()
+    assert not (tmp_path / "paper").exists()
 
 
 def test_account_create_idempotent(client: TestClient):

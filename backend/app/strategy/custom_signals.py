@@ -1,16 +1,17 @@
 """自定义信号 — 用户用「字段 + 运算符 + 值」组合出的布尔信号。
 
 职责:
-  - 从 ``<user_root>/user_data/custom_signals/*.json`` 加载信号定义 (**每账户一份**)
+  - 从 ``<data_dir>/user_data/custom_signals/*.json`` 加载信号定义 (**部署级一份**)
   - 把每个信号的 conditions 编译成一条 Polars 布尔表达式（AND 组合）
   - 供 pipeline 在 compute_signals / compute_enriched_today 末尾注入为列
 
 不知道: 引擎、AI、API、回测、监控。纯函数 + 模块级缓存。
 
-账户隔离: user_root 由 ``user_paths.resolve_user_root()`` 解析 (请求路径走认证中间件
-注入的 contextvar, 后台线程必须显式传 ``user_root=``)。本模块的两处指纹缓存
-(``_intraday_cache`` / ``_names_cache``) 以**解析后的账户根**为键 —— 键跟着账户走,
-A 的信号定义不会被 B 命中。
+作用域: **部署级**(见 ``_dir`` 的说明 —— 信号产出的是共享 enriched 表的列, 装不下
+每账户一套)。因此本模块**不再接受 user_root**; 调用方传进来的账户根对该模块无意义。
+本模块的两处指纹缓存
+(``_intraday_cache`` / ``_names_cache``) 以部署级信号目录为键(单一键) —— 定义只有一套,
+不存在跨账户命中的问题。
 
 设计:
   - 信号列名加前缀 ``csg_`` 避免与内置 ``signal_`` 列冲突。
@@ -28,7 +29,6 @@ from pathlib import Path
 import polars as pl
 
 from app.services.fs_utils import atomic_write_text
-from app.services.user_paths import resolve_user_root
 
 logger = logging.getLogger(__name__)
 
@@ -136,19 +136,34 @@ def materialize_factor_columns(
 
 
 # ── 持久化（镜像 strategy/config.py 的写法）──────────────
-def _dir(user_root: Path | None = None) -> Path:
-    d = resolve_user_root(user_root) / "user_data" / "custom_signals"
+def _dir() -> Path:
+    """自定义信号目录 —— **部署级**, 与账户无关。
+
+    为什么不是每用户: 信号定义产出的是 enriched parquet 里的 ``csg_*`` 列, 而那张表
+    是**全站共享**的一张表, 装不下每个账户各自的一套信号列; 共享实时快照同理。
+
+    评估过"共享表里装所有账户信号的并集、按账户前缀去重"这个替代方案 —— 技术上可行,
+    但它会让 A 的表达式被为所有人计算, 且 B 能通过列集合反推 A 定义了哪些信号, 属跨
+    租户信息泄漏, 因此否决。
+
+    结论: 信号只能有一套, 与"创作面仅管理员可用"配套(对普通用户隐藏自定义表达式的
+    创作入口)。若将来要恢复每用户信号, 需要先让共享 enriched 按账户分叉或改为按需在
+    每用户计算里注入 —— 那是一次架构改动, 不是改一行路径。
+    """
+    from app.config import settings
+
+    d = settings.data_dir / "user_data" / "custom_signals"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
-def _path(user_root: Path | None, signal_id: str) -> Path:
-    return _dir(user_root) / f"{signal_id}.json"
+def _path(signal_id: str) -> Path:
+    return _dir() / f"{signal_id}.json"
 
 
-def load_all(user_root: Path | None = None) -> list[dict]:
-    """读取**当前账户**全部自定义信号定义。损坏的文件被跳过。"""
-    d = _dir(user_root)
+def load_all() -> list[dict]:
+    """读取全部自定义信号定义(部署级一份)。损坏的文件被跳过。"""
+    d = _dir()
     out: list[dict] = []
     for f in sorted(d.glob("*.json")):
         try:
@@ -158,14 +173,14 @@ def load_all(user_root: Path | None = None) -> list[dict]:
     return out
 
 
-def save_one(sig: dict, user_root: Path | None = None) -> None:
-    p = _path(user_root, sig["id"])
+def save_one(sig: dict) -> None:
+    p = _path(sig["id"])
     p.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(p, json.dumps(sig, ensure_ascii=False, indent=2))
 
 
-def delete_one(signal_id: str, user_root: Path | None = None) -> bool:
-    p = _path(user_root, signal_id)
+def delete_one(signal_id: str) -> bool:
+    p = _path(signal_id)
     if p.exists():
         p.unlink()
         return True
@@ -522,23 +537,22 @@ def _dir_fingerprint(d: Path) -> tuple:
         return ()
 
 
-def load_intraday_all(user_root: Path | None = None) -> list[dict]:
-    """读取**当前账户**全部启用的盘中信号定义(带缓存)。
+def load_intraday_all() -> list[dict]:
+    """读取全部启用的盘中信号定义(带缓存)。
 
     盘中评估与引擎注入每分钟执行, 不宜每次全量读盘; save/delete 端点
     调用 invalidate_intraday_cache() 主动失效。
 
-    缓存键用**解析后的账户根** —— 不能直接用入参: 走 contextvar 时入参是 None,
-    所有账户会共用同一个键, A 的信号定义就被 B 读到了。
+    缓存键用部署级信号目录(单一键)—— 信号已不再按账户分家, 见 ``_dir``。
     """
-    root = resolve_user_root(user_root)
-    d = _dir(root)
+    root = _dir()
+    d = root
     fp = _dir_fingerprint(d)
     cached = _intraday_cache.get(root)
     if cached is not None and cached[0] == fp:
         return cached[1]
     sigs = [
-        s for s in load_all(root)
+        s for s in load_all()
         if s.get("timeframe") == TIMEFRAME_INTRADAY and s.get("enabled") is not False
     ]
     _intraday_cache[root] = (fp, sigs)
@@ -553,20 +567,20 @@ def invalidate_intraday_cache() -> None:
 _names_cache: dict[Path, tuple[object, dict[str, str]]] = {}
 
 
-def signal_names(user_root: Path | None = None) -> dict[str, str]:
-    """**当前账户**自定义信号列名 (csg_/csgi_) → 用户命名的映射, 带目录指纹缓存。
+def signal_names() -> dict[str, str]:
+    """自定义信号列名 (csg_/csgi_) → 用户命名的映射, 带目录指纹缓存。
 
     指纹含文件名 + mtime, 保存/删除信号后自动失效重载, 调用方无需配合失效。
-    缓存键用解析后的账户根, 理由同 ``load_intraday_all``。
+    缓存键用部署级信号目录, 理由同 ``load_intraday_all``。
     """
-    root = resolve_user_root(user_root)
-    d = _dir(root)
+    root = _dir()
+    d = root
     fp = _dir_fingerprint(d)
     cached = _names_cache.get(root)
     if cached is not None and cached[0] == fp:
         return cached[1]
     names: dict[str, str] = {}
-    for s in load_all(root):
+    for s in load_all():
         sid, name = s.get("id"), s.get("name")
         if sid and name:
             names[column_name(sid)] = name

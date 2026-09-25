@@ -1522,7 +1522,7 @@ class QuoteService:
         try:
             from app.strategy import custom_signals
 
-            return custom_signals.load_intraday_all(self._repo.store.data_dir)
+            return custom_signals.load_intraday_all()
         except Exception as e:
             logger.warning("load intraday signal defs failed: %s", e)
             return []

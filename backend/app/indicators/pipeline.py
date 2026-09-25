@@ -61,7 +61,7 @@ def _get_custom_signal_exprs() -> dict[str, pl.Expr]:
     if _custom_signal_exprs is None:
         from app.strategy import custom_signals
         try:
-            sigs = custom_signals.load_all(settings.data_dir)
+            sigs = custom_signals.load_all()
             _custom_signal_exprs = custom_signals.build_expressions(sigs)
         except Exception as e:
             logger.warning("custom signals load failed: %s", e)
@@ -79,7 +79,7 @@ def _get_custom_signal_exprs_today() -> dict[str, pl.Expr]:
     if _custom_signal_exprs_today is None:
         from app.strategy import custom_signals
         try:
-            sigs = custom_signals.load_all(settings.data_dir)
+            sigs = custom_signals.load_all()
             _custom_signal_exprs_today = custom_signals.build_expressions(sigs, allow_shift=False)
         except Exception as e:
             logger.warning("custom signals load failed (today): %s", e)

@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from app import config as app_config
 from app.api.strategy import (
     StrategyCodeSaveRequest,
     StrategyCodeValidateRequest,
@@ -13,17 +14,27 @@ from app.api.strategy import (
 from app.strategy.engine import StrategyEngine
 
 @pytest.fixture(autouse=True)
-def _current_user_context(tmp_path):
+def _current_user_context(tmp_path, monkeypatch):
     """把「当前账户根」设为本次用例的临时目录。
 
     HTTP handler 通过 user_paths 的统一接缝解析账户私有目录 (真实请求里由认证
     中间件注入 contextvar); 这里直接调用 handler 或只挂了 router 的 TestClient,
     必须自己注入, 否则 fail-closed 抛 MissingUserContextError。
-    data_dir 与 user_root 同取 tmp_path: 用例只关心"落到哪个根", 不区分共享/私有。
-    """
-    from app.services import preferences
 
-    token = preferences.set_current_user_root(tmp_path)
+    账户根用**生产形态** ``<data_dir>/users/1``, 而不是把共享 data_dir 当根。
+    后者有两个问题: 每用户存储会退化成共享文件(所有账户读写同一份), 且
+    handler 把根**显式**传给 store 时 resolve_user_root 会拒绝它 —— 共享目录
+    不能作账户根。
+
+    **必须先 patch settings.data_dir**: user_root(1) 是按全局 data_dir 解析的,
+    不 patch 就会落到**真实仓库的 data/users/1/** 里 —— 测试会把策略源码与
+    __pycache__ 写进真实目录(实测污染过)。不是"顺手加一行", 而是本 fixture 成立
+    的前提。
+    """
+    from app.services import preferences, user_paths
+
+    monkeypatch.setattr(app_config.settings, "data_dir", tmp_path)
+    token = preferences.set_current_user_root(user_paths.user_root(1))
     yield tmp_path
     preferences.reset_current_user_root(token)
 
@@ -58,9 +69,18 @@ def filter(df: pl.DataFrame, params: dict) -> pl.Expr:
 '''
 
 
+def _user_root():
+    """账户私有根的**生产形态** ``<data_dir>/users/1`` (与 fixture 注入的一致)。"""
+    from app.services import user_paths
+
+    return user_paths.user_root(1)
+
+
 def _request(tmp_path):
-    ai_dir = tmp_path / "strategies" / "ai"
-    custom_dir = tmp_path / "strategies" / "custom"
+    """请求替身: 策略源码写在**账户根**之下, 共享行情仍读 data_dir。"""
+    user_root = _user_root()
+    ai_dir = user_root / "strategies" / "ai"
+    custom_dir = user_root / "strategies" / "custom"
     engine = StrategyEngine(strategy_dirs=[custom_dir, ai_dir])
     repo = SimpleNamespace(store=SimpleNamespace(data_dir=tmp_path))
     return SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(repo=repo, strategy_engine=engine)))
@@ -103,10 +123,10 @@ def test_save_strategy_code_creates_ai_strategy_in_ai_dir(tmp_path):
 
     assert result["ok"] is True
     assert result["source"] == "ai"
-    assert (tmp_path / "strategies" / "ai" / "ai_saved.py").exists()
+    assert (_user_root() / "strategies" / "ai" / "ai_saved.py").exists()
     loaded = request.app.state.strategy_engine.get("ai_saved")
     assert loaded.source == "ai"
-    assert loaded.file_path == tmp_path / "strategies" / "ai" / "ai_saved.py"
+    assert loaded.file_path == _user_root() / "strategies" / "ai" / "ai_saved.py"
 
 
 def test_save_strategy_code_creates_custom_strategy_in_custom_dir(tmp_path):
@@ -123,10 +143,10 @@ def test_save_strategy_code_creates_custom_strategy_in_custom_dir(tmp_path):
 
     assert result["ok"] is True
     assert result["source"] == "custom"
-    assert (tmp_path / "strategies" / "custom" / "custom_saved.py").exists()
+    assert (_user_root() / "strategies" / "custom" / "custom_saved.py").exists()
     loaded = request.app.state.strategy_engine.get("custom_saved")
     assert loaded.source == "custom"
-    assert loaded.file_path == tmp_path / "strategies" / "custom" / "custom_saved.py"
+    assert loaded.file_path == _user_root() / "strategies" / "custom" / "custom_saved.py"
 
 
 def test_save_strategy_code_updates_existing_source_file(tmp_path):
@@ -148,9 +168,9 @@ def test_save_strategy_code_updates_existing_source_file(tmp_path):
     result = _save_strategy_code(update, request)
 
     assert result["source"] == "custom"
-    custom_path = tmp_path / "strategies" / "custom" / "custom_update.py"
+    custom_path = _user_root() / "strategies" / "custom" / "custom_update.py"
     assert custom_path.exists()
-    assert not (tmp_path / "strategies" / "ai" / "custom_update.py").exists()
+    assert not (_user_root() / "strategies" / "ai" / "custom_update.py").exists()
     assert '"name": "新名称"' in custom_path.read_text(encoding="utf-8")
 
 
@@ -175,11 +195,15 @@ def test_save_strategy_code_rejects_undefined_custom_signal(tmp_path):
         _save_strategy_code(req, request)
 
     # 校验失败不落盘
-    assert not (tmp_path / "strategies" / "custom" / "custom_missing_sig.py").exists()
+    assert not (_user_root() / "strategies" / "custom" / "custom_missing_sig.py").exists()
 
 
 def test_save_strategy_code_ok_when_custom_signal_defined(tmp_path):
-    """信号已定义时, 引用它的策略可以正常保存。"""
+    """信号已定义时, 引用它的策略可以正常保存。
+
+    自定义信号是**部署级**存储(见 custom_signals._dir), 与账户无关; fixture 已把
+    settings.data_dir 指向 tmp, 因此 save_one 落在临时目录里。
+    """
     from app.strategy import custom_signals
 
     custom_signals.save_one({
@@ -191,7 +215,7 @@ def test_save_strategy_code_ok_when_custom_signal_defined(tmp_path):
              "leftDays": 0, "rightDays": 0},
         ],
         "enabled": True,
-    }, user_root=tmp_path)
+    })
     request = _request(tmp_path)
     code = _code("custom_with_sig") + (
         '\nREQUIRED_FEATURES = {"csg_oversold_macd_about_to_golden"}\n'

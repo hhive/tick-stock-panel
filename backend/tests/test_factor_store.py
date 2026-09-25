@@ -57,8 +57,22 @@ def _isolate_runtime_ext_factors(tmp_path, monkeypatch):
     ext_factors._sync_state = None
 
 
+@pytest.fixture
+def user_root(tmp_path, monkeypatch):
+    """账户私有根目录 —— 生产形态 ``<data_dir>/users/<账号ID>``。
 
-def test_custom_factor_definition_roundtrip(tmp_path, cleanup_registry) -> None:
+    ``tmp_path`` 是共享数据目录 (settings.data_dir); 自定义因子
+    (``<user_root>/user_data/custom_factors/*.json``) 每账户一份, 必须落在账户根
+    之下 —— data_dir 自身是共享位置, 不能当账户根。
+    """
+    from app import config as app_config
+    from app.services import user_paths
+
+    monkeypatch.setattr(app_config.settings, "data_dir", tmp_path)
+    return user_paths.user_root(1)
+
+
+def test_custom_factor_definition_roundtrip(user_root, cleanup_registry) -> None:
     definition = {
         "id": "uf_test_rev", "kind": "custom", "version": 1, "label": "测试反转",
         "group": "自定义", "formula": "rank(-ts_sum(close / ts_delay(close, 1) - 1, 5))",
@@ -70,8 +84,10 @@ def test_custom_factor_definition_roundtrip(tmp_path, cleanup_registry) -> None:
     assert "close" in spec.dependencies
     assert spec.warmup_bars >= 6
 
-    store.save_one(definition, tmp_path)
-    loaded = store.load_all(tmp_path)
+    store.save_one(definition, user_root)
+    # 落盘在账户根之下 (生产形态), 不落共享 data_dir
+    assert (user_root / "user_data" / "custom_factors" / "uf_test_rev.json").exists()
+    loaded = store.load_all(user_root)
     assert len(loaded) == 1 and loaded[0]["id"] == "uf_test_rev"
 
     # 目录视图与 all_factors 追加动态因子
@@ -147,16 +163,16 @@ def test_scoring_bridge_custom_materializes(cleanup_registry) -> None:
     assert day["uf_rank_close"].is_not_null().all()
 
 
-def test_load_into_registry_isolated_failure(tmp_path, cleanup_registry) -> None:
+def test_load_into_registry_isolated_failure(user_root, cleanup_registry) -> None:
     good = {
         "id": "uf_good", "kind": "custom", "version": 1, "label": "好因子",
         "formula": "close + 1", "status": "draft",
     }
-    store.save_one(good, tmp_path)
-    (tmp_path / "user_data" / "custom_factors" / "uf_broken.json").write_text(
+    store.save_one(good, user_root)
+    (user_root / "user_data" / "custom_factors" / "uf_broken.json").write_text(
         "{ not json", encoding="utf-8"
     )
-    loaded = store.load_into_registry(tmp_path)
+    loaded = store.load_into_registry(user_root)
     assert loaded == ["uf_good"]
     cleanup_registry.add("uf_good")
 

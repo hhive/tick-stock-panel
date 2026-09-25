@@ -30,16 +30,35 @@ from app.strategy import custom_signals
 
 @pytest.fixture()
 def data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """共享数据目录 (settings.data_dir): 行情、扩展表配置、自定义数据源 YAML 等
+    所有人一份。注意它**不是**账户根 —— 拿它当账户根会让所有账户读写同一份文件。
+    """
     from app.config import settings
 
     monkeypatch.setattr(settings, "data_dir", tmp_path, raising=False)
     preferences._invalidate_cache()
-    # 每用户存储 (secrets 等) 没有共享回退, 需要账户上下文 —— 真实请求由认证
-    # 中间件注入 user_root; 这里把测试的 data_dir 当作该账户的根目录。
-    token = preferences.set_current_user_root(tmp_path)
     yield tmp_path
-    preferences.reset_current_user_root(token)
     preferences._invalidate_cache()
+
+
+@pytest.fixture()
+def user_root(data_dir: Path) -> Path:
+    """**本账户**的根目录 —— 生产形态 ``<data_dir>/users/<账号ID>``。
+
+    每用户存储 (secrets/覆盖配置/自定义因子) 没有共享回退, 需要账户上下文:
+    真实请求由认证中间件注入 user_root, 这里手工注入同一 contextvar。
+    (偏好按归属分派: 每用户键落账户根, 其余落共享 data_dir; 自定义信号是部署级。)
+    """
+    from app.services import user_paths
+
+    return user_paths.user_root(1)
+
+
+@pytest.fixture(autouse=True)
+def _user_ctx(user_root: Path):
+    token = preferences.set_current_user_root(user_root)
+    yield user_root
+    preferences.reset_current_user_root(token)
 
 
 @pytest.fixture()
@@ -101,49 +120,56 @@ def test_ext_config_survives_a_torn_write(data_dir: Path, torn_write) -> None:
     assert reloaded[0].label == "人气"
 
 
-def test_strategy_override_survives_a_torn_write(data_dir: Path, torn_write) -> None:
+def test_strategy_override_survives_a_torn_write(user_root: Path, torn_write) -> None:
     """load_override 吞异常返回 {} —— 半截文件会让策略参数静默回默认值。"""
     strat_config._override_cache.clear()
     strat_config._override_cache_sig.clear()
-    strat_config.save_override("s1", {"params": {"period": 20}}, user_root=data_dir)
-    assert strat_config.load_override("s1", user_root=data_dir) == {"params": {"period": 20}}
+    strat_config.save_override("s1", {"params": {"period": 20}}, user_root=user_root)
+    # 覆盖配置落在账户根之下 (生产形态), 不落共享 data_dir
+    assert (user_root / "user_data" / "strategy_overrides" / "s1.json").exists()
+    assert strat_config.load_override("s1", user_root=user_root) == {"params": {"period": 20}}
 
     torn_write()
     with pytest.raises(OSError):
-        strat_config.save_override("s1", {"params": {"period": 60}}, user_root=data_dir)
+        strat_config.save_override("s1", {"params": {"period": 60}}, user_root=user_root)
 
     strat_config._override_cache.clear()
     strat_config._override_cache_sig.clear()
-    assert strat_config.load_override("s1", user_root=data_dir) == {"params": {"period": 20}}
+    assert strat_config.load_override("s1", user_root=user_root) == {"params": {"period": 20}}
 
 
 def test_custom_signal_survives_a_torn_write(data_dir: Path, torn_write) -> None:
-    """custom_signals.load_all 跳过损坏文件 —— 半截文件会让该信号静默消失。"""
+    """custom_signals.load_all 跳过损坏文件 —— 半截文件会让该信号静默消失。
+
+    信号定义是**部署级**一份 (``<data_dir>/user_data/custom_signals``), 不是每用户存储。
+    """
     sig = {
         "id": "vol_up", "name": "放量", "kind": "entry", "enabled": True,
         "conditions": [{"left": "volume", "op": ">", "right": "0", "leftDays": 0, "rightDays": 0}],
     }
-    custom_signals.save_one(sig, user_root=data_dir)
-    assert [s["id"] for s in custom_signals.load_all(data_dir)] == ["vol_up"]
+    custom_signals.save_one(sig)
+    assert (data_dir / "user_data" / "custom_signals" / "vol_up.json").exists()
+    assert [s["id"] for s in custom_signals.load_all()] == ["vol_up"]
 
     torn_write()
     with pytest.raises(OSError):
-        custom_signals.save_one({**sig, "name": "放量2"}, user_root=data_dir)
+        custom_signals.save_one({**sig, "name": "放量2"})
 
-    assert custom_signals.load_all(data_dir) == [sig]
+    assert custom_signals.load_all() == [sig]
 
 
-def test_custom_factor_survives_a_torn_write(data_dir: Path, torn_write) -> None:
+def test_custom_factor_survives_a_torn_write(user_root: Path, torn_write) -> None:
     """factors.store.load_all 跳过损坏文件 —— 半截文件会让该因子静默消失。"""
     definition = {"id": "uf_mom", "kind": "custom", "label": "动量", "status": "draft"}
-    factor_store.save_one(definition, data_dir)
-    assert [d["id"] for d in factor_store.load_all(data_dir)] == ["uf_mom"]
+    factor_store.save_one(definition, user_root)
+    assert (user_root / "user_data" / "custom_factors" / "uf_mom.json").exists()
+    assert [d["id"] for d in factor_store.load_all(user_root)] == ["uf_mom"]
 
     torn_write()
     with pytest.raises(OSError):
-        factor_store.save_one({**definition, "label": "动量2"}, data_dir)
+        factor_store.save_one({**definition, "label": "动量2"}, user_root)
 
-    assert factor_store.load_all(data_dir) == [definition]
+    assert factor_store.load_all(user_root) == [definition]
 
 
 def test_analysis_menu_survives_a_torn_write(data_dir: Path, torn_write) -> None:
@@ -182,8 +208,12 @@ def test_custom_source_yaml_survives_a_torn_write(data_dir: Path, torn_write) ->
     assert list(reloaded.datasets) == ["daily"]
 
 
-def test_a_normal_save_still_writes_what_it_was_given(data_dir: Path) -> None:
-    """没有失败时行为不变 —— 内容、合并语义和文件位置都照旧。"""
+def test_a_normal_save_still_writes_what_it_was_given(data_dir: Path, user_root: Path) -> None:
+    """没有失败时行为不变 —— 内容、合并语义和文件位置都照旧。
+
+    偏好按归属分派: theme/kline_compress 是 GLOBAL 键 (落共享 data_dir); secrets
+    是每用户存储 (落账户根之下)。
+    """
     preferences.save({"theme": "dark"})
     preferences.save({"kline_compress": True})
     assert preferences.load() == {"theme": "dark", "kline_compress": True}
@@ -196,15 +226,24 @@ def test_a_normal_save_still_writes_what_it_was_given(data_dir: Path) -> None:
         (data_dir / "user_data" / "preferences.json").read_text(encoding="utf-8")
     )
     assert written == {"theme": "dark", "kline_compress": True}
+    written_secrets = json.loads(
+        (user_root / "user_data" / "secrets.json").read_text(encoding="utf-8")
+    )
+    assert written_secrets == {"a": "1", "b": "2"}
+    # 每用户存储不得写进共享 data_dir
+    assert not (data_dir / "user_data" / "secrets.json").exists()
 
 
-def test_no_tmp_file_is_left_behind(data_dir: Path) -> None:
+def test_no_tmp_file_is_left_behind(data_dir: Path, user_root: Path) -> None:
     preferences.save({"theme": "dark"})
     secrets_store.save({"a": "1"})
-    strat_config.save_override("s1", {"params": {}}, user_root=data_dir)
-    custom_signals.save_one({"id": "vol_up", "conditions": []}, user_root=data_dir)
-    factor_store.save_one({"id": "uf_mom", "label": "动量"}, data_dir)
+    strat_config.save_override("s1", {"params": {}}, user_root=user_root)
+    custom_signals.save_one({"id": "vol_up", "conditions": []})
+    factor_store.save_one({"id": "uf_mom", "label": "动量"}, user_root)
     custom_loader.save_config("demo", {"name": "demo", "datasets": {}})
 
+    # 账户根在 data_dir 之下, rglob 覆盖到每用户存储 —— 断言扫描不是空转
+    assert (user_root / "user_data" / "secrets.json").exists()
+    assert (user_root / "user_data" / "custom_factors" / "uf_mom.json").exists()
     leftovers = sorted(p.name for p in data_dir.rglob("*.tmp"))
     assert leftovers == []
