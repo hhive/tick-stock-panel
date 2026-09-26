@@ -121,7 +121,30 @@ def build_focus_instruction(focus: str, *, report_name: str = "分析报告") ->
 
 
 def current_ai_provider() -> str:
-    return secrets_store.get_ai_config("ai_provider", settings.ai_provider) or OPENAI_COMPAT_PROVIDER
+    """当前 AI provider —— **恒为 OpenAI 兼容**。
+
+    本站 AI 配置只允许「自定义」一种形态(用户 2026-09-26 决策), 故这里**不再读
+    secrets.json 的 ai_provider**。锁在读侧而不是只在保存侧拒绝: 存量凭据文件里的
+    `codex_cli` / `openai` 取值必须一并失效 —— 否则旧配置继续生效, 界面上却看不到
+    入口, 「只能自定义」就成了假象。
+
+    连带效果: `CODEX_CLI_PROVIDER` 与 `OPENAI_PROVIDER` 两条分支按设计不可达。
+    引擎代码刻意保留(不删), 以免扩大与上游的差异 —— 将来若重新开放, 恢复本函数
+    即可, 不需要把分支加回来。
+    """
+    return OPENAI_COMPAT_PROVIDER
+
+
+def ai_base_url() -> str:
+    """当前 AI 上游地址 —— **恒为本站 Sub2API 网关常量**。
+
+    读取侧的唯一接缝: 所有出网点(含每用户 secrets.json 优先的旧行为)都走这里。
+    存量账户凭据文件里存的旧地址(runninghub 等)因此不再生效, 但它们仍留在文件里,
+    不主动删除 —— 用户若想看自己曾配过什么, 还能看到。
+    """
+    from app.config import AI_GATEWAY_BASE_URL
+
+    return AI_GATEWAY_BASE_URL
 
 
 def current_openai_model() -> str:
@@ -518,7 +541,7 @@ async def _stream_openai(
 
     client = _openai_client(ai_key, timeout)
     model = current_ai_model()
-    base_url = secrets_store.get_ai_config("ai_base_url", settings.ai_base_url)
+    base_url = ai_base_url()
     req_messages = list(messages)
 
     kwargs = _openai_kwargs(
@@ -609,7 +632,7 @@ def _openai_client(api_key: str, timeout: float):
     user_agent = secrets_store.get_ai_config("ai_user_agent", "") or settings.ai_user_agent
     return AsyncOpenAI(
         api_key=api_key,
-        base_url=normalize_openai_base_url(secrets_store.get_ai_config("ai_base_url", settings.ai_base_url)),
+        base_url=normalize_openai_base_url(ai_base_url()),
         timeout=timeout,
         # SDK 层重试仅覆盖首包前的连接错误/超时/429/5xx, 此时尚未产出任何内容,
         # 重试安全; 首 chunk 之后的断流不在此列, 由上层协议报错处理。

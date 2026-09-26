@@ -6,10 +6,11 @@ from types import SimpleNamespace
 import httpx
 import openai
 import pytest
+from fastapi import HTTPException
 
 from app import secrets_store
 from app.api import settings as settings_api
-from app.config import settings
+from app.config import AI_GATEWAY_BASE_URL, settings
 from app.services import ai_provider
 from app.services.ai_provider import (
     _format_openai_error,
@@ -254,30 +255,21 @@ def test_is_temperature_rejected_false_for_non_400():
     assert _is_temperature_rejected(exc) is False
 
 
-def test_openai_kwargs_include_configured_reasoning_effort(monkeypatch):
-    stored = {"ai_provider": "openai_compat"}
+def test_openai_kwargs_never_emit_reasoning_effort(monkeypatch):
+    """锁定为「自定义」后不再下发 reasoning_effort（2026-09-26 上游锁定）。
+
+    该参数原先只在 provider=openai(官方) 时下发; 官方预设已下线, 且本请求实际发往
+    本站网关(未声明支持该参数)。存量 ai_reasoning_effort 不得再泄漏进请求体 ——
+    未知参数会把整次调用打成 400。
+    """
+    stored: dict = {}
     monkeypatch.setattr(secrets_store, "load", lambda *a, **k: stored)
 
-    assert "reasoning_effort" not in ai_provider._openai_kwargs(temperature=None, max_tokens=1000)
-
-    stored["ai_provider"] = "openai"
-    assert ai_provider._openai_kwargs(temperature=None, max_tokens=1000)["reasoning_effort"] == "high"
-
-    stored["ai_reasoning_effort"] = "custom-high"
-    kwargs = ai_provider._openai_kwargs(temperature=0.3, max_tokens=1000)
-
-    assert kwargs == {
-        "max_tokens": 1000,
-        "temperature": 0.3,
-        "reasoning_effort": "custom-high",
-    }
-
-    stored["ai_reasoning_effort"] = ""
-    assert "reasoning_effort" not in ai_provider._openai_kwargs(temperature=None, max_tokens=1000)
-
-    stored["ai_reasoning_effort"] = "custom-high"
-    stored["ai_provider"] = "openai_compat"
-    assert "reasoning_effort" not in ai_provider._openai_kwargs(temperature=None, max_tokens=1000)
+    for provider in ("openai_compat", "openai", "codex_cli"):
+        stored.update({"ai_provider": provider, "ai_reasoning_effort": "custom-high"})
+        assert "reasoning_effort" not in ai_provider._openai_kwargs(
+            temperature=None, max_tokens=1000
+        )
 
 
 def test_openai_kwargs_none_max_tokens_omits_limit():
@@ -298,7 +290,12 @@ def test_codex_prompt_none_max_tokens_skips_length_hint():
     assert "Keep the final answer" in bounded
 
 
-def test_ai_settings_keep_provider_models_separate(monkeypatch):
+def test_ai_settings_stay_on_custom_provider(monkeypatch):
+    """供应商切换已下线: 保存「自定义」时 provider/地址都被服务端钉住。
+
+    原用例断言 codex_cli / openai 两个分支可各自保存模型, 与新锁定冲突 ——
+    那两个分支现在按设计不可达, 用例随之改为断言「切不过去」。
+    """
     stored = {
         "ai_provider": "openai_compat",
         "ai_model": "custom-api-model",
@@ -317,39 +314,9 @@ def test_ai_settings_keep_provider_models_separate(monkeypatch):
     monkeypatch.setattr(secrets_store, "save", save)
     monkeypatch.setattr(secrets_store, "clear", clear)
     monkeypatch.setattr(ai_provider, "ai_configured", lambda provider=None: True)
-    monkeypatch.setattr(settings, "ai_provider", "openai_compat")
-    monkeypatch.setattr(settings, "ai_base_url", "")
-    monkeypatch.setattr(settings, "ai_model", "")
-    monkeypatch.setattr(settings, "ai_codex_command", "codex")
-    monkeypatch.setattr(settings, "ai_codex_reasoning_effort", "")
     monkeypatch.setattr(settings, "ai_user_agent", "")
 
-    settings_api.save_ai_settings(
-        settings_api.AiSettingsIn(
-            provider="codex_cli",
-            model="gpt-5.6-sol",
-            codex_command="codex",
-            codex_reasoning_effort="high",
-        )
-    )
-
-    assert stored["ai_model"] == "custom-api-model"
-    assert stored["ai_codex_model"] == "gpt-5.6-sol"
-
-    settings_api.save_ai_settings(
-        settings_api.AiSettingsIn(
-            provider="openai",
-            base_url="https://api.openai.com/v1",
-            model="openai-model",
-            reasoning_effort="vendor-high",
-        )
-    )
-
-    assert stored["ai_model"] == "openai-model"
-    assert stored["ai_reasoning_effort"] == "vendor-high"
-    assert stored["ai_codex_model"] == "gpt-5.6-sol"
-
-    settings_api.save_ai_settings(
+    result = settings_api.save_ai_settings(
         settings_api.AiSettingsIn(
             provider="openai_compat",
             base_url="https://example.com/v1",
@@ -358,8 +325,18 @@ def test_ai_settings_keep_provider_models_separate(monkeypatch):
     )
 
     assert stored["ai_model"] == "new-custom-model"
-    assert stored["ai_reasoning_effort"] == "vendor-high"
-    assert stored["ai_codex_model"] == "gpt-5.6-sol"
+    assert stored["ai_provider"] == "openai_compat"
+    assert stored["ai_base_url"] == AI_GATEWAY_BASE_URL
+    assert result["ai_base_url"] == AI_GATEWAY_BASE_URL
+
+    with pytest.raises(HTTPException):
+        settings_api.save_ai_settings(
+            settings_api.AiSettingsIn(provider="codex_cli", model="gpt-5.6-sol")
+        )
+    with pytest.raises(HTTPException):
+        settings_api.save_ai_settings(
+            settings_api.AiSettingsIn(provider="openai", model="openai-model")
+        )
 # ── 输出上限 / 上下文窗口配置 ─────────────────────────────────
 
 

@@ -72,6 +72,16 @@ _ENV_FILE = Path(
 )
 
 
+# ── AI 上游锁定 ────────────────────────────────────────────────
+# 本站 AI 配置只允许「自定义」一种形态: 走本站 Sub2API 网关的 OpenAI 兼容接口。
+# 这是**唯一**允许的上游 —— UI 只读展示, 保存时服务端强制写入, 读取侧也一律
+# 返回它(存量 secrets.json 里的旧地址必须失效, 否则「写死」只对新配置成立)。
+#
+# 改这一行 = 改全站 AI 上游。前端 `pages/settings/AI.tsx` 里有一份同字面量的
+# 兜底常量(仅首屏用, 加载后以服务端返回值为准), 两边要一起改。
+AI_GATEWAY_BASE_URL = "https://xiaoni-model.top/v1"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=str(_ENV_FILE),
@@ -84,9 +94,11 @@ class Settings(BaseSettings):
 
     # AI
     ai_provider: str = "openai_compat"
-    ai_base_url: str = "https://llm.runninghub.ai/v1"
+    ai_base_url: str = AI_GATEWAY_BASE_URL
     ai_api_key: str = ""
-    ai_model: str = "openai/gpt-6-astra-saver"
+    # 默认模型留空: 旧默认值是 RunningHub 专属模型名, 换到本站网关后没有意义。
+    # 由用户在 AI 设置页填写(可从本站网关拉取模型列表), 空值不会被静默当成可用配置。
+    ai_model: str = ""
     ai_codex_command: str = "codex"
     ai_codex_reasoning_effort: str = ""
     # 默认浏览器风格 UA,绕过 Cloudflare 等 CDN/WAF 的 Bot 拦截(Issue #8)。

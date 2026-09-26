@@ -58,7 +58,9 @@ def get_settings() -> dict:
     from app.services import preferences
     from app.services.ai_provider import (
         ai_configured,
+        ai_base_url,
         current_ai_model,
+        current_ai_provider,
         current_codex_command,
         current_codex_model,
         current_codex_reasoning_effort,
@@ -69,7 +71,9 @@ def get_settings() -> dict:
     )
 
     key = secrets_store.get_tickflow_key()
-    ai_provider = secrets_store.get_ai_config("ai_provider", settings.ai_provider)
+    # provider 与地址都走锁定后的读取口, 不读 secrets.json 的存量值 ——
+    # 否则界面会把一个「已经不会生效」的旧配置当成当前配置显示。
+    ai_provider = current_ai_provider()
     return {
         "mode": tf_client.current_mode(),
         "tickflow_api_key_masked": secrets_store.mask(key),
@@ -83,7 +87,7 @@ def get_settings() -> dict:
         "onboarding_completed": preferences.get_onboarding_completed(),
         # AI 配置
         "ai_provider": ai_provider,
-        "ai_base_url": secrets_store.get_ai_config("ai_base_url", settings.ai_base_url),
+        "ai_base_url": ai_base_url(),
         "ai_api_key_masked": secrets_store.mask(secrets_store.get_ai_key()),
         "has_ai_key": bool(secrets_store.get_ai_key()),
         "ai_configured": ai_configured(ai_provider),
@@ -249,7 +253,7 @@ def complete_onboarding() -> dict:
 
 class AiSettingsIn(BaseModel):
     provider: str = "openai_compat"
-    base_url: str = ""
+    base_url: str = ""                     # 客户端提交值一律被忽略(见 save_ai_settings)
     api_key: str | None = None
     model: str = ""
     reasoning_effort: str = Field(default="high", max_length=64)
@@ -260,12 +264,22 @@ class AiSettingsIn(BaseModel):
     context_window: int | None = None      # 输入上下文窗口上限 (约 token)
 
 
+# 保存时清掉的旧 provider 键: 锁死为「自定义」后 codex 配置不可选也不可读,
+# 留着只会在凭据文件里积累无人能解释的幽灵字段。
+_LEGACY_AI_KEYS: tuple[str, ...] = ("ai_codex_command", "ai_codex_reasoning_effort", "ai_codex_model")
+
+
 @router.post("/ai")
 def save_ai_settings(req: AiSettingsIn) -> dict:
-    """保存 AI 配置（全部持久化到 secrets.json）"""
+    """保存 AI 配置（全部持久化到 secrets.json）。
+
+    本站只允许「自定义」: provider 非 `openai_compat` 直接 400, 地址由服务端强制写成
+    `AI_GATEWAY_BASE_URL` —— 请求里的 `base_url` 一律忽略。客户端改不了上游。
+    """
     from app.config import settings
     from app.services.ai_provider import (
-        OPENAI_PROVIDER,
+        OPENAI_COMPAT_PROVIDER,
+        ai_base_url,
         ai_configured,
         current_ai_model,
         current_ai_provider,
@@ -276,42 +290,32 @@ def save_ai_settings(req: AiSettingsIn) -> dict:
         current_openai_reasoning_effort,
         current_ai_context_window,
         current_ai_max_output_tokens,
-        normalize_codex_command,
-        normalize_codex_model,
-        normalize_codex_reasoning_effort,
     )
 
-    updates: dict = {}
-    if req.provider:
-        updates["ai_provider"] = req.provider
-        settings.ai_provider = req.provider
-    if req.provider == "codex_cli":
-        updates["ai_codex_model"] = normalize_codex_model(req.model)
-        try:
-            codex_command = normalize_codex_command(req.codex_command)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        codex_reasoning_effort = normalize_codex_reasoning_effort(req.codex_reasoning_effort)
-        updates["ai_codex_command"] = codex_command
-        updates["ai_codex_reasoning_effort"] = codex_reasoning_effort
-        settings.ai_codex_command = codex_command
-        settings.ai_codex_reasoning_effort = codex_reasoning_effort
-    else:
-        if req.base_url:
-            updates["ai_base_url"] = req.base_url
-            settings.ai_base_url = req.base_url
-        if req.api_key is not None:
-            if req.api_key:
-                updates["ai_api_key"] = req.api_key
-                settings.ai_api_key = req.api_key
-            else:
-                secrets_store.clear("ai_api_key")
-                settings.ai_api_key = ""
-        if req.model:
-            updates["ai_model"] = req.model
-            settings.ai_model = req.model
-        if req.provider == OPENAI_PROVIDER:
-            updates["ai_reasoning_effort"] = req.reasoning_effort.strip()
+    if req.provider and req.provider != OPENAI_COMPAT_PROVIDER:
+        raise HTTPException(
+            status_code=400,
+            detail="AI 仅支持「自定义」（OpenAI 兼容接口 + 本站网关），不支持其它 provider",
+        )
+
+    locked_base_url = ai_base_url()
+    updates: dict = {
+        "ai_provider": OPENAI_COMPAT_PROVIDER,
+        # 无条件写入: 空值也写, 免得存量旧地址在「用户只改了模型」时继续留着生效
+        "ai_base_url": locked_base_url,
+    }
+    settings.ai_provider = OPENAI_COMPAT_PROVIDER
+    settings.ai_base_url = locked_base_url
+    if req.api_key is not None:
+        if req.api_key:
+            updates["ai_api_key"] = req.api_key
+            settings.ai_api_key = req.api_key
+        else:
+            secrets_store.clear("ai_api_key")
+            settings.ai_api_key = ""
+    if req.model:
+        updates["ai_model"] = req.model
+        settings.ai_model = req.model
     # user_agent 允许清空(回到默认浏览器 UA),故无条件持久化
     updates["ai_user_agent"] = req.user_agent
     settings.ai_user_agent = req.user_agent
@@ -330,11 +334,16 @@ def save_ai_settings(req: AiSettingsIn) -> dict:
 
     if updates:
         secrets_store.save(updates)
+    secrets_store.clear(*_LEGACY_AI_KEYS)
+    settings.ai_codex_command = "codex"
+    settings.ai_codex_reasoning_effort = ""
 
     provider = current_ai_provider()
     return {
         "ok": True,
         "ai_provider": provider,
+        # 回传权威地址: 前端不靠本地常量猜, 两边不会漂移
+        "ai_base_url": ai_base_url(),
         "ai_model": current_ai_model(),
         "ai_openai_model": current_openai_model(),
         "ai_reasoning_effort": current_openai_reasoning_effort(),
@@ -355,6 +364,8 @@ def clear_ai_settings() -> dict:
     """
     from app.config import settings
 
+    from app.services.ai_provider import ai_base_url
+
     secrets_store.clear(
         "ai_provider",
         "ai_base_url",
@@ -364,11 +375,13 @@ def clear_ai_settings() -> dict:
         "ai_codex_model",
         "ai_codex_command",
         "ai_codex_reasoning_effort",
+        "ai_max_output_tokens",
+        "ai_context_window",
     )
-    secrets_store.clear("ai_provider", "ai_base_url", "ai_api_key", "ai_model", "ai_codex_command", "ai_codex_reasoning_effort", "ai_max_output_tokens", "ai_context_window")
-    # 同步重置运行时内存(provider 回默认值,其余置空)
+    # 同步重置运行时内存。地址回到**锁定的常量**而不是空串 —— 清空凭证不等于取消
+    # 上游锁定, 空的 base_url 会让下一次请求打到 SDK 默认的 api.openai.com。
     settings.ai_provider = "openai_compat"
-    settings.ai_base_url = ""
+    settings.ai_base_url = ai_base_url()
     settings.ai_api_key = ""
     settings.ai_model = ""
     settings.ai_codex_command = "codex"
@@ -376,21 +389,35 @@ def clear_ai_settings() -> dict:
     settings.ai_max_output_tokens = 16384
     settings.ai_context_window = 128000
 
-    return {"ok": True}
+    return {"ok": True, "ai_base_url": ai_base_url()}
 
 
-@router.get("/ai/sponsor-models")
-async def list_sponsor_models() -> dict:
-    """代理获取赞助商(RunningHub)的模型列表。
+class AiModelsIn(BaseModel):
+    api_key: str = ""
 
-    其网关按 Origin 头过滤: 浏览器跨域请求只会拿到国产模型子集,
-    服务端请求无 Origin 头可取全量, 故由后端代理转发。
+
+@router.post("/ai/models")
+async def list_ai_models(req: AiModelsIn = AiModelsIn()) -> dict:
+    """列出当前 key 在本站网关上可见的模型。
+
+    模型名不再由预设预填(预设已下线), 而本站网关的 `/v1/models` 正是权威来源:
+    Sub2API 按用户分组过滤模型, 故必须带**用户自己的 key**, 不能用服务端凭据代查。
     """
+    from app.services.ai_provider import ai_base_url
+
+    api_key = (req.api_key or "").strip() or secrets_store.get_ai_key()
+    if not api_key:
+        raise HTTPException(status_code=400, detail="请先填写 AI API Key，再拉取模型列表")
+
     import httpx
 
+    base_url = ai_base_url()
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            res = await client.get("https://llm.runninghub.ai/v1/models")
+            res = await client.get(
+                f"{base_url}/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
             res.raise_for_status()
             data = res.json()
     except Exception as exc:
@@ -399,7 +426,7 @@ async def list_sponsor_models() -> dict:
         item.get("id") for item in data.get("data", [])
         if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"]
     })
-    return {"models": models}
+    return {"models": models, "base_url": base_url}
 
 
 # ===== 偏好设置 =====

@@ -28,12 +28,20 @@ logger = logging.getLogger(__name__)
 
 # Sub2API 基地址默认值(生产)。部署到其它环境时用环境变量 SUB2API_BASE_URL 覆盖。
 #
+# 本站对应的 Sub2API = `https://xiaoni-model.top`(2026-09-26 用户确认): 面板
+# 部署在 stock.xiaoni-model.top, 跳转菜单与用户 apikey 都出自同一个实例。校验与
+# AI 上游必须是同一个 —— 校验过了却把 AI 请求打到别的实例, 会拿用户的 key 去别处
+# 换一个 401。
+#
+# 前端 `src/lib/account.ts` 的 SUB2API_SITE_URL 是同一事实的另一半(登录页「一键
+# 进入」落地页), 两者必须一起改。
+#
 # 为什么读 os.environ 而不是 app.config.settings:
 #   1) app/config.py 里没有对应字段, 而本任务明确不改动其它文件;
 #   2) Settings 是 pydantic-settings 且 extra="ignore", 未声明的环境变量根本
 #      进不到 settings 对象里, 想加就得改 config.py;
 #   3) 每次调用惰性读取, 测试用 monkeypatch.setenv 即可覆盖, 不依赖 import 时机。
-SUB2API_BASE_URL = "https://xiaoni-apikey.top"
+SUB2API_BASE_URL = "https://xiaoni-model.top"
 
 # 校验接口路径(Sub2API 既有只读接口, 不新增/不改动 Sub2API)。
 _USAGE_PATH = "/v1/usage"

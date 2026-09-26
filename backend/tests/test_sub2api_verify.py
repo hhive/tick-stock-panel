@@ -149,12 +149,17 @@ def test_base_url_trailing_slash_does_not_double_up(monkeypatch: pytest.MonkeyPa
 
 
 def test_default_base_url_is_production(monkeypatch: pytest.MonkeyPatch) -> None:
-    """未设环境变量时回落到生产地址 (此处仅比对 URL, 传输层已被 mock)。"""
-    assert sub2api_verify.SUB2API_BASE_URL == "https://xiaoni-apikey.top"
+    """未设环境变量时回落到生产地址 (此处仅比对 URL, 传输层已被 mock)。
+
+    本站对应的 Sub2API 实例 = xiaoni-model.top(2026-09-26 用户确认), 与 AI 上游
+    `app.config.AI_GATEWAY_BASE_URL` 同一实例 —— 校验与出网打到两处会拿用户的 key
+    去别处换 401。
+    """
+    assert sub2api_verify.SUB2API_BASE_URL == "https://xiaoni-model.top"
     monkeypatch.delenv("SUB2API_BASE_URL", raising=False)
     calls = _install(monkeypatch, _status(200))
     assert sub2api_verify.verify_api_key("sk-abc123") is True
-    assert str(calls[0].url) == "https://xiaoni-apikey.top/v1/usage"
+    assert str(calls[0].url) == "https://xiaoni-model.top/v1/usage"
 
 
 # --- 日志不泄露明文 key -------------------------------------------------------
@@ -194,5 +199,5 @@ def test_redaction_keeps_only_short_prefix() -> None:
 def test_module_contract_constants() -> None:
     """模块级契约: 超时 10s, 且生产模式下传输层注入点为 None (真实网络)。"""
     assert sub2api_verify._TIMEOUT_S == 10.0
-    assert sub2api_verify.SUB2API_BASE_URL == "https://xiaoni-apikey.top"
+    assert sub2api_verify.SUB2API_BASE_URL == "https://xiaoni-model.top"
     assert sub2api_verify._TRANSPORT is None

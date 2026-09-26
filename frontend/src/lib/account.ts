@@ -18,7 +18,7 @@ export const JUMP_KEY_PARAM = 'apikey'
  * 换环境时用构建期变量 ``VITE_SUB2API_SITE_URL`` 覆盖。
  */
 export const SUB2API_SITE_URL: string =
-  import.meta.env.VITE_SUB2API_SITE_URL || 'https://xiaoni-apikey.top'
+  import.meta.env.VITE_SUB2API_SITE_URL || 'https://xiaoni-model.top'
 
 /** 内存中的待绑定凭证 (仅本次页面生命周期有效) */
 let _heldKey: string | null = null

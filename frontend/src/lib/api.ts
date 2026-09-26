@@ -2208,19 +2208,24 @@ export const api = {
     ),
 
   /** 保存 AI 配置 */
-  saveAiSettings: (ai: { provider?: string; base_url?: string; api_key?: string; model?: string; reasoning_effort?: string; codex_command?: string; codex_reasoning_effort?: string; user_agent?: string; max_output_tokens?: number; context_window?: number }) =>
-    request<{ ok: boolean; ai_provider?: string; ai_model?: string; ai_openai_model?: string; ai_reasoning_effort?: string; ai_codex_model?: string; ai_codex_command?: string; ai_codex_reasoning_effort?: string; ai_configured?: boolean; ai_max_output_tokens?: number; ai_context_window?: number }>('/api/settings/ai', {
+  /** 保存 AI 配置。provider 与 base_url 由服务端锁定, 传什么都改不了上游。 */
+  saveAiSettings: (ai: { provider?: string; base_url?: string; api_key?: string; model?: string; user_agent?: string; max_output_tokens?: number; context_window?: number }) =>
+    request<{ ok: boolean; ai_provider?: string; ai_base_url?: string; ai_model?: string; ai_openai_model?: string; ai_configured?: boolean; ai_max_output_tokens?: number; ai_context_window?: number }>('/api/settings/ai', {
       method: 'POST',
       body: JSON.stringify(ai),
     }),
 
-  /** 一键清空 AI 配置(保留自定义 UA) */
+  /** 一键清空 AI 配置(保留自定义 UA)。地址是锁定的, 清空后仍是本站网关。 */
   clearAiSettings: () =>
-    request<{ ok: boolean }>('/api/settings/ai', { method: 'DELETE' }),
+    request<{ ok: boolean; ai_base_url?: string }>('/api/settings/ai', { method: 'DELETE' }),
 
   /** 赞助商(RunningHub)模型列表(后端代理, 规避其网关按 Origin 过滤) */
-  sponsorModels: () =>
-    request<{ models: string[] }>('/api/settings/ai/sponsor-models'),
+  /** 列出本站网关上当前 key 可见的模型(不传 key 时用已保存的)。 */
+  aiModels: (apiKey?: string) =>
+    request<{ models: string[]; base_url?: string }>('/api/settings/ai/models', {
+      method: 'POST',
+      body: JSON.stringify({ api_key: apiKey ?? '' }),
+    }),
 
   preferences: () => request<Preferences>('/api/settings/preferences'),
   dataSources: () => request<DataSourcesResponse>('/api/settings/data-sources'),

@@ -1,9 +1,8 @@
-import { useState, useEffect, useRef, createContext, useContext, type ReactNode } from 'react'
+import { useState, useEffect, useRef, createContext, useContext } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   Save, Loader2, Check, Wifi, WifiOff, Eye, EyeOff, Shield,
-  Shuffle, Plug, Zap, Settings2, ExternalLink, Trash2,
-  Terminal, ChevronDown,
+  Shuffle, Plug, Settings2, Trash2, ChevronDown,
 } from 'lucide-react'
 import { useSettings } from '@/lib/useSharedQueries'
 import { api, type SettingsState } from '@/lib/api'
@@ -20,70 +19,23 @@ const toPositiveInt = (v: string) => {
   return Number.isInteger(n) && n > 0 ? n : undefined
 }
 
-const CODEX_PROVIDER = 'codex_cli'
-const OPENAI_PROVIDER = 'openai'
+// ── AI 上游锁定 ────────────────────────────────────────────────
+// 本站 AI 配置只有「自定义」一种形态: 走本站 Sub2API 网关。地址由服务端强制写入
+// (`backend/app/config.py` 的 AI_GATEWAY_BASE_URL), 前端这里只负责**展示**。
+//
+// 显示以服务端返回的 ai_base_url 为准 —— 万一后端的常量改了而这里忘了改, 界面会
+// 如实显示请求实际打向哪里, 而不是拿本地常量把差异盖住。下面的常量只是服务端还没
+// 返回时的兜底, 不要当成权威值。
+const AI_GATEWAY_BASE_URL = 'https://xiaoni-model.top/v1'
 const OPENAI_COMPAT_PROVIDER = 'openai_compat'
-const CODEX_COMMAND = 'codex'
-const DEFAULT_CODEX_MODEL = 'gpt-5.6-sol'
-const DEFAULT_CODEX_REASONING_EFFORT = 'xhigh'
-const DEFAULT_OPENAI_MODEL = 'gpt-5.5'
-const DEFAULT_REASONING_EFFORT = 'high'
-const SAVED_CODEX_OPTION_VALUE = '__saved_codex_config__'
-const CODEX_REASONING_LABELS: Record<string, string> = {
-  high: '高',
-  xhigh: '极高',
-}
-
-type CodexModelOption = { label: string; value: string; model: string; effort: string; hint: string }
-
-const CODEX_MODEL_OPTIONS: CodexModelOption[] = [
-  { label: 'GPT-5.6 Sol · 极高（推荐）', value: 'gpt-5.6-sol:xhigh', model: 'gpt-5.6-sol', effort: 'xhigh', hint: '旗舰档，适合复杂金融分析与专业任务' },
-  { label: 'GPT-5.6 Terra · 极高', value: 'gpt-5.6-terra:xhigh', model: 'gpt-5.6-terra', effort: 'xhigh', hint: '平衡智能、速度与使用成本' },
-  { label: 'GPT-5.6 Luna · 极高', value: 'gpt-5.6-luna:xhigh', model: 'gpt-5.6-luna', effort: 'xhigh', hint: '适合成本敏感与高频分析任务' },
-  { label: 'gpt-5.5 · 高', value: 'gpt-5.5:high', model: 'gpt-5.5', effort: 'high', hint: '使用 gpt-5.5 + high 推理档' },
-  { label: 'gpt-5.5 · 极高', value: 'gpt-5.5:xhigh', model: 'gpt-5.5', effort: 'xhigh', hint: '使用 gpt-5.5 + xhigh 推理档' },
-  { label: '跟随本机 Codex 默认', value: '', model: '', effort: '', hint: '使用本机 Codex CLI 配置的默认模型与推理强度' },
-]
-
-const codexModelLabel = (model?: string, effort?: string) => {
-  if (!model && !effort) return '默认模型'
-  const modelLabel = model || '默认模型'
-  const effortLabel = effort ? CODEX_REASONING_LABELS[effort] ?? effort : ''
-  return effortLabel ? `${modelLabel} · ${effortLabel}` : modelLabel
-}
-
-type AiPreset = { label: string; provider?: string; url: string; model: string; codexCommand?: string; website: string; websiteLabel: string; description: ReactNode; custom?: boolean; sponsor?: boolean }
-
-const PRESETS: AiPreset[] = [
-  { label: '自定义', url: '', model: '', website: '', websiteLabel: '', description: '不自动填充任何配置，完全手动填写 API 地址、模型和密钥。', custom: true },
-  { label: 'RunningHub', url: 'https://llm.runninghub.ai/v1', model: 'openai/gpt-6-astra-saver', website: 'https://www.runninghub.ai/zh-cn/call-api/llm/models?source=github&inviteCode=edt5wh7c', websiteLabel: 'www.runninghub.ai · 赞助', sponsor: true, description: <>本项目赞助商 · OpenAI 兼容中转，单一接口直连 400+ 主流大模型，<span className="font-medium text-amber-600 dark:text-amber-400">Claude、ChatGPT、Gemini</span> 等国际模型直连稳定不掉线，<span className="font-medium text-amber-600 dark:text-amber-400">最高优惠 80%</span>，<span className="font-medium text-amber-600 dark:text-amber-400">邀请链接注册赠送 1000 RH 积分</span>。通过下方链接注册即为项目提供赞助支持。</> },
-  { label: 'OpenAI', provider: OPENAI_PROVIDER, url: 'https://api.openai.com/v1', model: DEFAULT_OPENAI_MODEL, website: 'https://platform.openai.com/', websiteLabel: 'platform.openai.com', description: 'OpenAI 官方接口，可单独配置模型支持的推理强度。' },
-  { label: 'DeepSeek', url: 'https://api.deepseek.com', model: 'deepseek-v4-pro', website: 'https://www.deepseek.com/', websiteLabel: 'deepseek.com', description: 'DeepSeek 官方 OpenAI 兼容接口。' },
-  { label: '通义千问', url: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-3.6plus', website: 'https://tongyi.aliyun.com/', websiteLabel: 'tongyi.aliyun.com', description: '阿里云 DashScope 兼容模式接口。' },
-  { label: '智谱 GLM', url: 'https://open.bigmodel.cn/api/paas/v4', model: 'glm-5.2', website: 'https://open.bigmodel.cn/', websiteLabel: 'open.bigmodel.cn', description: '智谱 AI 官方 OpenAI 兼容接口。' },
-  { label: 'Kimi', url: 'https://api.moonshot.cn/v1', model: 'kimi-k2.7-code', website: 'https://platform.moonshot.cn/', websiteLabel: 'platform.moonshot.cn', description: '月之暗面 Moonshot 官方 OpenAI 兼容接口，支持超长上下文。' },
-  { label: 'Codex CLI', provider: CODEX_PROVIDER, url: '', model: DEFAULT_CODEX_MODEL, codexCommand: CODEX_COMMAND, website: 'https://developers.openai.com/codex/noninteractive', websiteLabel: 'codex exec', description: '调用本机 Codex CLI 的 codex exec, 适合已登录 ChatGPT/Codex 的本地环境。' },
-]
-
-const findPreset = (provider: string, baseUrl: string, codexCommand: string) => PRESETS.find(p => {
-  if (p.custom || (p.provider ?? OPENAI_COMPAT_PROVIDER) !== provider) return false
-  if (provider === OPENAI_PROVIDER) return true
-  return provider === CODEX_PROVIDER ? p.codexCommand === codexCommand : p.url === baseUrl
-}) ?? PRESETS[0]
 
 export function SettingsAIPanel({ highlight }: { highlight?: string } = {}) {
   const qc = useQueryClient()
   const settings = useSettings()
   const s = settings.data
 
-  const [provider, setProvider] = useState(OPENAI_COMPAT_PROVIDER)
-  const [baseUrl, setBaseUrl] = useState('')
   const [apiKey, setApiKey] = useState('')
   const [model, setModel] = useState('')
-  const [reasoningEffort, setReasoningEffort] = useState(DEFAULT_REASONING_EFFORT)
-  const [codexModel, setCodexModel] = useState('')
-  const [codexReasoningEffort, setCodexReasoningEffort] = useState('')
-  const [codexCommand, setCodexCommand] = useState(CODEX_COMMAND)
   const [customUa, setCustomUa] = useState(false)
   const [userAgent, setUserAgent] = useState('')
   const [maxOutputTokens, setMaxOutputTokens] = useState('')
@@ -91,7 +43,7 @@ export function SettingsAIPanel({ highlight }: { highlight?: string } = {}) {
   const [showKey, setShowKey] = useState(false)
   const [saved, setSaved] = useState(false)
   const [confirmClear, setConfirmClear] = useState(false)
-  // 赞助商预设的模型列表下拉（/models 接口 + 关键词过滤）
+  // 模型列表下拉（从本站网关 /v1/models 拉取该 key 可见的模型 + 关键词过滤）
   const [modelsOpen, setModelsOpen] = useState(false)
   const [modelsLoading, setModelsLoading] = useState(false)
   const [modelsError, setModelsError] = useState('')
@@ -100,68 +52,18 @@ export function SettingsAIPanel({ highlight }: { highlight?: string } = {}) {
   const modelBoxRef = useRef<HTMLDivElement | null>(null)
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<{ ok: boolean; msg: string } | null>(null)
-  const [selectedPresetLabel, setSelectedPresetLabel] = useState(PRESETS[0].label)
-  const directDrafts = useRef({
-    custom: { baseUrl: '', model: '' },
-    openai: { baseUrl: 'https://api.openai.com/v1', model: DEFAULT_OPENAI_MODEL },
-  })
-  const draftsInitialized = useRef(false)
 
-  const isCodexProvider = provider === CODEX_PROVIDER
-  const isOpenAIProvider = provider === OPENAI_PROVIDER
-  const savedCodexProvider = s?.ai_provider === CODEX_PROVIDER
-  const configured = s?.ai_configured ?? (savedCodexProvider ? !!(s?.ai_codex_command ?? CODEX_COMMAND) : s?.has_ai_key)
-  const selectedPreset = PRESETS.find(p => p.label === selectedPresetLabel) ?? PRESETS[0]
-  const configTitle = isCodexProvider ? 'Codex CLI 配置' : isOpenAIProvider ? 'OpenAI 配置' : selectedPreset.custom ? '自定义配置' : `${selectedPreset.label} 配置`
-  const savedCodexModel = s?.ai_codex_model ?? (savedCodexProvider ? (s?.ai_model ?? '') : '')
-  const savedCodexEffort = s?.ai_codex_reasoning_effort ?? ''
-  const savedCodexOptionKnown = CODEX_MODEL_OPTIONS.some(option =>
-    option.model === savedCodexModel && option.effort === savedCodexEffort,
-  )
-  const savedCodexOption: CodexModelOption | null =
-    (savedCodexModel || savedCodexEffort) && !savedCodexOptionKnown
-      ? {
-          label: `${codexModelLabel(savedCodexModel, savedCodexEffort)}（当前配置）`,
-          value: SAVED_CODEX_OPTION_VALUE,
-          model: savedCodexModel,
-          effort: savedCodexEffort,
-          hint: '保留项目中已保存的模型与推理档；此兼容项不可编辑',
-        }
-      : null
-  const codexModelOptions = savedCodexOption
-    ? [savedCodexOption, ...CODEX_MODEL_OPTIONS]
-    : CODEX_MODEL_OPTIONS
-  const selectedCodexModelOption = codexModelOptions.find(option =>
-    option.model === codexModel && option.effort === codexReasoningEffort,
-  ) ?? CODEX_MODEL_OPTIONS[0]
-  const codexModelSelectValue = selectedCodexModelOption.value
-  const canSave = isCodexProvider ? true : !!baseUrl.trim() && !!model.trim()
+  const configured = s?.ai_configured ?? s?.has_ai_key ?? false
+  // 服务端返回优先: 地址栏必须显示请求**实际**打向哪里。本地常量只在首屏(或服务端
+  // 返回空值)时兜底, 不能反过来盖住服务端的值。
+  const baseUrl = s?.ai_base_url || AI_GATEWAY_BASE_URL
+  const canSave = !!model.trim()
 
   useEffect(() => {
     if (!s) return
-    // 未配置过 AI (无 api_key): 字段留空, 默认选中"自定义"预设, 不预填充后端默认值
+    // 未配置过 AI (无 api_key): 字段留空, 不预填充后端默认值
     const unconfigured = !s.has_ai_key && !s.ai_configured
-    const savedProvider = s.ai_provider ?? OPENAI_COMPAT_PROVIDER
-    const savedBaseUrl = unconfigured ? '' : (s.ai_base_url ?? '')
-    const savedOpenAIModel = unconfigured ? '' : (s.ai_openai_model ?? (savedProvider !== CODEX_PROVIDER ? s.ai_model : '') ?? '')
-    const savedPreset = unconfigured ? PRESETS[0] : findPreset(savedProvider, savedBaseUrl, s.ai_codex_command ?? CODEX_COMMAND)
-    if (!draftsInitialized.current) {
-      const officialOpenAI = PRESETS.find(p => p.provider === OPENAI_PROVIDER)
-      if (savedProvider === OPENAI_PROVIDER || (savedProvider === CODEX_PROVIDER && savedBaseUrl === officialOpenAI?.url)) {
-        directDrafts.current.openai = { baseUrl: savedBaseUrl, model: savedOpenAIModel }
-      } else if (findPreset(OPENAI_COMPAT_PROVIDER, savedBaseUrl, CODEX_COMMAND).custom) {
-        directDrafts.current.custom = { baseUrl: savedBaseUrl, model: savedOpenAIModel }
-      }
-      draftsInitialized.current = true
-    }
-    setProvider(savedProvider)
-    setSelectedPresetLabel(savedPreset.label)
-    setBaseUrl(savedBaseUrl)
-    setModel(savedOpenAIModel)
-    setReasoningEffort(s.ai_reasoning_effort ?? DEFAULT_REASONING_EFFORT)
-    setCodexModel(s.ai_codex_model ?? (savedProvider === CODEX_PROVIDER ? s.ai_model : '') ?? '')
-    setCodexReasoningEffort(s.ai_codex_reasoning_effort ?? '')
-    setCodexCommand(s.ai_codex_command ?? CODEX_COMMAND)
+    setModel(unconfigured ? '' : (s.ai_model ?? ''))
     const ua = s.ai_user_agent ?? ''
     setCustomUa(!!ua)
     setUserAgent(ua)
@@ -170,13 +72,12 @@ export function SettingsAIPanel({ highlight }: { highlight?: string } = {}) {
   }, [s])
 
   const payload = () => ({
-    provider,
-    base_url: baseUrl,
+    provider: OPENAI_COMPAT_PROVIDER,
+    // 服务端会强制覆盖这个值(见 backend/app/api/settings.py), 这里传常量只是让
+    // 请求体自洽; 真正的锁在服务端, 用户改不了
+    base_url: AI_GATEWAY_BASE_URL,
     api_key: apiKey || undefined,
-    model: isCodexProvider ? codexModel : model,
-    ...(isOpenAIProvider ? { reasoning_effort: reasoningEffort } : {}),
-    codex_command: isCodexProvider ? CODEX_COMMAND : codexCommand,
-    codex_reasoning_effort: isCodexProvider ? codexReasoningEffort : '',
+    model,
     user_agent: customUa ? userAgent : '',
     max_output_tokens: toPositiveInt(maxOutputTokens),
     context_window: toPositiveInt(contextWindow),
@@ -189,15 +90,11 @@ export function SettingsAIPanel({ highlight }: { highlight?: string } = {}) {
       setApiKey('')
       qc.setQueryData<SettingsState>(QK.settings, prev => prev ? {
         ...prev,
-        ai_provider: result.ai_provider ?? provider,
-        ai_base_url: baseUrl,
-        ai_model: result.ai_model ?? (isCodexProvider ? codexModel : model),
+        ai_provider: result.ai_provider ?? OPENAI_COMPAT_PROVIDER,
+        ai_base_url: result.ai_base_url ?? AI_GATEWAY_BASE_URL,
+        ai_model: result.ai_model ?? model,
         ai_openai_model: result.ai_openai_model ?? model,
-        ai_reasoning_effort: result.ai_reasoning_effort ?? reasoningEffort,
-        ai_codex_model: result.ai_codex_model ?? codexModel,
-        ai_codex_command: result.ai_codex_command ?? (isCodexProvider ? CODEX_COMMAND : codexCommand),
-        ai_codex_reasoning_effort: result.ai_codex_reasoning_effort ?? (isCodexProvider ? codexReasoningEffort : ''),
-        ai_configured: result.ai_configured ?? (isCodexProvider ? true : (apiKey ? true : prev.ai_configured)),
+        ai_configured: result.ai_configured ?? (apiKey ? true : prev.ai_configured),
         ai_max_output_tokens: result.ai_max_output_tokens ?? toPositiveInt(maxOutputTokens),
         ai_context_window: result.ai_context_window ?? toPositiveInt(contextWindow),
         ...(apiKey ? {
@@ -214,32 +111,17 @@ export function SettingsAIPanel({ highlight }: { highlight?: string } = {}) {
     mutationFn: () => api.clearAiSettings(),
     onSuccess: () => {
       setConfirmClear(false)
-      setProvider(OPENAI_COMPAT_PROVIDER)
-      setSelectedPresetLabel(PRESETS[0].label)
-      setBaseUrl('')
       setApiKey('')
       setModel('')
-      setReasoningEffort(DEFAULT_REASONING_EFFORT)
-      setCodexModel('')
-      setCodexReasoningEffort('')
-      setCodexCommand(CODEX_COMMAND)
-      directDrafts.current = {
-        custom: { baseUrl: '', model: '' },
-        openai: { baseUrl: 'https://api.openai.com/v1', model: DEFAULT_OPENAI_MODEL },
-      }
       setMaxOutputTokens('16384')
       setContextWindow('128000')
       setTestResult(null)
       qc.setQueryData<SettingsState>(QK.settings, prev => prev ? {
         ...prev,
         ai_provider: OPENAI_COMPAT_PROVIDER,
-        ai_base_url: '',
+        ai_base_url: AI_GATEWAY_BASE_URL,
         ai_model: '',
         ai_openai_model: '',
-        ai_reasoning_effort: DEFAULT_REASONING_EFFORT,
-        ai_codex_model: '',
-        ai_codex_command: CODEX_COMMAND,
-        ai_codex_reasoning_effort: '',
         ai_max_output_tokens: 16384,
         ai_context_window: 128000,
         has_ai_key: false,
@@ -261,53 +143,17 @@ export function SettingsAIPanel({ highlight }: { highlight?: string } = {}) {
     setUserAgent(`Mozilla/5.0 (${pf}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36`)
   }
 
-  const handlePreset = (p: AiPreset) => {
-    setSelectedPresetLabel(p.label)
-    if (p.custom) {
-      setProvider(OPENAI_COMPAT_PROVIDER)
-      setBaseUrl(directDrafts.current.custom.baseUrl)
-      setModel(directDrafts.current.custom.model)
-      return
-    }
-    if (p.provider === CODEX_PROVIDER) {
-      setProvider(CODEX_PROVIDER)
-      setCodexModel(p.model)
-      setCodexReasoningEffort(DEFAULT_CODEX_REASONING_EFFORT)
-      setCodexCommand(CODEX_COMMAND)
-      return
-    }
-    const nextProvider = p.provider ?? OPENAI_COMPAT_PROVIDER
-    setProvider(nextProvider)
-    if (nextProvider === OPENAI_PROVIDER) {
-      setBaseUrl(directDrafts.current.openai.baseUrl)
-      setModel(directDrafts.current.openai.model)
-    } else {
-      setBaseUrl(p.url)
-      setModel(p.model)
-    }
-  }
+  const handleModelChange = (value: string) => setModel(value)
 
-  const handleBaseUrlChange = (value: string) => {
-    setBaseUrl(value)
-    if (selectedPreset.custom) directDrafts.current.custom.baseUrl = value
-    if (isOpenAIProvider) directDrafts.current.openai.baseUrl = value
-  }
-
-  const handleModelChange = (value: string) => {
-    setModel(value)
-    if (selectedPreset.custom) directDrafts.current.custom.model = value
-    if (isOpenAIProvider) directDrafts.current.openai.model = value
-  }
-
-  // 赞助商预设: 经后端代理拉取 /models 全量模型列表供下拉选择
-  // (浏览器直连会被 RunningHub 网关按 Origin 过滤, 只返回国产模型)
+  // 经后端代理拉取本站网关上该 key 可见的模型列表
+  // (浏览器直连会把 key 暴露在跨域请求里; 且 Sub2API 按用户分组过滤, 必须带用户自己的 key)
   const fetchModelOptions = async () => {
     setModelsLoading(true)
     setModelsError('')
     setModelFilter('')
     setModelsOpen(true)
     try {
-      const data = await api.sponsorModels()
+      const data = await api.aiModels(apiKey || undefined)
       setModelOptions(data.models)
     } catch (error) {
       setModelOptions([])
@@ -337,7 +183,7 @@ export function SettingsAIPanel({ highlight }: { highlight?: string } = {}) {
     try {
       if (canSave) await api.saveAiSettings(payload())
       const r = await api.strategyAiTest()
-      setTestResult({ ok: r.ok, msg: r.ok ? `连通成功 · ${r.model ?? provider}` : (r.error ?? '未知错误') })
+      setTestResult({ ok: r.ok, msg: r.ok ? `连通成功 · ${r.model ?? model}` : (r.error ?? '未知错误') })
     } catch (e: any) {
       setTestResult({ ok: false, msg: String(e?.message ?? '测试失败') })
     } finally {
@@ -365,10 +211,8 @@ export function SettingsAIPanel({ highlight }: { highlight?: string } = {}) {
             <div className="text-sm font-medium text-foreground">{configured ? 'AI 已连接' : 'AI 未配置'}</div>
             <div className="text-xs text-muted mt-0.5 truncate">
               {configured
-                ? (savedCodexProvider
-                  ? `${s?.ai_codex_command ?? CODEX_COMMAND} · ${codexModelLabel(s?.ai_model, s?.ai_codex_reasoning_effort)}`
-                  : `${s?.ai_model} · ${s?.ai_api_key_masked}`)
-                : (isCodexProvider ? '使用本机 codex exec, 此处无需填写 API Key。' : '配置 API Key 后即可使用 AI 功能。')}
+                ? `${s?.ai_model} · ${s?.ai_api_key_masked}`
+                : '填入 Sub2API 的 API Key 后即可使用 AI 功能。'}
             </div>
           </div>
         </div>
@@ -380,164 +224,89 @@ export function SettingsAIPanel({ highlight }: { highlight?: string } = {}) {
         )}
       </Card>
 
-      <Card icon={Zap} title="快速预设">
-        <div className="flex flex-wrap items-start gap-2">
-          {PRESETS.map(p => (
-            <button key={p.label} onClick={() => handlePreset(p)}
-              className={`rounded-lg border px-3 py-2 text-left transition-all ${selectedPreset?.label === p.label ? 'border-accent/40 bg-accent/10 text-accent' : 'border-border bg-base text-secondary hover:border-accent/30'}`}>
-              <div className="flex items-center gap-1.5 text-xs font-medium">
-                <span>{p.label}</span>
-                {p.sponsor && <span className="rounded-full border border-amber-500/40 bg-amber-400/15 px-1.5 py-px text-[9px] font-semibold leading-none text-amber-600 dark:border-amber-400/40 dark:text-amber-400">优惠</span>}
-                {p.provider === CODEX_PROVIDER && <Terminal className="h-3 w-3" />}
-              </div>
-            </button>
-          ))}
-        </div>
-        {selectedPreset && (
-          <div className="mt-3 rounded-btn border border-border/30 bg-base/30 px-3 py-2 text-[11px] leading-relaxed">
-            <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-              <span className="text-secondary">{selectedPreset.description}</span>
-            </div>
-            {selectedPreset.website && (
-              <a href={selectedPreset.website} target="_blank" rel="noreferrer"
-                className={`mt-1 inline-flex items-center gap-1 transition-colors ${selectedPreset.sponsor ? 'font-medium text-amber-600 hover:text-amber-700 dark:text-amber-400 dark:hover:text-amber-300' : 'text-muted hover:text-accent'}`}>
-                {selectedPreset.websiteLabel}
-                <ExternalLink className="h-3 w-3" />
-              </a>
-            )}
-          </div>
-        )}
-      </Card>
-
       <Card
         icon={Settings2}
-        title={configTitle}
+        title="自定义配置"
         right={
-          <span className="inline-flex items-center gap-1.5 text-[10px] text-muted/60" title={isCodexProvider ? 'Use local Codex CLI via codex exec' : 'Use OpenAI-compatible Chat Completions API'}>
-            <span className="rounded-full border border-border/40 bg-base/50 px-1.5 py-px font-mono">{isCodexProvider ? 'codex exec' : 'Chat Completions'}</span>
-            {isCodexProvider ? 'CLI' : '接口'}
+          <span className="inline-flex items-center gap-1.5 text-[10px] text-muted/60" title="Use OpenAI-compatible Chat Completions API">
+            <span className="rounded-full border border-border/40 bg-base/50 px-1.5 py-px font-mono">Chat Completions</span>
+            接口
           </span>
         }
       >
         <div className="space-y-4">
-          {isCodexProvider ? (
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-              <Field label="CLI 命令" hint="固定使用默认 codex 命令, 由后端自动解析本机 Codex Desktop/CLI, 不支持自定义可执行路径。">
-                <div className={`${INPUT_CLS} flex items-center text-muted/80 select-none`} aria-label="Codex CLI command">
-                  {CODEX_COMMAND}
-                </div>
-              </Field>
-              <Field
-                label="模型 / 推理档"
-                hint={selectedCodexModelOption.hint}
-              >
-                <select
-                  value={codexModelSelectValue}
-                  onChange={e => {
-                    const value = e.target.value
-                    const option = codexModelOptions.find(item => item.value === value) ?? CODEX_MODEL_OPTIONS[0]
-                    setCodexModel(option.model)
-                    setCodexReasoningEffort(option.effort)
-                  }}
-                  className={INPUT_CLS}
-                >
-                  {codexModelOptions.map(option => (
-                    <option key={option.value || 'codex-local-default'} value={option.value}>{option.label}</option>
-                  ))}
-                </select>
-              </Field>
-            </div>
-          ) : (
-            <>
-              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                <Field label="API 地址">
-                  <input type="text" value={baseUrl} onChange={e => handleBaseUrlChange(e.target.value)} placeholder="https://llm.runninghub.ai/v1" className={INPUT_CLS} />
-                </Field>
-                <Field label="模型">
-                  <div ref={modelBoxRef} className="relative">
-                    <input type="text" value={model} onChange={e => handleModelChange(e.target.value)} placeholder="gpt-5.6-sol" className={`${INPUT_CLS} ${selectedPreset?.sponsor ? 'pr-9' : ''}`} />
-                    {selectedPreset?.sponsor && (
-                      <button type="button" onClick={fetchModelOptions} aria-label="获取模型列表"
-                        className="absolute right-1.5 top-1/2 flex h-6 w-7 -translate-y-1/2 items-center justify-center rounded-md border border-border/40 bg-base text-muted transition-colors hover:border-accent/40 hover:text-accent">
-                        {modelsLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ChevronDown className="h-3.5 w-3.5" />}
-                      </button>
-                    )}
-                    {selectedPreset?.sponsor && modelsOpen && (
-                      <div className="absolute z-20 mt-1 w-full rounded-lg border border-border/40 bg-base shadow-lg">
-                        <div className="border-b border-border/30 p-2">
-                          <input type="text" value={modelFilter} onChange={e => setModelFilter(e.target.value)}
-                            placeholder="搜索模型..." autoFocus
-                            className="h-7 w-full rounded-md bg-base px-2 text-xs ring-1 ring-border/30 focus:outline-none focus:ring-accent/40" />
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <Field label="API 地址" hint="本站 AI 网关，固定不可修改。">
+              <input type="text" value={baseUrl} readOnly aria-label="AI 网关地址" className={`${INPUT_CLS} cursor-default text-muted/80`} />
+            </Field>
+            <Field label="模型" hint="可从本站网关拉取可用列表，也可直接填写">
+              <div ref={modelBoxRef} className="relative">
+                <input type="text" value={model} onChange={e => handleModelChange(e.target.value)} placeholder="gpt-5.6-sol" className={`${INPUT_CLS} pr-9`} />
+                <button type="button" onClick={fetchModelOptions} aria-label="获取模型列表"
+                  className="absolute right-1.5 top-1/2 flex h-6 w-7 -translate-y-1/2 items-center justify-center rounded-md border border-border/40 bg-base text-muted transition-colors hover:border-accent/40 hover:text-accent">
+                  {modelsLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ChevronDown className="h-3.5 w-3.5" />}
+                </button>
+                {modelsOpen && (
+                  <div className="absolute z-20 mt-1 w-full rounded-lg border border-border/40 bg-base shadow-lg">
+                    <div className="border-b border-border/30 p-2">
+                      <input type="text" value={modelFilter} onChange={e => setModelFilter(e.target.value)}
+                        placeholder="搜索模型..." autoFocus
+                        className="h-7 w-full rounded-md bg-base px-2 text-xs ring-1 ring-border/30 focus:outline-none focus:ring-accent/40" />
+                    </div>
+                    <div className="max-h-56 overflow-y-auto py-1">
+                      {modelsLoading ? (
+                        <div className="flex items-center justify-center gap-1.5 py-6 text-xs text-muted">
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />加载中...
                         </div>
-                        <div className="max-h-56 overflow-y-auto py-1">
-                          {modelsLoading ? (
-                            <div className="flex items-center justify-center gap-1.5 py-6 text-xs text-muted">
-                              <Loader2 className="h-3.5 w-3.5 animate-spin" />加载中...
-                            </div>
-                          ) : modelsError ? (
-                            <div className="px-3 py-4 text-center text-xs text-muted">获取失败: {modelsError}</div>
-                          ) : filteredModelOptions.length === 0 ? (
-                            <div className="px-3 py-4 text-center text-xs text-muted">{modelOptions.length ? '无匹配模型' : '未获取到模型'}</div>
-                          ) : filteredModelOptions.map(id => (
-                            <button key={id} type="button" onClick={() => { handleModelChange(id); setModelsOpen(false) }}
-                              className={`block w-full truncate px-3 py-1.5 text-left font-mono text-xs transition-colors hover:bg-accent/10 ${model === id ? 'text-accent' : 'text-secondary'}`}>
-                              {id}
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                </Field>
-              </div>
-
-              {isOpenAIProvider && (
-                <div className="rounded-lg border border-accent/15 bg-accent/[0.03] p-3">
-                  <div className="mb-2.5">
-                    <span className="rounded-full bg-accent/10 px-2 py-0.5 text-[10px] font-medium text-accent">OpenAI 专属</span>
-                  </div>
-                  <div className="max-w-xs">
-                    <Field label="推理强度">
-                      <input type="text" value={reasoningEffort} onChange={e => setReasoningEffort(e.target.value)} placeholder={DEFAULT_REASONING_EFFORT} className={INPUT_CLS} />
-                    </Field>
-                  </div>
-                </div>
-              )}
-
-              <Field label="API Key">
-                <div className="flex gap-2">
-                  <div className="flex-1 relative">
-                    <input type={showKey ? 'text' : 'password'} value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder={configured ? `${s?.ai_api_key_masked} · 留空不修改` : 'sk-...'} className={`${INPUT_CLS} pr-9`} />
-                    <button onClick={() => setShowKey(v => !v)} className="absolute right-2 top-1/2 -translate-y-1/2 text-muted/40 hover:text-muted" tabIndex={-1} aria-label={showKey ? '隐藏' : '显示'}>
-                      {showKey ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-                    </button>
-                  </div>
-                  <button onClick={handleTest} disabled={testing || !apiKey} className="h-9 px-3 rounded-lg border border-border/50 text-xs text-secondary hover:text-accent hover:border-accent/30 disabled:opacity-40 transition-all flex items-center gap-1.5 shrink-0">
-                    {testing ? <Loader2 className="h-3 w-3 animate-spin" /> : <Wifi className="h-3 w-3" />}
-                    测试
-                  </button>
-                </div>
-              </Field>
-
-              <div className="border-t border-border/20" />
-
-              <div className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <Field label="自定义 User-Agent" inline>
-                    <Toggle checked={customUa} onChange={() => setCustomUa(v => !v)} />
-                  </Field>
-                </div>
-                {customUa && (
-                  <div className="flex gap-2">
-                    <input type="text" value={userAgent} onChange={e => setUserAgent(e.target.value)} placeholder="粘贴浏览器 User-Agent" className={`${INPUT_CLS} flex-1`} />
-                    <button type="button" onClick={genRandomUa} title="随机生成浏览器 User-Agent" className="h-9 px-2.5 rounded-lg border border-border/50 text-xs text-secondary hover:text-accent hover:border-accent/30 transition-all flex items-center gap-1.5 shrink-0">
-                      <Shuffle className="h-3 w-3" /> 随机
-                    </button>
+                      ) : modelsError ? (
+                        <div className="px-3 py-4 text-center text-xs text-muted">获取失败: {modelsError}</div>
+                      ) : filteredModelOptions.length === 0 ? (
+                        <div className="px-3 py-4 text-center text-xs text-muted">{modelOptions.length ? '无匹配模型' : '未获取到模型'}</div>
+                      ) : filteredModelOptions.map(id => (
+                        <button key={id} type="button" onClick={() => { handleModelChange(id); setModelsOpen(false) }}
+                          className={`block w-full truncate px-3 py-1.5 text-left font-mono text-xs transition-colors hover:bg-accent/10 ${model === id ? 'text-accent' : 'text-secondary'}`}>
+                          {id}
+                        </button>
+                      ))}
+                    </div>
                   </div>
                 )}
               </div>
-            </>
-          )}
+            </Field>
+          </div>
+
+          <Field label="API Key" hint="本站 Sub2API 的 API Key；计费走你自己的额度">
+            <div className="flex gap-2">
+              <div className="flex-1 relative">
+                <input type={showKey ? 'text' : 'password'} value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder={configured ? `${s?.ai_api_key_masked} · 留空不修改` : 'sk-...'} className={`${INPUT_CLS} pr-9`} />
+                <button onClick={() => setShowKey(v => !v)} className="absolute right-2 top-1/2 -translate-y-1/2 text-muted/40 hover:text-muted" tabIndex={-1} aria-label={showKey ? '隐藏' : '显示'}>
+                  {showKey ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                </button>
+              </div>
+              <button onClick={handleTest} disabled={testing || !apiKey} className="h-9 px-3 rounded-lg border border-border/50 text-xs text-secondary hover:text-accent hover:border-accent/30 disabled:opacity-40 transition-all flex items-center gap-1.5 shrink-0">
+                {testing ? <Loader2 className="h-3 w-3 animate-spin" /> : <Wifi className="h-3 w-3" />}
+                测试
+              </button>
+            </div>
+          </Field>
+
+          <div className="border-t border-border/20" />
+
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <Field label="自定义 User-Agent" inline>
+                <Toggle checked={customUa} onChange={() => setCustomUa(v => !v)} />
+              </Field>
+            </div>
+            {customUa && (
+              <div className="flex gap-2">
+                <input type="text" value={userAgent} onChange={e => setUserAgent(e.target.value)} placeholder="粘贴浏览器 User-Agent" className={`${INPUT_CLS} flex-1`} />
+                <button type="button" onClick={genRandomUa} title="随机生成浏览器 User-Agent" className="h-9 px-2.5 rounded-lg border border-border/50 text-xs text-secondary hover:text-accent hover:border-accent/30 transition-all flex items-center gap-1.5 shrink-0">
+                  <Shuffle className="h-3 w-3" /> 随机
+                </button>
+              </div>
+            )}
+          </div>
 
           <div className="border-t border-border/20 pt-4">
             <div className="grid grid-cols-2 gap-4">
@@ -555,9 +324,7 @@ export function SettingsAIPanel({ highlight }: { highlight?: string } = {}) {
       <div className="rounded-card border border-amber-400/20 bg-amber-400/[0.04] px-4 py-3 flex items-start gap-3">
         <Shield className="h-4 w-4 text-amber-400/70 mt-0.5 shrink-0" />
         <div className="text-[11px] text-amber-400/70 leading-relaxed">
-          {isCodexProvider
-            ? 'Codex CLI 模式会复用本机已登录的 Codex 账户, 个股、财务、复盘等分析上下文会发送给 OpenAI/Codex。保存即表示确认仅在本机或可信内网使用。'
-            : 'API Key 仅保存在本机项目文件中, 不会上传到任何服务器。请妥善保管。'}
+          API 地址固定为本站 AI 网关，不可修改。API Key 仅保存在本机项目文件中, 不会上传到任何服务器。请妥善保管。
         </div>
       </div>
 
@@ -580,7 +347,7 @@ export function SettingsAIPanel({ highlight }: { highlight?: string } = {}) {
           <div className="relative w-[90vw] max-w-[380px] rounded-card border border-border bg-base shadow-2xl p-6">
             <h3 className="text-sm font-medium text-foreground mb-2">清空 AI 配置</h3>
             <p className="text-xs text-secondary mb-5 leading-relaxed">
-              这会清空已保存的 provider、API Key、API 地址、模型和 Codex CLI 命令。之后可以重新配置。
+              这会清空已保存的 API Key、模型和 User-Agent。API 地址是固定的，不受影响。之后可以重新配置。
             </p>
             <div className="flex items-center justify-end gap-2">
               <button onClick={() => setConfirmClear(false)} className="px-3 py-1.5 rounded-btn bg-elevated text-secondary hover:bg-elevated/80 text-sm transition-colors">

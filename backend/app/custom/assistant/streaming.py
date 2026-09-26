@@ -25,6 +25,7 @@ from app import secrets_store
 from app.config import settings
 from app.services.ai_provider import (
     OPENAI_PROVIDER,
+    ai_base_url,
     current_ai_model,
     current_ai_provider,
     current_openai_reasoning_effort,
@@ -70,9 +71,7 @@ def _client(timeout: float) -> AsyncOpenAI:
     user_agent = secrets_store.get_ai_config("ai_user_agent", "") or settings.ai_user_agent
     return AsyncOpenAI(
         api_key=ai_key,
-        base_url=normalize_openai_base_url(
-            secrets_store.get_ai_config("ai_base_url", settings.ai_base_url),
-        ),
+        base_url=normalize_openai_base_url(ai_base_url()),
         timeout=timeout,
         max_retries=2,
         default_headers={"User-Agent": user_agent},
