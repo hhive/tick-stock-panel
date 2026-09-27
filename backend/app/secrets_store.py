@@ -17,7 +17,7 @@ import os
 from pathlib import Path
 
 from app.services.fs_utils import atomic_write_text
-from app.services.user_paths import resolve_user_root
+from app.services.user_paths import MissingUserContextError, resolve_user_root
 
 logger = logging.getLogger(__name__)
 
@@ -236,18 +236,56 @@ def set_email_smtp_password(password: str, user_root: Path | None = None) -> str
     return value
 
 
-def get_env_backed_secret(field: str, env_name: str, user_root: Path | None = None) -> str:
-    """取环境变量后备的密钥(**部署级**):部署凭据文件优先, 否则环境变量。
+def user_secret_field(field: str) -> str:
+    """把部署级字段名映射到它的**每用户**版本: ``fuyao_api_key`` → ``user_fuyao_api_key``。
 
-    为什么是部署级而非每用户: 三个调用方(自定义数据源插件 loader.py:103、内置
-    插件 plugins/fuyao/provider.py:84、扩展数据配置 ext_data.py:175)取的都是
-    **共享行情**的凭据, 且会在 **import 期与后台线程**被读取 —— 那些时机没有账户
-    上下文。按账户分会让插件在 import 时直接被判为不可用(已实测: fuyao 插件清单
-    解析失败), 且行情取数整体失败。
-
-    签名保留 user_root 是为了不改动既有调用方, 但传进来的账户根对此键无意义。
-    写入侧请用 save_deployment()。
+    为什么不复用同名键: `save()` 按名字分派作用域, 同名键会被写进**部署**文件 ——
+    用户填的 key 会污染站点共享凭据。
     """
+    return f"user_{field}"
+
+
+def get_user_secret(field: str, user_root: Path | None = None) -> str:
+    """取**当前账户**在该字段上的值(未设置 / 无账户上下文 → 空串, 不抛)。
+
+    无上下文返回空串是刻意的: 账户层是**可选覆盖**, 它读不到时调用方应回落到部署级,
+    而不是让 import 期的插件解析整个失败。
+    """
+    try:
+        val = load(user_root).get(user_secret_field(field))
+    except MissingUserContextError:
+        return ""
+    return str(val).strip() if val else ""
+
+
+def save_user_secret(field: str, value: str, user_root: Path | None = None) -> None:
+    """把某字段写进**当前账户**的凭据文件。无账户上下文时由 `save()` fail-closed 拒绝。"""
+    save({user_secret_field(field): value}, user_root=user_root)
+
+
+def clear_user_secret(field: str, user_root: Path | None = None) -> None:
+    """清掉**当前账户**在该字段上的值(清后自动回落到部署级)。"""
+    clear(user_secret_field(field), user_root=user_root)
+
+
+def get_env_backed_secret(field: str, env_name: str, user_root: Path | None = None) -> str:
+    """取环境变量后备的密钥。优先级: **用户自己的 > 部署级 > 环境变量**。
+
+    三个调用方(自定义数据源插件 loader.py:103、内置插件 plugins/fuyao/provider.py:84、
+    扩展数据配置 ext_data.py:175)取的是**共享行情**的凭据, 所以:
+
+      - **有账户上下文**(用户在页面上触发的读取) → 用户自己的 key 优先。这就是
+        「用户填写后以用户填写的为准」的生效点, 无需任何新增取数路径。
+      - **无账户上下文**(import 期、后台线程、调度器、worker 子进程) → 跳过用户层,
+        回落部署级。**这条是关键**: 此前「按账户分」的失败(已实测: fuyao 插件清单
+        在 import 期解析失败)源于「读不到每用户文件即判不可用」; 这里**跳过而非判失败**,
+        所以那些时机**永远有值**, 共享层行为与此前逐位一致。
+
+    写入侧: 站点共享凭据用 `save_deployment()`, 用户自己的用 `save_user_secret()`。
+    """
+    user_val = get_user_secret(field, user_root)
+    if user_val:
+        return user_val
     val = load_deployment().get(field)
     if val:
         return str(val).strip()

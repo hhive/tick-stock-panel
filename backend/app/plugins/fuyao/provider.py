@@ -53,6 +53,10 @@ _DATASETS = ("realtime", "daily", "adj_factor", "financial")
 API_KEY_ENV = "FUYAO_API_KEY"
 SECRETS_FIELD = "fuyao_api_key"  # UI 配置的 Key 存 secrets.json, 优先级高于 .env
 
+# 客户端按 Key 分桶的上限。用户可填自己的 Key(get_api_key 按账户上下文返回),
+# 而本 provider 长期存活 —— 见 _get_client 的说明。
+_CLIENT_CACHE_MAX = 8
+
 # 扶摇 *ms 时间字段为北京时间零点(= UTC 前一日 16:00), +8h 后按 UTC 解析即得交易日
 _SH_MS = 28_800_000
 _HIST_MAX_SPAN_MS = 3650 * 86_400_000  # historical 单次窗口上限 10 年, 超出由本层分片
@@ -310,22 +314,38 @@ class FuyaoProvider:
 
     def __init__(self) -> None:
         self.config = _FuyaoConfig()
-        self._client: FuyaoClient | None = None
+        self._clients: dict[str, FuyaoClient] = {}
         self._dump_memo: dict[str, pl.DataFrame] = {}
         self._dump_path_memo: dict[str, Path] = {}
 
     def close(self) -> None:  # loader.load_all 重建注册表时会对每个 provider 调 close
-        if self._client is not None:
+        for client in self._clients.values():
             with contextlib.suppress(Exception):
-                self._client.close()
-            self._client = None
+                client.close()
+        self._clients.clear()
         self._dump_memo.clear()
         self._dump_path_memo.clear()
 
     def _get_client(self) -> FuyaoClient:
-        if self._client is None:
-            self._client = fuyao_client.FuyaoClient(api_key=get_api_key())
-        return self._client
+        """按 Key 取客户端 —— **不能只缓存一个实例**。
+
+        本 provider 在 loader 的 `_PROVIDERS` 里是长期存活的一份, 而 `get_api_key()`
+        会按账户上下文返回**用户自己的** Key: 只缓存一个实例的话, 第一个调用者的 Key
+        会被之后所有账户复用 —— 那是凭据串号。按 Key 分桶, 上限兜住连接数。
+        """
+        key = get_api_key()
+        client = self._clients.get(key)
+        if client is None:
+            client = fuyao_client.FuyaoClient(api_key=key)
+            self._clients[key] = client
+            while len(self._clients) > _CLIENT_CACHE_MAX:
+                oldest_key = next(iter(self._clients))
+                if oldest_key == key:  # 上限为 1 时也不能把自己挤掉
+                    break
+                stale = self._clients.pop(oldest_key)
+                with contextlib.suppress(Exception):
+                    stale.close()
+        return client
 
     # ---- dump 缓存 ----
     def _ensure_dump_path(self, dump_kind: str, cache_prefix: str) -> Path:

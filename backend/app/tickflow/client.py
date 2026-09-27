@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import logging
 import os
+import time
+from collections import OrderedDict
 
 from tickflow import AsyncTickFlow, TickFlow
 
@@ -23,8 +25,16 @@ logger = logging.getLogger(__name__)
 # 单次请求最坏 4×30s + 退避 ≈ 127s。日志中标注此值, 便于在卡死时对照耗时。
 
 _sync_client: TickFlow | None = None
-_async_client: AsyncTickFlow | None = None
 _paid_realtime_client: TickFlow | None = None
+
+# 异步客户端**按 key 缓存** —— 不能是进程级单例。
+#
+# 请求路径上不同账户带着**不同的 key**(用户在设置页填了自己的数据源 key), 共用一个
+# 实例等于 A 的 key 被 B 的请求用上 —— 那是凭据串号, 不是性能取舍。用 LRU + TTL
+# 兜住内存与连接数: 上限够覆盖同时在线的账户数, 空闲 15 分钟释放连接池。
+_ASYNC_CLIENT_CACHE_MAX = 8
+_ASYNC_CLIENT_TTL_S = 900.0
+_async_clients: OrderedDict[str, tuple[float, AsyncTickFlow]] = OrderedDict()
 
 
 # ===== 服务器归属判定 =====
@@ -73,17 +83,35 @@ def get_client() -> TickFlow:
 
 
 def get_async_client() -> AsyncTickFlow:
-    """异步客户端。FastAPI 请求路径上用。"""
-    global _async_client
-    if _async_client is None:
-        key = secrets_store.get_tickflow_key()
-        if _should_use_free_server():
-            _async_client = AsyncTickFlow.free()
-            logger.info("创建异步 SDK 客户端 (free-api, SDK超时=30s×重试3)")
-        else:
-            _async_client = AsyncTickFlow(api_key=key, base_url=_base_url())
-            logger.info("创建异步 SDK 客户端 (付费端点=%s, SDK超时=30s×重试3)", current_endpoint())
-    return _async_client
+    """异步客户端。FastAPI 请求路径上用。
+
+    **按 key 缓存**(不是单例): 每个账户可能带着自己的数据源 key, 见模块顶部的说明。
+    缓存键含 base_url —— 同一把 key 配不同端点也是两条链路。
+    """
+    key = secrets_store.get_tickflow_key()
+    free = _should_use_free_server()
+    cache_key = "free" if free else f"{key}|{_base_url() or ''}"
+
+    now = time.monotonic()
+    hit = _async_clients.get(cache_key)
+    if hit is not None:
+        created_at, cached = hit
+        if now - created_at < _ASYNC_CLIENT_TTL_S:
+            _async_clients.move_to_end(cache_key)
+            return cached
+        del _async_clients[cache_key]  # 空闲超时: 释放连接池
+
+    if free:
+        client = AsyncTickFlow.free()
+        logger.info("创建异步 SDK 客户端 (free-api, SDK超时=30s×重试3)")
+    else:
+        client = AsyncTickFlow(api_key=key, base_url=_base_url())
+        logger.info("创建异步 SDK 客户端 (付费端点=%s, SDK超时=30s×重试3)", current_endpoint())
+
+    _async_clients[cache_key] = (now, client)
+    while len(_async_clients) > _ASYNC_CLIENT_CACHE_MAX:
+        _async_clients.popitem(last=False)
+    return client
 
 
 def get_paid_realtime_client() -> TickFlow | None:
@@ -104,10 +132,11 @@ def get_paid_realtime_client() -> TickFlow | None:
 
 def reset_clients() -> None:
     """Key 变化后调用 — 让下一次 get_client() 拿新实例。"""
-    global _sync_client, _async_client, _paid_realtime_client
+    global _sync_client, _paid_realtime_client
     _sync_client = None
-    _async_client = None
     _paid_realtime_client = None
+    # 异步侧是按 key 缓存的, key 变了缓存键自然不同; 但清空能立刻释放旧连接池
+    _async_clients.clear()
 
 
 def current_mode() -> str:

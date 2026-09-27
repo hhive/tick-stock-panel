@@ -104,6 +104,19 @@ def _plugin_key_masked(name: str, api_key_env: str) -> str:
     return secrets_store.mask(key) if key else ""
 
 
+def _plugin_user_key_masked(name: str, api_key_env: str) -> str:
+    """**当前账户自己填的** Key 的脱敏串; 没填过返回空。
+
+    与 `_plugin_key_masked` 的区别: 那个是**当前生效**的那把(用户自己的优先, 没有才
+    回落站点共享), 本函数只回答「用户自己填过没有」—— 界面靠它显示
+    「使用中：你自己的 / 站点的」。无账户上下文(启动期 load_all)时恒为空串。
+    """
+    if not str(api_key_env or "").strip():
+        return ""
+    key = secrets_store.get_user_secret(f"{name.lower()}_api_key")
+    return secrets_store.mask(key) if key else ""
+
+
 def plugin_manifest(name: str) -> dict | None:
     """读取指定插件的 plugin.yaml 清单。"""
     plugin_dir = plugins_dir() / (name or "")
@@ -578,6 +591,8 @@ def _register_one_plugin(manifest: dict) -> None:
         "homepage": manifest.get("homepage", ""),
         "api_key_env": manifest.get("api_key_env", ""),
         "api_key_masked": _plugin_key_masked(name, manifest.get("api_key_env", "")),
+        # 用户自己填的那把(空 = 用站点共享的), 界面据此显示「使用中」来源
+        "user_api_key_masked": _plugin_user_key_masked(name, manifest.get("api_key_env", "")),
     }
     if not available:
         return  # 依赖没装: 不注册, 但状态已记录供 UI 显示

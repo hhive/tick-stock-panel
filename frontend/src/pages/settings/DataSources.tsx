@@ -540,6 +540,122 @@ function PluginKeyConfig({ plugin }: { plugin: PluginDataSourceItem }) {
   )
 }
 
+/** 用户自己的 Key —— 与上一块的站点 Key 是两个作用域, 别混。
+ *
+ *  站点的 Key 是**全站共享凭据**(喂共享行情, 管理员才能改); 这一块只属于当前账号:
+ *  填了就优先用你填的, 清掉就回落到站点那把。后台的共享取数始终走站点那把 ——
+ *  所以这里改不动别人的数据, 也不会因为你的额度用尽而影响全站。
+ */
+export function MySourceKeyConfig({ plugin }: { plugin: PluginDataSourceItem }) {
+  const qc = useQueryClient()
+  const [keyInput, setKeyInput] = useState('')
+  const [revealing, setRevealing] = useState(false)
+  const [saved, setSaved] = useState(false)
+
+  const invalidate = () => {
+    qc.invalidateQueries({ queryKey: QK.dataSources })
+    qc.invalidateQueries({ queryKey: QK.capabilityMatrix })
+    qc.invalidateQueries({ queryKey: QK.capabilities })
+    qc.invalidateQueries({ queryKey: QK.quoteStatus })
+  }
+
+  const save = useMutation({
+    mutationFn: () => api.saveUserSourceKey(plugin.name, keyInput.trim()),
+    onSuccess: () => {
+      invalidate()
+      setKeyInput('')
+      setSaved(true)
+      setTimeout(() => setSaved(false), 2000)
+      toast('已改用你自己的 Key', 'success')
+    },
+    onError: (e: Error) => toast(`保存失败: ${e.message}`, 'error'),
+  })
+
+  const clear = useMutation({
+    mutationFn: () => api.clearUserSourceKey(plugin.name),
+    onSuccess: () => {
+      invalidate()
+      toast('已改回站点共用的 Key', 'success')
+    },
+    onError: (e: Error) => toast(`清除失败: ${e.message}`, 'error'),
+  })
+
+  const usingOwn = !!plugin.user_api_key_masked
+
+  return (
+    <div className="mt-6 border-t border-border/30 pt-5">
+      <div className="flex items-center gap-2 mb-2">
+        <KeyRound className="h-3.5 w-3.5 text-accent" />
+        <h3 className="text-xs font-medium text-foreground">我自己的 Key</h3>
+      </div>
+      <p className="text-xs text-secondary leading-relaxed mb-3">
+        填你自己的 Key 后, <span className="text-foreground">你在页面上触发的取数</span>走你自己的额度;
+        站点的共享行情仍走站点那把 Key, 不受影响。清掉即回落。
+      </p>
+
+      <div className="flex items-center gap-2 mb-3 text-xs" data-testid="source-key-in-use">
+        <span className="text-muted">当前使用</span>
+        {usingOwn ? (
+          <>
+            <span className="text-accent font-medium">你自己的</span>
+            <span className="font-mono text-secondary truncate" title={plugin.user_api_key_masked}>
+              {plugin.user_api_key_masked}
+            </span>
+          </>
+        ) : (
+          <span className="text-secondary">{plugin.available ? '站点共用的' : '未配置'}</span>
+        )}
+      </div>
+
+      <form
+        onSubmit={(e) => { e.preventDefault(); if (keyInput.trim()) save.mutate() }}
+        className="space-y-2"
+      >
+        <div className="relative">
+          <input
+            type={revealing ? 'text' : 'password'}
+            placeholder={usingOwn ? '粘贴新 Key 替换你自己的' : `粘贴你自己的 ${plugin.display_name} API Key（可留空不用）`}
+            value={keyInput}
+            onChange={(e) => { setKeyInput(e.target.value); if (saved) setSaved(false) }}
+            autoComplete="off"
+            className="w-full px-3 py-2 pr-9 rounded-input bg-base border border-border text-sm font-mono focus:outline-none focus:border-accent transition-colors duration-150 ease-smooth"
+          />
+          <button
+            type="button"
+            onClick={() => setRevealing((v) => !v)}
+            className="absolute right-2 top-1/2 -translate-y-1/2 text-muted hover:text-foreground transition-colors duration-150 ease-smooth"
+            tabIndex={-1}
+            aria-label={revealing ? '隐藏' : '显示'}
+          >
+            {revealing ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+          </button>
+        </div>
+        <div className="flex gap-2">
+          <button
+            type="submit"
+            disabled={save.isPending || !keyInput.trim()}
+            className="flex-1 h-9 rounded-xl bg-accent text-white text-sm font-semibold flex items-center justify-center gap-2 hover:bg-accent/90 disabled:opacity-40 transition-all"
+          >
+            {save.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : saved ? <Check className="h-4 w-4" /> : <Save className="h-4 w-4" />}
+            {save.isPending ? '验证中...' : saved ? '已保存' : '保存并使用'}
+          </button>
+          {usingOwn && (
+            <button
+              type="button"
+              onClick={() => clear.mutate()}
+              disabled={clear.isPending}
+              className="h-9 px-3 rounded-xl bg-elevated text-secondary hover:text-foreground text-sm flex items-center gap-1.5 transition-colors disabled:opacity-50 shrink-0"
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+              改回站点
+            </button>
+          )}
+        </div>
+      </form>
+    </div>
+  )
+}
+
 /** 能力芯片: 三态 — 服务中(高亮+勾) / 已适配(灰) / 档位锁定(锁, 仅 TickFlow) */
 function CapabilityChips({ caps, servingSet, isTickFlow }: {
   caps: CapabilityRoute[]
@@ -1006,6 +1122,10 @@ function PluginDetail({ plugin, isActive, matrixCaps, servingSet }: {
   servingSet: Set<string>
 }) {
   const declared = new Set(plugin.datasets)
+  // 用来区分「站点 Key」(管理员才可改) 与「我自己的 Key」。与侧边栏账号入口共用
+  // 同一个 query key, 不会多打一次接口。
+  const { data: auth } = useQuery({ queryKey: QK.authStatus, queryFn: api.authStatus, staleTime: 30_000 })
+  const isAdmin = auth?.role === 'admin'
   return (
     <section className="rounded-card border border-border bg-surface p-6">
       {/* 介绍 */}
@@ -1048,7 +1168,10 @@ function PluginDetail({ plugin, isActive, matrixCaps, servingSet }: {
           {/* API Key 配置 (声明了 api_key_env 的插件) */}
           {plugin.api_key_env && (
             <div className={plugin.available ? 'mt-4' : ''}>
-              <PluginKeyConfig plugin={plugin} />
+              {/* 站点 Key 是**全站共享凭据**, 只有管理员能改(写端点也是管理员门控)。
+                  给普通用户渲染一个存下去必然 403 的输入框, 只会让人以为坏了。 */}
+              {isAdmin && <PluginKeyConfig plugin={plugin} />}
+              <MySourceKeyConfig plugin={plugin} />
             </div>
           )}
         </div>

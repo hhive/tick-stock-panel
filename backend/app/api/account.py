@@ -71,6 +71,11 @@ class BindingIn(BaseModel):
     api_key: str = Field(min_length=1, max_length=512)
 
 
+class SourceKeyIn(BaseModel):
+    """用户自己填的数据源 Key。与绑定用同一长度约束。"""
+    api_key: str = Field(min_length=1, max_length=512)
+
+
 # ================================================================
 # 辅助
 # ================================================================
@@ -337,3 +342,62 @@ def remove_binding(req: BindingIn, request: Request) -> dict:
     except accounts.AccountNotFoundError as e:
         raise HTTPException(status_code=401, detail="未登录或会话已过期") from e
     return {"ok": True}
+
+
+# ================================================================
+# 用户自己的数据源 Key
+# ================================================================
+
+def _require_plugin_with_key(name: str) -> str:
+    """校验数据源存在且支持配置 Key, 返回规范化后的名字。"""
+    from app.data_providers import custom as custom_sources
+
+    source = (name or "").strip().lower()
+    manifest = custom_sources.plugin_manifest(source)
+    if manifest is None:
+        raise HTTPException(status_code=404, detail=f"数据源 '{source}' 不存在")
+    if not manifest.get("api_key_env"):
+        raise HTTPException(status_code=400, detail=f"数据源 '{source}' 不支持配置 Key")
+    return source
+
+
+@router.put("/source-keys/{name}")
+def save_source_key(name: str, req: SourceKeyIn, request: Request) -> dict:
+    """保存**当前账号自己的**数据源 Key(先探后存)。
+
+    与管理员那条 `/api/settings/plugin-key` 的分工: 那条写**部署级**(站点共享行情用
+    哪把 Key), 本条写**每用户**。作用域必须与读取侧一致 —— 本仓此前踩过「写入每用户、
+    读取部署级 ⇒ 界面里保存的 Key 永远读不到」的坑(`api/settings.py` 的注释留了档)。
+
+    读取侧在**有账户上下文**时优先取用户自己的(`secrets_store.get_env_backed_secret`),
+    所以用户在页面上触发的探测/试拉会直接用他填的 Key; 后台共享取数仍走部署级。
+    """
+    from app import secrets_store
+    from app.data_providers import custom as custom_sources
+
+    account_id = _current_account_id(request)
+    source = _require_plugin_with_key(name)
+    key = req.api_key.strip()
+
+    ok, message = custom_sources.probe_plugin_key(source, key)
+    if not ok:
+        # 探测不过就不落盘 —— 与管理员端点同语义, 免得存下一把用不了的 Key
+        raise HTTPException(status_code=400, detail=message or "API Key 无效")
+
+    root = user_paths.ensure_user_dirs(account_id)
+    secrets_store.save_user_secret(f"{source}_api_key", key, user_root=root)
+    logger.info("user source key saved: account_id=%s source=%s", account_id, source)
+    return {"ok": True, "scope": "user", "api_key_masked": secrets_store.mask(key)}
+
+
+@router.delete("/source-keys/{name}")
+def clear_source_key(name: str, request: Request) -> dict:
+    """清除**当前账号自己的**数据源 Key —— 清除后自动回落到站点共享的那把。"""
+    from app import secrets_store
+
+    account_id = _current_account_id(request)
+    source = (name or "").strip().lower()
+    root = user_paths.ensure_user_dirs(account_id)
+    secrets_store.clear_user_secret(f"{source}_api_key", user_root=root)
+    logger.info("user source key cleared: account_id=%s source=%s", account_id, source)
+    return {"ok": True, "scope": "user"}

@@ -1834,6 +1834,8 @@ export interface PluginDataSourceItem {
   homepage?: string        // 插件官网/申请地址 (manifest 可选声明)
   api_key_env?: string     // 声明后设置页提供 Key 输入框 (先探后存)
   api_key_masked?: string  // 当前生效 Key 的脱敏串 (secrets.json 优先, .env 兜底; 与 TickFlow Key 同一展示契约)
+  /** **当前用户自己填的**那把的脱敏串; 空 = 用的是站点共享的那把 */
+  user_api_key_masked?: string
 }
 
 /** 数据源路由偏好字段 (每个能力一个, 与后端能力注册表一一对应) */
@@ -2265,6 +2267,20 @@ export const api = {
   },
   clearPluginKey: (plugin: string) =>
     request<PluginKeyResult>(`/api/settings/plugin-key/${encodeURIComponent(plugin)}`, { method: 'DELETE' }),
+
+  /** 保存**当前账号自己的**数据源 Key(先探后存)。任何登录用户可用, 只影响自己。 */
+  saveUserSourceKey: (source: string, apiKey: string) =>
+    request<{ ok: boolean; scope: string; api_key_masked?: string }>(
+      `/api/account/source-keys/${encodeURIComponent(source)}`,
+      { method: 'PUT', body: JSON.stringify({ api_key: apiKey }) },
+    ),
+
+  /** 清除自己填的 Key —— 之后回落到站点共享的那把。 */
+  clearUserSourceKey: (source: string) =>
+    request<{ ok: boolean; scope: string }>(
+      `/api/account/source-keys/${encodeURIComponent(source)}`,
+      { method: 'DELETE' },
+    ),
   testDataSource: (
     provider: string,
     dataset: string,

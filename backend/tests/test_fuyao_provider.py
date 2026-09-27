@@ -964,7 +964,8 @@ def test_iter_daily_splits_older_history_from_big_dump(monkeypatch, tmp_path):
         tmp_path,
         [_dump_bar("000001.SZ", date(2020, 1, 2), 10.0)],
     )
-    provider._client = _FakeHistClient({"000001.SZ": [_bar(date(2019, 12, 31), 9.0)]})
+    # 客户端现按 Key 分桶(见 provider._get_client 的说明), 注入要落进对应的桶
+    provider._clients[fp.get_api_key()] = _FakeHistClient({"000001.SZ": [_bar(date(2019, 12, 31), 9.0)]})
     rows = pl.concat(list(provider.iter_daily(
         ["000001.SZ"], datetime(2019, 12, 30), datetime(2020, 1, 2)
     )))
