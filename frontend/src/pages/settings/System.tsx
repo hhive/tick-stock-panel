@@ -4,7 +4,6 @@
  * 独立于实时监控, 放置影响整体应用行为的开关项。
  */
 import { useState, useCallback, useEffect } from 'react'
-import { useNavigate } from 'react-router-dom'
 import { useQueryClient } from '@tanstack/react-query'
 import { Settings2, Trash2, RefreshCw, Bell, Volume2, Info, ExternalLink, LogOut, Loader2, UserRound } from 'lucide-react'
 import { usePreferences, useVersion } from '@/lib/useSharedQueries'
@@ -17,14 +16,13 @@ import {
   listZhVoices, previewVoice, activateVoice, getCurrentVoiceURI,
 } from '@/lib/voiceBroadcast'
 import { loadStockExternalTemplate, saveStockExternalTemplate } from '@/lib/stock-external-link'
+import { useSignOut } from '@/lib/useSignOut'
 
 export function SettingsSystemPanel() {
   const qc = useQueryClient()
-  const navigate = useNavigate()
   const { data: prefs } = usePreferences()
   const { data: versionData } = useVersion()
   const [saving, setSaving] = useState(false)
-  const [signingOut, setSigningOut] = useState(false)
 
   const screenerAutoRun = prefs?.screener_auto_run ?? true
   const [extTpl, setExtTpl] = useState(() => loadStockExternalTemplate())
@@ -99,21 +97,12 @@ export function SettingsSystemPanel() {
       .catch(() => setAuthInfo(null))  // 取不到就按最简单的文案展示, 不挡退出
   }, [])
 
-  const handleLogout = useCallback(async () => {
-    setSigningOut(true)
-    try {
-      // 账号会话与单密码应急会话是两套独立会话, 按当前身份登出对应那一个
-      if (authInfo?.mode === 'legacy') await api.authLogout()
-      else await api.accountLogout()
-    } catch {
-      // 登出接口失败(如会话已过期)也要让本地落到未登录态, 否则用户卡在已登录界面
-    } finally {
-      // 清掉查询缓存: 换账号后不能还看到上一个账号的数据
-      qc.clear()
-      setSigningOut(false)
-      navigate('/login', { replace: true })
-    }
-  }, [authInfo, navigate, qc])
+  // 退出逻辑与侧边栏账号入口共用一份(那两套会话的分支很容易漏写)
+  const { signOut, signingOut } = useSignOut()
+  const handleLogout = useCallback(
+    () => void signOut(authInfo?.mode),
+    [signOut, authInfo?.mode],
+  )
 
   // 刷新前端缓存: 清除 react-query 缓存 + 强制重载 (绕过浏览器缓存)
   // 不动 localStorage (用户列配置/策略池等偏好保留), 也不影响后端的本地股票数据

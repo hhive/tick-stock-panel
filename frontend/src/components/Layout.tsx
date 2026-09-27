@@ -58,6 +58,7 @@ import {
   PanelLeftOpen,
 } from 'lucide-react'
 import { Logo } from './Logo'
+import { AccountBadge } from './AccountBadge'
 import { api, type CapabilityMatrix, type IndexQuote } from '@/lib/api'
 import { cn } from '@/lib/cn'
 import { useIsDesktop } from '@/lib/useMediaQuery'
@@ -735,6 +736,8 @@ export function Layout() {
                 configured={settingsState?.ai_configured ?? settingsState?.has_ai_key}
                 model={settingsState?.ai_model}
               />
+              <div className="mx-2 border-t border-border/45" aria-hidden="true" />
+              <AccountBadge />
             </div>
           )}
         </div>
