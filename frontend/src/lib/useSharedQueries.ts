@@ -31,6 +31,21 @@ export function useCapabilityMatrix() {
   })
 }
 
+/**
+ * 当前身份与角色 — authStatus (email / role / mode / authenticated)。
+ *
+ * 与侧边栏账号入口同 queryKey, 共享缓存不重复发请求。两处用途:
+ *   - 应用外壳据此把本地数据的身份对齐 (applyAccountIdentity);
+ *   - 设置页据此做站点级(管理员)选项的角色门控。
+ */
+export function useAuthStatus() {
+  return useQuery({
+    queryKey: QK.authStatus,
+    queryFn: api.authStatus,
+    staleTime: 30_000,
+  })
+}
+
 /** 设置状态 — Layout / Data / Keys 共用 */
 export function useSettings() {
   return useQuery({

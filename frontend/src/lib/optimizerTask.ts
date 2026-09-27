@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from 'react'
+import { registerAccountScopedReset } from './account'
 
 /**
  * 参数优化任务管理 (SSE 模式 + 重连)。镜像 backtestTask, 结果为排名 dict。
@@ -296,3 +297,26 @@ export function tryReconnectOptimize(): boolean {
 export function useOptimizerTask(): OptimizerTask | null {
   return useSyncExternalStore(subscribe, () => current, () => null)
 }
+
+/**
+ * 换账号时复位 (登出/登录成功由 lib/account.ts 触发, 不放第二条清理入口)。
+ *
+ * 与 clearOptimize() 分工不同, 别互相顶替: clearOptimize 只是把 current 置 null 让 UI
+ * 收起 —— **它既不关 SSE 也不清续连键/job key**。这里还要断掉上一账号的观察通道, 免得
+ * 下一个账号看到他的进度, 或拿残留的 job key 去操作他的任务。
+ * stopOptimize() 里那个 5s 兜底定时器无需处理: 它自带 `es === eventSource` 判断, 这里把
+ * eventSource 置空后它自然变成空操作。
+ */
+export function resetOptimizerForAccountSwitch(): void {
+  eventSource?.close()
+  eventSource = null
+  currentJobKey = null
+  cancelRequested = false
+  reconnectAttempts = 0
+  current = null
+  localStorage.removeItem(RECONNECT_KEY)
+  localStorage.removeItem(JOB_KEY_KEY)
+  emit()
+}
+
+registerAccountScopedReset(resetOptimizerForAccountSwitch)

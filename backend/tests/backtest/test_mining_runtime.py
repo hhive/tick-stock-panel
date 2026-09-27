@@ -267,8 +267,8 @@ def test_prepare_base_market_forwards_cancel_event(monkeypatch, tmp_path) -> Non
     result = _prepare_base_market(
         service,
         strategy_engine,
-        tmp_path,
         request,
+        user_root=tmp_path,
         expected_generation="generation",
         cancel_check=cancel_event,
     )

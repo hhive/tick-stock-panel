@@ -12,11 +12,14 @@ run_backtest 复用现有 StrategyBacktestConfig + worker, 只读、受控窗口
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
 from app.market_time import cn_today
+
+logger = logging.getLogger(__name__)
 
 # 工具名常量 (与 build_tool_schemas 里 function.name 一一对应)
 LIST_FACTORS = "list_factors"
@@ -195,6 +198,43 @@ def list_data_capabilities() -> dict[str, Any]:
     return {"capabilities": capabilities}
 
 
+# 对客文案里不允许出现的内部痕迹 (路径/异常类名/内部键名)。命中即替换为通用文案 ——
+# 这条错误会经 execute_tool 回填给 LLM 并可能出现在助手回答里, 属**第二类对客出口**
+# (与 api/mining.py 的 manifest error 同类)。
+_INTERNAL_ERROR_MARKERS = (
+    "/", "\\", "InvalidAccountIdError", "MissingUserContextError",
+    "Traceback", "data_dir", "user_root", "users/",
+)
+
+
+def _public_backtest_error(error: object) -> str:
+    """把回测失败原因收敛成可对客的文案; 内部痕迹一律不外发。"""
+    text = str(error or "").strip()
+    if not text or any(marker in text for marker in _INTERNAL_ERROR_MARKERS):
+        return "回测运行失败, 请稍后重试或调整参数"
+    return text
+
+
+def _resolve_account_root(user_root: Path | None) -> Path | None:
+    """显式传入优先; 否则取请求上下文注入的账户根; 都没有则返回 None。
+
+    返回 None 时按"无账户上下文"处理(与修复前的行为一致), 但**记一条 warning** ——
+    修复前这里是静默的: worker 拿共享 data_dir 当账户根会让复合/叠加策略的子策略
+    覆盖值**静默变空**, 两边对不上账且没有任何提示。
+    """
+    if user_root is not None:
+        return user_root
+    from app.services.user_paths import MissingUserContextError, resolve_user_root
+
+    try:
+        return resolve_user_root()
+    except MissingUserContextError:
+        logger.warning(
+            "run_backtest 无账户上下文: 子策略覆盖值将回落默认参数 (调用方需传 user_root=)",
+        )
+        return None
+
+
 def run_backtest(
     data_dir: str | Path,
     *,
@@ -203,15 +243,22 @@ def run_backtest(
     start: str | None = None,
     end: str | None = None,
     asset_type: str = "stock",
+    user_root: Path | None = None,
 ) -> dict[str, Any]:
     """回测工具桥: 复用 StrategyBacktestConfig + make_worker_task/run_worker_task。
 
     同步阻塞 (spawn 子进程), 由 execute_tool 用 asyncio.to_thread 调用。
     返回 {"strategy_id", "start", "end", "stats": 精简白名单键}。
+
+    ``user_root``: 发起账户的数据根。**必须带上** —— worker 子进程没有请求上下文,
+    缺它时引擎的 override_loader 会拿共享 data_dir 去解析账户根, fail-closed 抛错,
+    而调用点是 `except Exception: pass` ⇒ 复合策略的子策略覆盖值静默变空。
     """
     from app.backtest.strategy import StrategyBacktestConfig
     from app.backtest.worker import make_worker_task, run_worker_task
     from app.services.heavy_job_limiter import shared_heavy_job_limiter
+
+    account_root = _resolve_account_root(user_root)
 
     # 缺省结束日用北京日期; 服务器本地 date.today() 会在 UTC/美西主机少取一天。
     end_date = date.fromisoformat(end) if end else cn_today()
@@ -230,12 +277,12 @@ def run_backtest(
     )
     # 与其它重回测端点一致: 走共享重任务限流 (容量 2), 防并发迭代/手动回测叠加挤爆内存
     with shared_heavy_job_limiter.slot("normal"):
-        task = make_worker_task("backtest", Path(data_dir), cfg)
+        task = make_worker_task("backtest", Path(data_dir), cfg, user_root=account_root)
         result = run_worker_task(task)
 
     error = result.get("error")
     if error:
-        raise ValueError(f"回测失败: {error}")
+        raise ValueError(f"回测失败: {_public_backtest_error(error)}")
     stats = result.get("stats") or {}
     return {
         "strategy_id": strategy_id,

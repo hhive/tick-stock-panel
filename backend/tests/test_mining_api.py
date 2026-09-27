@@ -11,6 +11,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from app.api import mining as mining_api
 from app.api.mining import router
 from app.backtest.mining import compute_candidate_signature
 from app.enriched_generation import EnrichedGenerationUnavailableError
@@ -18,16 +19,25 @@ from app.services.mining_jobs import MiningRunStore
 from app.strategy.engine import StrategyEngine
 
 @pytest.fixture(autouse=True)
-def _current_user_context(tmp_path):
-    """把「当前账户根」设为本次用例的临时目录。
+def _current_user_context(tmp_path, monkeypatch):
+    """把「当前账户根」设为本次用例的临时目录, **共享策略库**也指到 tmp。
 
     HTTP handler 通过 user_paths 的统一接缝解析账户私有目录 (真实请求里由认证
     中间件注入 contextvar); 这里直接调用 handler 或只挂了 router 的 TestClient,
     必须自己注入, 否则 fail-closed 抛 MissingUserContextError。
-    data_dir 与 user_root 同取 tmp_path: 用例只关心"落到哪个根", 不区分共享/私有。
+
+    发布产物落**共享策略库** ``<data_dir>/strategies`` (与 ``main.py`` 的引擎加载
+    目录同源), 用例里引擎扫的是 ``tmp_path/strategies/custom`` —— 所以必须把共享库
+    根也指到 tmp_path, 否则产物会写进真实 data_dir 且引擎找不到 (500)。
+    直接 patch ``settings.data_dir`` 不行: 那样 user_root 上下文 (tmp_path) 会与
+    data_dir 相同, resolve_user_root 会以"共享目录不能作账户根"拒绝。
     """
     from app.services import preferences
 
+    monkeypatch.setattr(
+        "app.services.mining_candidates.shared_strategies_root",
+        lambda: tmp_path / "strategies",
+    )
     token = preferences.set_current_user_root(tmp_path)
     yield tmp_path
     preferences.reset_current_user_root(token)
@@ -555,7 +565,10 @@ def test_sse_maps_failed_event_and_honors_last_event_id(tmp_path):
     assert f"id: {failed['id']}" in response.text
     assert "event: failed" in response.text
     assert "event: error" not in response.text
-    assert "worker failed" in response.text
+    # 事件里的 message 与 manifest["error"] 同源, 走同一套对客脱敏 (白名单):
+    # 原文里的任务级措辞 / 内部路径 / 异常类名一律不外发。
+    assert mining_api.MINING_ERROR_FALLBACK in response.text
+    assert "worker failed" not in response.text
 
 
 def test_sse_recovers_progress_snapshot_when_history_is_truncated(tmp_path):

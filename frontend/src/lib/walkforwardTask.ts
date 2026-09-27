@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from 'react'
+import { registerAccountScopedReset } from './account'
 
 /** Walk-forward 任务管理 (SSE + job_key 回吐 + 重连)。镜像 optimizerTask。 */
 
@@ -275,3 +276,24 @@ export function tryReconnectWalkForward(): boolean {
 export function useWalkForwardTask(): WalkForwardTask | null {
   return useSyncExternalStore(subscribe, () => current, () => null)
 }
+
+/**
+ * 换账号时复位 (登出/登录成功由 lib/account.ts 触发, 不放第二条清理入口)。
+ *
+ * 与 clearWalkForward() 分工不同, 别互相顶替: 它只是把 current 置 null 让 UI 收起,
+ * **既不关 SSE 也不清续连键/job key**。stopWalkForward() 的 5s 兜底定时器自带
+ * `es === eventSource` 判断, 这里的 eventSource = null 会让它自然变成空操作。
+ */
+export function resetWalkForwardForAccountSwitch(): void {
+  eventSource?.close()
+  eventSource = null
+  currentJobKey = null
+  cancelRequested = false
+  reconnectAttempts = 0
+  current = null
+  localStorage.removeItem(RECONNECT_KEY)
+  localStorage.removeItem(JOB_KEY_KEY)
+  emit()
+}
+
+registerAccountScopedReset(resetWalkForwardForAccountSwitch)

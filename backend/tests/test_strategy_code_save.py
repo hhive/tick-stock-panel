@@ -10,6 +10,7 @@ from app.api.strategy import (
     StrategyCodeValidateRequest,
     _prepare_strategy_code,
     _save_strategy_code,
+    _strategy_source_dir,
 )
 from app.strategy.engine import StrategyEngine
 
@@ -69,19 +70,27 @@ def filter(df: pl.DataFrame, params: dict) -> pl.Expr:
 '''
 
 
-def _user_root():
-    """账户私有根的**生产形态** ``<data_dir>/users/1`` (与 fixture 注入的一致)。"""
-    from app.services import user_paths
+def _shared_dir(source: str):
+    """共享策略库里的某一个来源目录 ``<data_dir>/strategies/<source>``。"""
+    return app_config.settings.data_dir / "strategies" / source
 
-    return user_paths.user_root(1)
+
+def _engine_strategy_dirs(data_dir):
+    """**照 ``main.py`` 原样接线**的引擎目录集 —— 共享 ``<data_dir>/strategies/*``。
+
+    本文件的核心接线: 引擎扫的目录必须就是 handler 写的目录。复核前 fixture 自己接
+    了一套 ``<user_root>/strategies/*`` (与 ``main.py`` 不符), 于是测试恒绿而生产
+    保存恒 400 —— 源码写进账户根, 引擎却在共享库里找不到它。
+    """
+    return [
+        data_dir / "strategies" / "custom",
+        data_dir / "strategies" / "ai",
+    ]
 
 
 def _request(tmp_path):
-    """请求替身: 策略源码写在**账户根**之下, 共享行情仍读 data_dir。"""
-    user_root = _user_root()
-    ai_dir = user_root / "strategies" / "ai"
-    custom_dir = user_root / "strategies" / "custom"
-    engine = StrategyEngine(strategy_dirs=[custom_dir, ai_dir])
+    """请求替身: 共享 data_dir 既是行情根也是数据根, 引擎按 main.py 接线扫共享策略库。"""
+    engine = StrategyEngine(strategy_dirs=_engine_strategy_dirs(tmp_path))
     repo = SimpleNamespace(store=SimpleNamespace(data_dir=tmp_path))
     return SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(repo=repo, strategy_engine=engine)))
 
@@ -123,10 +132,11 @@ def test_save_strategy_code_creates_ai_strategy_in_ai_dir(tmp_path):
 
     assert result["ok"] is True
     assert result["source"] == "ai"
-    assert (_user_root() / "strategies" / "ai" / "ai_saved.py").exists()
+    assert (_shared_dir("ai") / "ai_saved.py").exists()
+    # 保存即被引擎加载到 —— 保存路径与引擎加载目录必须同源, 否则这里会 400
     loaded = request.app.state.strategy_engine.get("ai_saved")
     assert loaded.source == "ai"
-    assert loaded.file_path == _user_root() / "strategies" / "ai" / "ai_saved.py"
+    assert loaded.file_path == _shared_dir("ai") / "ai_saved.py"
 
 
 def test_save_strategy_code_creates_custom_strategy_in_custom_dir(tmp_path):
@@ -143,10 +153,10 @@ def test_save_strategy_code_creates_custom_strategy_in_custom_dir(tmp_path):
 
     assert result["ok"] is True
     assert result["source"] == "custom"
-    assert (_user_root() / "strategies" / "custom" / "custom_saved.py").exists()
+    assert (_shared_dir("custom") / "custom_saved.py").exists()
     loaded = request.app.state.strategy_engine.get("custom_saved")
     assert loaded.source == "custom"
-    assert loaded.file_path == _user_root() / "strategies" / "custom" / "custom_saved.py"
+    assert loaded.file_path == _shared_dir("custom") / "custom_saved.py"
 
 
 def test_save_strategy_code_updates_existing_source_file(tmp_path):
@@ -168,9 +178,9 @@ def test_save_strategy_code_updates_existing_source_file(tmp_path):
     result = _save_strategy_code(update, request)
 
     assert result["source"] == "custom"
-    custom_path = _user_root() / "strategies" / "custom" / "custom_update.py"
+    custom_path = _shared_dir("custom") / "custom_update.py"
     assert custom_path.exists()
-    assert not (_user_root() / "strategies" / "ai" / "custom_update.py").exists()
+    assert not (_shared_dir("ai") / "custom_update.py").exists()
     assert '"name": "新名称"' in custom_path.read_text(encoding="utf-8")
 
 
@@ -195,7 +205,7 @@ def test_save_strategy_code_rejects_undefined_custom_signal(tmp_path):
         _save_strategy_code(req, request)
 
     # 校验失败不落盘
-    assert not (_user_root() / "strategies" / "custom" / "custom_missing_sig.py").exists()
+    assert not (_shared_dir("custom") / "custom_missing_sig.py").exists()
 
 
 def test_save_strategy_code_ok_when_custom_signal_defined(tmp_path):
@@ -232,3 +242,16 @@ def test_save_strategy_code_ok_when_custom_signal_defined(tmp_path):
     assert result["ok"] is True
     loaded = request.app.state.strategy_engine.get("custom_with_sig")
     assert "csg_oversold_macd_about_to_golden" in loaded.required_features
+
+
+def test_handler_source_dir_matches_engine_loading_dir(tmp_path):
+    """接线回归: handler 的落盘目录 == 引擎的加载目录 (共享策略库)。
+
+    这是 A1 缺陷的正面断言 —— 两边只要错开, 保存就必然在 ``engine.get(sid)`` 落空后
+    被回滚并报 400。历史缺陷: handler 写 ``<user_root>/strategies/*``, 而引擎只扫
+    ``main.py`` 里的 ``<data_dir>/strategies/*``。
+    """
+    engine_dirs = {p.resolve() for p in _engine_strategy_dirs(tmp_path)}
+    for source in ("custom", "ai"):
+        assert _strategy_source_dir(tmp_path, source).resolve() in engine_dirs
+        assert _strategy_source_dir(tmp_path, source) == _shared_dir(source)

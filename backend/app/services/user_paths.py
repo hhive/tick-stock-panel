@@ -32,6 +32,10 @@ USER_SUBDIRS: tuple[str, ...] = (
     "user_data",
     "user_data/lots",            # 手数批次 (strategy.lots)
     "user_data/custom_factors",  # 自定义/复合因子 (factors.store)
+    # 下面是**空壳**: D1 之后策略源码回到了共享策略库 (<data_dir>/strategies/*),
+    # 每账户这三个目录已无人写入 (创作端点全部 admin-only, 引擎也只读共享库)。
+    # 保留它们仅为不动老账户的目录骨架 —— 删掉要连带改测试, 收益为零。
+    # 新代码不要往这里写, 也不要以为读它就是"读到了该账户的策略"。
     "strategies/custom",
     "strategies/ai",
     "strategies/composite",

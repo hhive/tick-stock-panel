@@ -3,6 +3,7 @@ from __future__ import annotations
 import queue
 import threading
 from datetime import date, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import polars as pl
@@ -666,3 +667,54 @@ def test_mining_fails_with_guidance_when_generation_keeps_drifting(
             progress_cb=None,
             cancel_check=None,
         )
+
+
+def test_mining_artifacts_uses_the_shared_market_dir_not_the_account_root():
+    """`_build_artifacts` 读环境数据用的必须是**共享行情根**, 且它只能来自显式参数。
+
+    为什么是源码级而不是行为级 —— 说清楚, 免得被当成空转测试:
+
+    该行在 `_build_artifacts` 的 `for state in ("strong","range","weak")` 循环里, 循环体
+    只在「某个 fold **选中了候选**」时执行。本文件的合成装置里**没有任何 fold 会被选中**
+    (既有 4 条 worker 测试因此全部写死 `require_regime: False`, 且只断言 `overall`) ——
+    我实测加回缺陷后, 端到端用例的失败原因与修复前**完全相同**, 即它对目标缺陷零判别力,
+    故不留那条假测试。
+
+    真实事故: `MatcherCandidateEvaluator.data_dir` 随"账户根"改名成 `user_root` 而消失,
+    该行被留成悬空引用 ⇒ 任何**跑出结果**的挖掘运行在 artifacts 阶段 AttributeError,
+    而 2907 条测试全绿。本守卫直接钉住两件事:
+
+    1. `data_dir` 必须是 `_build_artifacts` 的**显式 keyword-only 参数**(不能从 evaluator 上取);
+    2. 环境数据走的是**共享行情根**, 不是 `evaluator.user_root`(账户根)—— 两者不可互换。
+
+    **行为级覆盖缺口已登记在计划文档待办**: 需要一个能让 fold 选中候选的装置才能真正跑通
+    该分支; 那是独立的测试基础设施工作, 不在本轮范围。
+    """
+    import re
+
+    source = (Path(__file__).resolve().parents[2] / "app" / "backtest" / "mining_runtime.py").read_text(
+        encoding="utf-8",
+    )
+
+    # 1. 签名: data_dir 是 keyword-only 显式参数
+    signature = re.search(r"def _build_artifacts\((.*?)\)\s*->", source, re.S)
+    assert signature, "未找到 _build_artifacts 的定义"
+    params = signature.group(1)
+    assert re.search(r"data_dir:\s*Path", params), (
+        f"_build_artifacts 必须显式接收 data_dir: {params!r}"
+    )
+    assert params.index("*") < params.index("data_dir:"), (
+        f"data_dir 必须是 keyword-only(位于 '*' 之后), 以免调用方按位置传错: {params!r}"
+    )
+
+    # 2. 不得再从 evaluator 上取 data_dir —— 该属性已不存在(改名为 user_root)。
+    #    只匹配**代码形态**(后接 `,` 或 `)`), 否则注释/docstring 里提到这个字符串也会误报。
+    assert not re.search(r"evaluator\.data_dir\s*[,)]", source), (
+        "mining_runtime.py 里仍在访问 evaluator.data_dir —— 该属性已随账户根改名而消失, "
+        "会让跑出结果的挖掘运行在 artifacts 阶段 AttributeError"
+    )
+    # 3. 调用点实参必须是 data_dir(共享行情根), 不是任何 evaluator 属性
+    assert re.search(
+        r"_regime_date_count\(\s*panel,\s*nested_fold\.outer,\s*state,\s*data_dir,\s*\)",
+        source,
+    ), "_regime_date_count 的第 4 个实参必须是 data_dir(共享行情根), 而不是 evaluator 上的属性"

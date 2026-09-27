@@ -3,6 +3,7 @@ import { NavLink, Outlet, useNavigate, useLocation } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { motion } from 'framer-motion'
 import { useQuoteStream, useQuoteStreamStatus } from '@/lib/useQuoteStream'
+import { applyAccountIdentity } from '@/lib/account'
 import { ToastContainer, toast } from '@/components/Toast'
 import { AlertToastContainer } from '@/components/AlertToast'
 import { AiAnalysisHost } from '@/components/financials/AiAnalysisHost'
@@ -10,6 +11,7 @@ import { AiReportBubble } from '@/components/financials/AiReportBubble'
 import { StockAnalysisHost } from '@/components/stock-analysis/StockAnalysisHost'
 import { StockAnalysisBubble } from '@/components/stock-analysis/StockAnalysisBubble'
 import {
+  useAuthStatus,
   useCapabilityMatrix,
   useSettings,
   usePreferences,
@@ -356,6 +358,14 @@ export function Layout() {
   const { data: matrix } = useCapabilityMatrix()
   const { data: versionData } = useVersion()
   const { data: prefs } = usePreferences()
+  // 身份对齐: 刷新/跳转进来时本地数据的身份还没就位 (store 先按哨兵装载), 这里拿到
+  // authStatus 后切到当前账号 —— 否则本人会看到空历史 (2026-09-27 复核 B3 口径修正)。
+  // 与侧边栏账号入口同 queryKey, 不额外发请求。
+  const { data: authInfo } = useAuthStatus()
+  const authIdentity = authInfo ? authInfo.email : null
+  useEffect(() => {
+    if (authInfo) applyAccountIdentity(authIdentity)
+  }, [authIdentity, authInfo])
   // 数据源列表 (用于实时行情状态显示当前数据源名称)
   const { data: dataSources } = useQuery({
     queryKey: QK.dataSources,

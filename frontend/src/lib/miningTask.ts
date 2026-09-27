@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from 'react'
+import { registerAccountScopedReset } from './account'
 import { api, type MiningResult, type MiningRun, type MiningRunProgress, type MiningRunStatus } from './api'
 
 export interface MiningTask {
@@ -28,17 +29,22 @@ const SUCCESS_STATES = new Set<MiningRunStatus>([
 ])
 const STATUS_POLL_INTERVAL_MS = 2000
 
-let current: MiningTask = {
-  runId: null,
-  isPending: false,
-  cancelling: false,
-  reconnecting: false,
-  run: null,
-  progress: null,
-  result: null,
-  previousResult: null,
-  error: null,
+/** 空态任务 (初值与换账号复位共用一份, 避免两处各写一份对不上) */
+function emptyTask(): MiningTask {
+  return {
+    runId: null,
+    isPending: false,
+    cancelling: false,
+    reconnecting: false,
+    run: null,
+    progress: null,
+    result: null,
+    previousResult: null,
+    error: null,
+  }
 }
+
+let current: MiningTask = emptyTask()
 let eventSource: EventSource | null = null
 let connectionToken = 0
 let statusPoll: {
@@ -415,23 +421,35 @@ export function tryReconnectMining(): boolean {
   return true
 }
 
+/**
+ * 收起任务 (页面切走后隐藏提示)。**不是换账号复位**: 它刻意沿用 previousResult ——
+ * 同一账号跨页回来还要看到上一轮结果; 换账号必须用下面的 resetMiningForAccountSwitch()。
+ */
 export function clearMiningTask() {
   closeEvents()
   localStorage.removeItem(ACTIVE_RUN_KEY)
-  current = {
-    runId: null,
-    isPending: false,
-    cancelling: false,
-    reconnecting: false,
-    run: null,
-    progress: null,
-    result: null,
-    previousResult: current.result ?? current.previousResult,
-    error: null,
-  }
+  current = { ...emptyTask(), previousResult: current.result ?? current.previousResult }
   emit()
 }
 
 export function useMiningTask(): MiningTask {
   return useSyncExternalStore(subscribe, () => current, () => current)
 }
+
+/**
+ * 换账号时复位 (登出/登录成功由 lib/account.ts 触发, 不放第二条清理入口)。
+ *
+ * closeEvents() 一次做三件事: 关 SSE、停状态轮询定时器、connectionToken++ (让在飞的
+ * 拉取/续作全部因 token 不匹配而失效)。
+ *
+ * 连 previousResult 也清: 与 clearMiningTask 刻意保留它相反 —— 它是上一账号算出来的
+ * 结果 (因子/标的宇宙与统计), 属「上一账号的产物」, 不能因为换个账号登录就展示给下一个人。
+ */
+export function resetMiningForAccountSwitch(): void {
+  closeEvents()
+  current = emptyTask()
+  localStorage.removeItem(ACTIVE_RUN_KEY)
+  emit()
+}
+
+registerAccountScopedReset(resetMiningForAccountSwitch)

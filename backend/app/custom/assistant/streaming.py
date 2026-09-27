@@ -68,7 +68,11 @@ def _client(timeout: float) -> AsyncOpenAI:
     ai_key = secrets_store.get_ai_key()
     if not ai_key:
         raise RuntimeError("AI API Key 未配置, 请在设置页配置")
-    user_agent = secrets_store.get_ai_config("ai_user_agent", "") or settings.ai_user_agent
+    # 不再回落 settings.ai_user_agent: 那是**进程级单例**, 历史上被每用户保存请求
+    # 改写, 于是这个"默认值"实际是"上一个保存者的值" ⇒ 跨账户串号。现在
+    # get_ai_config 的第三档读的是 app.config.AI_ENV_DEFAULTS(env 初值的只读快照),
+    # 所以这里的 `or settings...` 已属死代码, 且是潜在的回退入口, 一并去掉。
+    user_agent = secrets_store.get_ai_config("ai_user_agent", "")
     return AsyncOpenAI(
         api_key=ai_key,
         base_url=normalize_openai_base_url(ai_base_url()),

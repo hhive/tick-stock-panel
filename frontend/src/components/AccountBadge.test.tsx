@@ -44,6 +44,7 @@ afterEach(async () => {
   await act(async () => root.unmount())
   client.clear()
   host.remove()
+  localStorage.clear()
 })
 
 const status = (over: Partial<AuthStatus>): AuthStatus => ({
@@ -119,6 +120,23 @@ it('退出菜单默认收起，点开后出现「退出登录」', async () => {
   await settle()
 
   expect(menuItem('退出登录')).toBeTruthy()
+})
+
+it('从这里退出也会清掉账户私有的指针数据 (同浏览器换人用)', async () => {
+  localStorage.setItem('assistant.sessions.v1.prev@example.com', '{"sessions":[],"activeId":""}')
+  localStorage.setItem('paper.account', 'acc-of-previous')
+  localStorage.setItem('tf-theme', 'dark')
+
+  await render()
+  await act(async () => { button()?.click() })
+  await settle()
+  await act(async () => { menuItem('退出登录')?.click() })
+  await settle()
+
+  expect(localStorage.getItem('paper.account')).toBeNull()
+  expect(localStorage.getItem('tf-theme')).toBe('dark')
+  // 对话本体是别人的用户内容, 不销毁 (按身份命名空间隔离, 见 assistantIdentityScope.test.ts)
+  expect(localStorage.getItem('assistant.sessions.v1.prev@example.com')).not.toBeNull()
 })
 
 it('账号会话退出走 accountLogout，不走单密码端点', async () => {

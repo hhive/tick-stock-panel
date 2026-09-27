@@ -672,9 +672,22 @@ def clear_data(request: Request):
             deleted += 1
 
     # 清除监控运行数据 (user_data 下仅清运行产物, 不动 monitor_rules/preferences/secrets 等用户配置)
-    # - 触发记录 alerts.jsonl
-    from app.services import alert_store
-    alert_store.clear()
+    # - 触发记录 alerts.jsonl。**每账户一份**, 而本端点的语义是"清空全站数据",
+    #   故逐账户扇出, 而不是只清调用者那一份:
+    #     ① 只清调用者 = 别人的触发记录留着, 与"清空"语义不符;
+    #     ② 无参调用靠 contextvar 取账户根, 于是**没有账号身份**的会话(单密码应急
+    #        入口)会抛 MissingUserContextError 变成 4xx, 与"应急入口等价 admin"
+    #        的契约直接冲突 —— 应急入口做全站清理本就该允许。
+    from app.services import alert_store, user_paths
+
+    alert_accounts = 0
+    for _alert_account_id, _alert_root in user_paths.iter_user_roots():
+        try:
+            alert_store.clear(user_root=_alert_root)
+            alert_accounts += 1
+        except Exception as e:  # noqa: BLE001 — 单账户失败不阻断其余清理
+            logger.warning("清除触发记录失败 (账户 %s): %s", _alert_account_id, e)
+    logger.info("cleared alert records for %d account(s)", alert_accounts)
     # - 待推送的实时通知队列 (进程内存)
     qs = getattr(request.app.state, "quote_service", None)
     if qs is not None:

@@ -16,10 +16,12 @@
   - 认为控制**进程级单例线程**的键(实时行情轮询/深度轮询/分钟增量常驻服务)一律
     GLOBAL —— 单例线程注定只能有一份, 每账户能控制的只是"我看到什么"。
 
-上下文: 每用户键需要一个"当前账户根目录"。
-  - 请求路径: 由认证中间件用 ``set_current_user_root()`` 设置(contextvar)。
+上下文: 每用户键需要一个"当前账户根目录", 全局键需要一个"动作发起者是谁"。
+  - 请求路径: 由认证中间件用 ``set_current_user_root()`` / ``set_current_role()``
+    设置(contextvar, 同一个 finally 里复位)。
   - **后台线程/调度器必须显式传 user_root**, 不得依赖 contextvar —— 后台是
-    threading 与 asyncio 混用, contextvar 跨线程不可靠。
+    threading 与 asyncio 混用, contextvar 跨线程不可靠。同理, 后台没有角色
+    (``current_role() is None``), 因此不受全局键的角色门控影响。
 """
 from __future__ import annotations
 
@@ -92,13 +94,34 @@ def _owner_of(key: str) -> str:
     return "per_user" if key in PER_USER_KEYS else "global"
 
 
+class GlobalScopeWriteDenied(RuntimeError):
+    """在**请求上下文**里, 非管理员试图写全局(部署级)偏好键。
+
+    与 `RuntimeError("写入每用户偏好键但缺少账户上下文")` 是一对**方向相反**的闸门:
+      - 每用户键 + 无账户上下文 → 拒绝 (宁可不写, 也不写进所有人共享的文件);
+      - 全局键 + 有请求上下文且非 admin → 拒绝 (全局键喂的是全站共享的行情/管道)。
+
+    为什么放在 ``save()`` 而不是 URL 清单里: 归属表(PER_USER_KEYS)与门控清单是
+    两份独立维护的名单, 它们之间**没有任何机制保证同步** —— 复核时发现的正是这个
+    裂口(破坏性端点没进 admin 清单)。把判据钉在"这次要写的是不是全局键"上,
+    以后任何新增的全局键端点都自动受保护, 不必逐条登记 URL。
+
+    无请求上下文(后台线程/调度器)保持放行 —— 部署级写入的合法调用方正是它们,
+    在那里按角色判断只会把调度器打死 (它们本来就没有角色)。
+    """
+
+
 # ================================================================
-# 当前账户上下文
+# 当前账户上下文 / 当前角色上下文
 # ================================================================
 
 _current_user_root: ContextVar[Path | None] = ContextVar(
     "_current_user_root", default=None,
 )
+
+# 当前请求的角色。与 _current_user_root 完全同形 (同一个 finally 里注入与复位),
+# 判据是"有没有请求上下文": None = 后台线程/调度器, 不受角色门控。
+_current_role: ContextVar[str | None] = ContextVar("_current_role", default=None)
 
 
 def set_current_user_root(root: Path | None):
@@ -115,6 +138,20 @@ def current_user_root() -> Path | None:
     return _current_user_root.get()
 
 
+def set_current_role(role: str | None):
+    """设置当前请求的角色, 返回可用于 reset 的 token。仅应由认证中间件调用。"""
+    return _current_role.set(role)
+
+
+def reset_current_role(token) -> None:
+    _current_role.reset(token)
+
+
+def current_role() -> str | None:
+    """当前请求的角色; 无请求上下文(后台线程/调度器)返回 None。"""
+    return _current_role.get()
+
+
 def _resolve_root(explicit: Path | None) -> Path | None:
     """显式参数优先, 否则取 contextvar。后台线程**必须**用显式参数。"""
     return explicit if explicit is not None else _current_user_root.get()
@@ -124,16 +161,41 @@ def _resolve_root(explicit: Path | None) -> Path | None:
 # 路径与文件级缓存
 # ================================================================
 
+# 进程内「已确保存在」的目录集合。
+#
+# 原先 _global_path / _user_path **每次调用**都 mkdir(parents=True, exist_ok=True),
+# 而 load() 每次读都会经过它们 —— 行情轮询线程一轮要读 8~12 个键, 于是每轮都有
+# 8~12 次纯粹重复、注定无事发生的系统调用(还各自带一次完整路径解析)。
+# 目录一旦建成就不再消失(没有任何调用方删过 user_data/), 所以记下来即可。
+#
+# 写路径的原子写不变; 唯一的假设是"已确保的目录不会被外部删掉", 万一被删,
+# _write_file 会在 FileNotFoundError 上自愈重建 (见那里)。
+_ensured_dirs: set[str] = set()
+_ensured_lock = threading.Lock()
+
+
+def _ensure_dir(directory: Path) -> None:
+    """确保目录存在; 同一路径进程内只 mkdir 一次(带锁, 命中即跳过)。"""
+    key = str(directory)
+    with _ensured_lock:
+        if key in _ensured_dirs:
+            return
+    directory.mkdir(parents=True, exist_ok=True)
+    with _ensured_lock:
+        # 并发下可能两个线程都走到这里, 重复 insert 无害(exist_ok=True 已保证幂等)
+        _ensured_dirs.add(key)
+
+
 def _global_path() -> Path:
     from app.config import settings
     p = settings.data_dir / "user_data" / "preferences.json"
-    p.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_dir(p.parent)
     return p
 
 
 def _user_path(user_root: Path) -> Path:
     p = Path(user_root) / "user_data" / "preferences.json"
-    p.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_dir(p.parent)
     return p
 
 
@@ -172,7 +234,16 @@ def _load_file(p: Path) -> dict:
 
 
 def _write_file(p: Path, data: dict) -> None:
-    atomic_write_text(p, json.dumps(data, indent=2, ensure_ascii=False))
+    text = json.dumps(data, indent=2, ensure_ascii=False)
+    try:
+        atomic_write_text(p, text)
+    except FileNotFoundError:
+        # 目录被外部删掉了 (「已确保」集合因此失效)。自愈重建后重试一次, 而不是把
+        # 一次本该成功的保存变成报错 —— 这正是 _ensure_dir 去重所付出的代价。
+        with _ensured_lock:
+            _ensured_dirs.discard(str(p.parent))
+        _ensure_dir(p.parent)
+        atomic_write_text(p, text)
 
 
 # ================================================================
@@ -245,6 +316,9 @@ def save(updates: dict, user_root: Path | None = None) -> dict:
     已知只有 PUT /preferences/realtime-monitor 会这样(set_realtime_monitor_config
     混写 7 每用户 + 2 全局); 此处按分区正确写入并**打警告**, 不为此写补偿逻辑。
     真要根治应先把 minute_refresh_* 拆成独立端点, 使每次 save 只落一个文件。
+
+    角色门控: 有请求上下文且非 admin 时, 写**全局键**一律抛
+    ``GlobalScopeWriteDenied`` (main.py 映射为 403)。判据在键的归属, 不在 URL。
     """
     root = _resolve_root(user_root)
     global_updates: dict = {}
@@ -256,11 +330,28 @@ def save(updates: dict, user_root: Path | None = None) -> dict:
             global_updates[key] = value
 
     if user_updates and root is None:
-        # 有每用户键却没有账户上下文 = 调用方 bug。静默写进全局文件会让这个设置
-        # 对所有账户共享(且该键本该是私有的), 属于必须炸出来的错误。
-        raise RuntimeError(
+        # 有每用户键却没有账户上下文。静默写进全局文件会让这个设置对所有账户共享
+        # (且该键本该是私有的), 属于必须炸出来的错误。
+        #
+        # 这里抛 MissingUserContextError(而非新造 RuntimeError) 是为了让**读路径与写
+        # 路径对同一条件给出同一个答案**: main.py 已为该异常注册 handler → 403 +
+        # ACCOUNT_REQUIRED; 抛裸 RuntimeError 则冒泡成 500, 与真实原因完全对不上
+        # (且语义上不是服务端故障)。典型触发: 单密码应急会话在设置页改菜单排序/存
+        # 飞书地址/走首次引导。惰性导入避免与 user_paths 形成导入环。
+        from app.services.user_paths import MissingUserContextError
+
+        raise MissingUserContextError(
             f"写入每用户偏好键但缺少账户上下文: {sorted(user_updates)}; "
-            "后台线程请显式传 user_root=",
+            "后台线程请显式传 user_root= (请求路径上则是会话没有账号身份)",
+        )
+
+    # 结构性闸门: 全局键是**部署级**的(喂全站共享的行情/管道/单例线程), 请求路径
+    # 里只有管理员能改。role 为 None 表示没有请求上下文(后台线程/调度器), 放行。
+    # 判据在**键的归属**而非 URL 清单 —— 见 GlobalScopeWriteDenied 的 docstring。
+    role = _current_role.get()
+    if global_updates and role is not None and role != "admin":
+        raise GlobalScopeWriteDenied(
+            f"非管理员(role={role!r})试图写入全局偏好键: {sorted(global_updates)}",
         )
 
     with _SAVE_LOCK:

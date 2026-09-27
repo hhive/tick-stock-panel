@@ -5,7 +5,7 @@ import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { api } from '@/lib/api'
-import { SUB2API_SITE_URL, resetAccountStateForTests } from '@/lib/account'
+import { SUB2API_SITE_URL, currentAccountIdentity, resetAccountStateForTests } from '@/lib/account'
 import { JumpGate, resetJumpStateForTests } from '@/components/JumpGate'
 import { Auth } from './Auth'
 
@@ -46,6 +46,16 @@ const GUEST_STATUS = {
   configured: true, authenticated: false, claimed: true,
   mode: 'guest' as const, role: 'guest' as const, email: null,
 }
+/** 上一账号留在本浏览器的助手会话 (明文提问 + 回答) */
+const PREV_ACCOUNT_SESSIONS = JSON.stringify({
+  sessions: [{
+    id: 'prev-1',
+    title: '上一账号的对话',
+    createdAt: 1,
+    messages: [{ id: 'm1', role: 'user', content: '上一账号问的问题', ts: 1 }],
+  }],
+  activeId: 'prev-1',
+})
 
 let host: HTMLDivElement
 let root: Root
@@ -78,6 +88,7 @@ afterEach(async () => {
   client.clear()
   host.remove()
   window.history.replaceState(null, '', '/')
+  localStorage.clear()
 })
 
 // React Query / router 的重定向都排在后续的微任务与定时器里, 多刷几轮。
@@ -195,6 +206,27 @@ it('网络异常: 显示可重试的错误, 重试成功后进入登录页', asy
   expect(host.querySelector('[data-testid="email-input"]')).not.toBeNull()
 })
 
+it('跳转登录成功时切身份并清掉指针残留 (同浏览器换人用)', async () => {
+  m.accountJump.mockResolvedValue({ status: 'logged_in', email: 'vip@example.com' })
+  localStorage.setItem('assistant.sessions.v1.prev@example.com', PREV_ACCOUNT_SESSIONS)
+  localStorage.setItem('paper.account', 'acc-of-previous')
+  localStorage.setItem('mining_workbench_draft_v1', '{"symbols":["600000"]}')
+  localStorage.setItem('tf-theme', 'dark')
+
+  await renderApp()
+
+  expect(host.querySelector('[data-testid="app-dashboard"]')).not.toBeNull()
+  // 指针类: 清 (否则新登录的人会落到上一账号的模拟盘账户/挖掘草稿)
+  expect(localStorage.getItem('paper.account')).toBeNull()
+  expect(localStorage.getItem('mining_workbench_draft_v1')).toBeNull()
+  // 身份切到刚登录的账号 —— 助手会话据此读"自己那份"
+  expect(currentAccountIdentity()).toBe('vip@example.com')
+  // 别人(命名空间)的对话本体不许销毁
+  expect(localStorage.getItem('assistant.sessions.v1.prev@example.com')).not.toBeNull()
+  // 设备级偏好跨账号保留
+  expect(localStorage.getItem('tf-theme')).toBe('dark')
+})
+
 it('启动即抹掉地址栏里的凭证 (history.replaceState)', async () => {
   const replaceState = vi.spyOn(window.history, 'replaceState')
   m.accountJump.mockResolvedValue({ status: 'logged_in', email: 'vip@example.com' })
@@ -262,6 +294,22 @@ it('没有跳转凭证时登录成功不会去绑定', async () => {
 
   expect(m.accountLogin).toHaveBeenCalledTimes(1)
   expect(m.accountBind).not.toHaveBeenCalled()
+})
+
+it('登录成功时也切身份并清指针残留 (会话过期后换人登录不经过登出)', async () => {
+  m.accountLogin.mockResolvedValue({ ok: true, email: 'vip@example.com' })
+  localStorage.setItem('assistant.sessions.v1.prev@example.com', PREV_ACCOUNT_SESSIONS)
+  localStorage.setItem('paper.account', 'acc-of-previous')
+
+  await renderAuthOnly()
+  typeInto('[data-testid="email-input"]', 'vip@example.com')
+  typeInto('[data-testid="password-input"]', 'secret123')
+  await click('[data-testid="email-submit"]')
+
+  expect(host.querySelector('[data-testid="app-home"]')).not.toBeNull()
+  expect(currentAccountIdentity()).toBe('vip@example.com')
+  expect(localStorage.getItem('paper.account')).toBeNull()
+  expect(localStorage.getItem('assistant.sessions.v1.prev@example.com')).not.toBeNull()
 })
 
 it('密码不足 6 位时本地拦截, 不发请求', async () => {

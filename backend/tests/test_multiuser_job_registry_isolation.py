@@ -132,8 +132,9 @@ def stub_worker(monkeypatch):
     """
     from app.backtest import worker as worker_mod
 
-    def _fake_make_worker_task(kind, data_dir, config):
-        return {"kind": kind, "config": config}
+    def _fake_make_worker_task(kind, data_dir, config, *, user_root=None):
+        # 形状对齐生产: 账户根随载荷下传 (worker 子进程没有请求上下文, 这是它唯一的来源)。
+        return {"kind": kind, "config": config, "user_root": user_root}
 
     def _fake_run_worker_task(task, on_progress, cancel_event) -> dict:
         return {"ran_with": task["kind"], "params": dict(task["config"].__dict__)}

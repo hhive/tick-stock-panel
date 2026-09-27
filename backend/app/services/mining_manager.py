@@ -108,8 +108,13 @@ class MiningJobManager:
         user_root 必填 (keyword-only): 账户归属只可能来自调用方 —— 请求路径有
         上下文可解析, 后台/调度器必须显式传。刻意**不给默认值**, 否则漏传的调用方
         会静默落到共享目录, 正是本类要根除的形态。
+
+        ``user_root`` 先归一化 (与 ``store_for`` 同一函数) 再往下传: 随载荷发给 worker
+        的账户根必须与运行产物实际落盘的那个根是**同一个** (同一个规范形态), 否则
+        "store 落在 A、子进程按 B 建 store" 这类分歧会重新长出来。
         """
-        store = self.store_for(user_root)
+        root = resolve_user_root(Path(user_root))
+        store = self.store_for(root)
         signature = compute_run_signature(request, data_fingerprint)
         with self._lock:
             if self._shutdown:
@@ -147,7 +152,7 @@ class MiningJobManager:
                 "queued",
                 {"status": "queued", "source": source},
             )
-            self._start_thread_locked(store, run_id, user_root, source)
+            self._start_thread_locked(store, run_id, root, source)
             return manifest
 
     def cancel(self, run_id: str, *, user_root: Path | str) -> dict[str, Any]:

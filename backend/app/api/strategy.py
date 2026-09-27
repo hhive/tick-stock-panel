@@ -68,10 +68,13 @@ def _data_dir(request: Request) -> Path:
 
 
 def _user_root(request: Request) -> Path:
-    """**当前账户**私有数据根 —— 策略源码/覆盖配置/缓存/回测结果都落在这里。
+    """**当前账户**私有数据根 —— 覆盖配置/缓存/回测结果都落在这里。
+
+    **策略源码不在此列**: 它落在共享策略库 ``<data_dir>/strategies/<source>``
+    (见 ``_strategy_source_dir``), 因为引擎是进程级单例且目录集启动后固定。
 
     解析走 user_paths 的统一接缝 (认证中间件已按账户设好 contextvar)。
-    刻意不提供"解析不到就用共享目录"的回退: 那等于把 A 的策略写进 B 的视野。
+    刻意不提供"解析不到就用共享目录"的回退: 那等于把 A 的数据写进 B 的视野。
     """
     from app.services.user_paths import resolve_user_root
 
@@ -87,12 +90,14 @@ def _invalidate_strategy_runtime(request: Request) -> None:
         monitor_engine.invalidate_strategy_state()
 
 
-def _missing_custom_signals(user_root: Path, required_features) -> list[str]:
+def _missing_custom_signals(required_features) -> list[str]:
     """required_features 中 csg_ 列对应信号未定义的部分 (保存策略前校验)。
 
-    自定义信号列 (csg_ 前缀) 只有在**本账户**的 user_data/custom_signals/*.json
-    有对应定义时才会被注入; 引用不存在的信号运行必报缺列错, 保存时早失败。
-    必须查本账户: 查共享目录会把别人的信号当成"已定义"放行。
+    自定义信号列 (csg_ 前缀) 只有在 ``user_data/custom_signals/*.json`` 有对应定义
+    时才会被注入; 引用不存在的信号运行必报缺列错, 保存时早失败。
+
+    信号定义与策略源码同为**共享库**(见 custom_signals 模块的"部署级一份"), 因此这里
+    不再接受 user_root —— 旧签名带 user_root 却从不使用, 只会误导读者以为查的是本账户。
     """
     from app.strategy import custom_signals
 
@@ -711,14 +716,22 @@ def _validate_strategy_id(strategy_id: str) -> str:
     return sid
 
 
-def _target_dir(user_root: Path, source: str) -> Path:
-    """策略源码落盘目录 —— ``<user_root>/strategies/{ai,custom,composite}`` (**每账户一份**)。
+def _strategy_source_dir(data_dir: Path, source: str) -> Path:
+    """策略源码目录 —— ``<data_dir>/strategies/{ai,custom,composite}`` (**共享策略库**)。
 
-    与 ``_data_dir`` (共享行情) 无关: 策略源码是用户资产, 不同账户可以同 ID 各存一份。
+    **必须与 ``main.py`` 给 StrategyEngine 的 ``strategy_dirs`` 同源**: 引擎是进程级
+    单例、目录集启动后固定, 只遍历那几个目录。源码若写到别处 (如
+    ``<data_dir>/users/<id>/strategies/…``), 保存后的 ``engine.get(sid)`` 会落空并被
+    ``_restore_strategy_file`` 回滚 → 恒 400; 删除时的 ``allowed_dir`` 也会与
+    ``s.file_path`` 不同源 → 恒 400。
+
+    共享而非每账户一份的依据: ① 创作端点 (code/save、composite/save、ai/save、删除)
+    全部 admin-only; ② publish + research_only + ``_verify_public_strategy`` 证明策略
+    本就是「可被公开发现」的库; ③ per-account 加载要改引擎架构 (启动时固定的目录集)。
     """
     if source not in {"ai", "custom", "composite"}:
         raise ValueError("target_source 必须是 ai、custom 或 composite")
-    return user_root / "strategies" / source
+    return data_dir / "strategies" / source
 
 
 def _prepare_strategy_code(req: StrategyCodeValidateRequest | StrategyCodeSaveRequest) -> dict:
@@ -759,7 +772,7 @@ def _save_strategy_code(req: StrategyCodeSaveRequest, request: Request, *, legac
             raise ValueError("策略 ID 必须以 ai_ 或 custom_ 开头")
 
     engine = _get_engine(request)
-    user_root = _user_root(request)
+    data_dir = _data_dir(request)
     existing: StrategyDef | None = None
     try:
         existing = engine.get(sid)
@@ -773,7 +786,7 @@ def _save_strategy_code(req: StrategyCodeSaveRequest, request: Request, *, legac
             raise ValueError("自定义策略 ID 必须以 custom_ 开头")
 
     if legacy_ai_path:
-        out_dir = _target_dir(user_root, "ai")
+        out_dir = _strategy_source_dir(data_dir, "ai")
         out_dir.mkdir(parents=True, exist_ok=True)
         path = out_dir / f"{sid}.py"
         expected_source = "ai"
@@ -788,7 +801,7 @@ def _save_strategy_code(req: StrategyCodeSaveRequest, request: Request, *, legac
         if existing is not None:
             raise ValueError(f"策略 {sid} 已存在，请改用修改模式或换一个策略 ID")
         source_dir = "ai" if legacy_ai_path else req.target_source
-        out_dir = _target_dir(user_root, source_dir)
+        out_dir = _strategy_source_dir(data_dir, source_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         path = out_dir / f"{sid}.py"
         expected_source = "ai" if legacy_ai_path else req.target_source
@@ -817,7 +830,7 @@ def _save_strategy_code(req: StrategyCodeSaveRequest, request: Request, *, legac
             raise ValueError(f"策略来源异常: 期望 {expected_source}, 实际 {loaded.source}")
         # 自定义信号存在性校验: REQUIRED_FEATURES 里 csg_ 列必须已有定义,
         # 否则运行必报缺列错。早失败并恢复文件, 提示用户先创建信号。
-        missing = _missing_custom_signals(user_root, loaded.required_features)
+        missing = _missing_custom_signals(loaded.required_features)
         if missing:
             raise ValueError(
                 "策略引用了未定义的自定义信号: " + ", ".join(sorted(missing))
@@ -1001,18 +1014,17 @@ async def ai_iterate(req: AIIterateRequest, request: Request):
 
     engine = _get_engine(request)
     data_dir = _data_dir(request)
-    user_root = _user_root(request)
     try:
         prompt = build_step1(
             req.name, req.description, req.direction, req.rules,
             strategy_id="", execution_backend=req.execution_backend,
         )
         iterator = AIStrategyIterator(max_rounds=req.max_rounds)
+        # 草稿落共享策略库 (与引擎加载目录同源), 因此不需要账户根
         result = await iterator.iterate(
             prompt,
             engine=engine,
             data_dir=str(data_dir),
-            user_root=user_root,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -1092,7 +1104,7 @@ def _save_composite_strategy(req: StrategyCompositeSaveRequest, request: Request
         raise ValueError("叠加策略 ID 必须以 composite_ 开头")
 
     engine = _get_engine(request)
-    user_root = _user_root(request)
+    data_dir = _data_dir(request)
 
     existing: StrategyDef | None = None
     try:
@@ -1129,7 +1141,7 @@ def _save_composite_strategy(req: StrategyCompositeSaveRequest, request: Request
         sid, req.name, req.description, children, req.merge_mode, req.min_confirm
     )
 
-    out_dir = _target_dir(user_root, "composite")
+    out_dir = _strategy_source_dir(data_dir, "composite")
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"{sid}.py"
     previous_code = path.read_text(encoding="utf-8") if path.exists() else None
@@ -1246,19 +1258,19 @@ def delete_strategy(strategy_id: str, request: Request):
         )
 
     path = s.file_path
-    user_root = _user_root(request)
     if path is None or s.source not in {"custom", "ai", "composite"}:
         raise HTTPException(status_code=400, detail="策略源文件路径无效, 无法删除")
 
     try:
-        # 只允许删**本账户**策略目录内的文件; 用 user_root 而非共享 data_dir,
-        # 否则别的账户的 strategies/ 会落进 allowed_dir, 路径校验形同虚设。
-        allowed_dir = _target_dir(user_root, s.source).resolve()
+        # allowed_dir 必须是**引擎的加载目录**(共享策略库) —— 与 s.file_path 同源。
+        # 复核前这里取的是账户根下的 strategies/, 而源码在共享库, is_relative_to
+        # 恒假 → 删除恒 400。校验本身不能去掉: 它挡住"文件路径被指到策略库之外"。
+        allowed_dir = _strategy_source_dir(_data_dir(request), s.source).resolve()
         resolved_path = path.resolve()
     except (OSError, RuntimeError) as e:
         raise HTTPException(status_code=409, detail=f"无法访问策略文件: {e}") from e
     if not resolved_path.is_relative_to(allowed_dir):
-        raise HTTPException(status_code=400, detail="策略源文件不在用户策略目录, 拒绝删除")
+        raise HTTPException(status_code=400, detail="策略源文件不在策略库目录, 拒绝删除")
 
     try:
         resolved_path.unlink(missing_ok=True)

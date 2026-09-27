@@ -203,6 +203,50 @@ def run_instruments_sync(repo: KlineRepository) -> dict:
     return {"instruments_rows": rows}
 
 
+def settle_paper_accounts(data_dir: Path, day: str) -> dict:
+    """按面板账户扇出模拟盘结算 (后台调度线程 —— 必须逐账户显式传 user_root=)。
+
+    本函数在**后台调度线程**里跑, 没有账户上下文 —— 早先直接调
+    ``paper.list_account_ids()`` 会抛 MissingUserContextError 并整段跳过, 使盘后结算从未
+    执行 (生产日志实证 ``paper_settle skipped`` 出现 6 次)。现遍历账户注册表, 逐个显式传
+    ``user_root=`` (数据在 ``<data_dir>/users/<面板账户>/paper/...``)。刻意不拿
+    ``data_dir`` 兜底: 那等于把共享目录当账户目录读写, 会把 A 的订单台账当成人人可见的数据。
+
+    这里**不**缓存账户名单 (与行情轮询热路径的 TTL 缓存不同): 一天只跑一次, 及时性优先。
+
+    隔离: 每个面板账户独立 try —— 一个账户的数据坏掉只记 WARNING 并计入
+    ``failed_accounts``, 不中断其余账户的结算。刻意不计入 stage_errors: 某个用户自己的
+    数据问题不该让整条管道对所有人报失败。
+
+    成交留痕不在这里做: ``paper._fill_order`` 在成交当时就按账户写进了该账户的
+    alerts.jsonl (盘中与结算两条路径都经过它), 管道侧再写一遍只会多出一条重复记录。
+    """
+    from app.strategy import paper as paper_trading
+
+    totals: dict = {
+        "filled": 0, "expired": 0, "corp_actions": 0, "nav": None,
+        "accounts": [], "failed_accounts": [],
+    }
+    for panel_account_id, user_root in list(user_paths.iter_user_roots()):
+        try:
+            for acc_id in paper_trading.list_account_ids(user_root=user_root):
+                s = paper_trading.settle_day(data_dir, day, account_id=acc_id, user_root=user_root)
+                totals["filled"] += s.get("filled", 0)
+                totals["expired"] += s.get("expired", 0)
+                totals["corp_actions"] += s.get("corp_actions", 0)
+                if s.get("nav") is not None:
+                    totals["nav"] = s["nav"]
+                totals["accounts"].append({
+                    "panel_account": panel_account_id,
+                    "account": acc_id,
+                    **{k: s.get(k) for k in ("filled", "expired", "corp_actions")},
+                })
+        except Exception as e:  # noqa: BLE001
+            logger.warning("paper_settle 账户 %s 失败 (不影响其余账户): %s", panel_account_id, e)
+            totals["failed_accounts"].append(panel_account_id)
+    return totals
+
+
 def run_now(
     repo: KlineRepository,
     capset: CapabilitySet,
@@ -745,47 +789,9 @@ def run_now(
     paper_summary: dict = {}
     try:
         emit("paper_settle", 94, "模拟盘结算…")
-        from app.services.user_paths import MissingUserContextError
-        from app.strategy import paper as paper_trading
-
-        # 账户数据按面板账户分家 (data/users/<面板账户>/paper/...): 本阶段在**后台
-        # 调度线程**里跑, 没有账户上下文, 需要按账户扇出并显式传 user_root=。
-        # 扇出落地前这里拿不到任何账户 → 跳过并留痕 (计入 skipped, 不算失败: 没有
-        # 账户可结算是「本阶段无从下手」, 报成管道失败会让运维误判数据链路坏了)。
-        # 刻意不传 repo.store.data_dir 兜底 —— 那等于把共享目录当账户目录来读写。
-        try:
-            account_ids = paper_trading.list_account_ids()
-        except MissingUserContextError:
-            logger.warning("paper_settle skipped: 后台无账户上下文, 待每账户扇出 (S3)")
-            skipped.append("paper_settle")
-            account_ids = []
-
-        # 逐账户结算 (账户间订单/台账隔离), 汇总合并供日志与结果展示
-        totals = {"filled": 0, "expired": 0, "corp_actions": 0, "nav": None, "accounts": []}
-        for acc_id in account_ids:
-            s = paper_trading.settle_day(repo.store.data_dir, today.isoformat(), account_id=acc_id)
-            totals["filled"] += s.get("filled", 0)
-            totals["expired"] += s.get("expired", 0)
-            totals["corp_actions"] += s.get("corp_actions", 0)
-            if s.get("nav") is not None:
-                totals["nav"] = s["nav"]
-            totals["accounts"].append({"account": acc_id, **{k: s.get(k) for k in ("filled", "expired", "corp_actions")}})
-        paper_summary = totals
+        paper_summary = settle_paper_accounts(repo.store.data_dir, today.isoformat())
         if paper_summary.get("filled") or paper_summary.get("corp_actions"):
             logger.info("paper_settle: %s", paper_summary)
-        # 结算成交留痕 (V3): next_open/close 单的成交发生在盘后管道内, 盘中钩子
-        # 覆盖不到; 管道无 SSE 广播器, 这里补 alert_store 留痕进监控中心即可见。
-        if totals["filled"]:
-            try:
-                from app.services import alert_store
-                settle_events = []
-                for acc_id in account_ids:
-                    settle_events.extend(paper_trading.day_fill_events(
-                        today.isoformat(), account_id=acc_id))
-                if settle_events:
-                    alert_store.append_many(repo.store.data_dir, settle_events)
-            except Exception as e:
-                logger.warning("模拟盘结算成交留痕失败: %s", e)
         emit("paper_settle", 94, "模拟盘结算完成")
     except Exception as e:
         logger.warning("paper_settle failed (soft): %s", e)

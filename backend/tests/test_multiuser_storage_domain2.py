@@ -8,7 +8,12 @@
   5. 回测结果       app/services/backtest.py
   6. 回测候选池     app/backtest/candidates.py
   7. 挖掘运行       app/services/mining_jobs.py
-  8. 策略源码目录   app/api/strategy.py
+  8. 策略源码目录   app/api/strategy.py —— **例外: 共享策略库** (D1)
+
+第 8 条是唯一不按账户分家的: 源码落在共享 ``<data_dir>/strategies/<source>``, 因为
+策略引擎是进程级单例、目录集启动后固定 (``main.py`` 的 ``strategy_dirs``), 创作端点又
+全部 admin-only。按账户分家会让引擎扫不到刚保存的策略 —— 保存恒 400。本文件对它的
+断言因此是"落在共享库**且保存后引擎能加载到**", 用与 ``main.py`` 相同的引擎接线。
 
 断言一律走**真实存储函数**(不是断言路径字符串), 否则"路径对了但读的时候没按账户读"
 这类缺陷照样漏网。三条固定负例对每个存储都成立:
@@ -468,52 +473,83 @@ def _request(tmp_path: Path, engine: StrategyEngine) -> SimpleNamespace:
     return SimpleNamespace(app=SimpleNamespace(state=state))
 
 
-def _save_strategy(tmp_path: Path, account_id: int, strategy_id: str, name: str) -> Path:
-    """以 account_id 的身份保存一个自定义策略, 返回其落盘路径。"""
-    root = user_paths.user_root(account_id)
-    engine = StrategyEngine(strategy_dirs=[root / "strategies" / "custom"])
+def _save_strategy(
+    tmp_path: Path,
+    account_id: int,
+    strategy_id: str,
+    name: str,
+    *,
+    mode: str = "create",
+) -> tuple[Path, StrategyEngine]:
+    """以 account_id 的身份保存一个自定义策略, 返回 (落盘路径, 引擎)。
+
+    引擎目录集**照 ``main.py`` 原样接线** (共享 ``<data_dir>/strategies/custom``):
+    只有用生产接线构造引擎, 才能暴露"源码写到别处 ⇒ 引擎加载不到 ⇒ 保存回滚报 400"
+    的缺陷 (复核前测试自己接了一套 ``<user_root>/strategies/*``, 于是恒绿)。
+    """
+    engine = StrategyEngine(strategy_dirs=[tmp_path / "strategies" / "custom"])
     request = _request(tmp_path, engine)
     req = strategy_api.StrategyCodeSaveRequest(
         strategy_id=strategy_id,
         target_source="custom",
-        mode="create",
+        mode=mode,
         code=_strategy_code("wrong", name),
         name=name,
     )
     with _as_account(account_id):
         result = strategy_api._save_strategy_code(req, request)
     assert result["ok"] is True
-    return Path(result["path"])
+    return Path(result["path"]), engine
 
 
-def test_strategy_source_lands_in_own_account_dir(_isolated):
-    """策略源码按账户分家; 同一 strategy_id 两个账户各存一份, 互不覆盖。"""
-    path_a = _save_strategy(_isolated, 1, "custom_shared", "A的策略")
-    path_b = _save_strategy(_isolated, 2, "custom_shared", "B的策略")
+def test_strategy_source_lands_in_shared_library(_isolated):
+    """策略源码落在**共享策略库** (= 引擎的加载目录), 且保存后引擎能加载到。
 
-    assert path_a == _isolated / "users" / "1" / "strategies" / "custom" / "custom_shared.py"
-    assert path_b == _isolated / "users" / "2" / "strategies" / "custom" / "custom_shared.py"
-    assert path_a != path_b
-    assert "A的策略" in path_a.read_text(encoding="utf-8")
-    assert "B的策略" in path_b.read_text(encoding="utf-8")
+    D1: 创作端点全部 admin-only; ``publish`` + ``research_only`` +
+    ``_verify_public_strategy("published strategy is not publicly discoverable")`` 证明
+    策略本就是「可被公开发现」的库; 引擎又是进程级单例、目录集启动后固定。因此源码
+    不按账户分家 —— 按账户分家会让引擎扫不到, 保存恒 400。
+    """
+    path_a, engine_a = _save_strategy(_isolated, 1, "custom_shared", "A的策略")
 
-    # 新账户的目录里没有别人的策略; 共享 data_dir 下不出现 strategies/
-    assert sorted(p.name for p in path_b.parent.glob("*.py")) == ["custom_shared.py"]
-    assert not (_isolated / "strategies").exists()
+    assert path_a == _isolated / "strategies" / "custom" / "custom_shared.py"
+    # 关键: 保存后引擎必须能加载到它 (否则保存路径会走回滚并报 400)
+    loaded = engine_a.get("custom_shared")
+    assert loaded.file_path == path_a
+    assert loaded.source == "custom"
+
+    # 共享库语义: 同一 strategy_id 只有一份, 由**另一个账户**以 update 模式改它,
+    # 落盘位置不变 (按账户分家时这里会多出 users/2/strategies/custom/ 的第二份,
+    # 而引擎只会加载其中一份 —— 正是 D1 要消除的分裂)。
+    path_b, engine_b = _save_strategy(
+        _isolated, 2, "custom_shared", "B的策略", mode="update"
+    )
+
+    assert path_b == path_a
+    assert engine_b.get("custom_shared").file_path == path_a
+    assert "B的策略" in path_a.read_text(encoding="utf-8")
+    assert sorted(p.name for p in path_a.parent.glob("*.py")) == ["custom_shared.py"]
+
+    # 账户私有根下**不**出现策略源码目录 (D1 反转了旧断言)
+    assert not (_isolated / "users" / "1" / "strategies").exists()
+    assert not (_isolated / "users" / "2" / "strategies").exists()
 
 
-def test_strategy_dir_helper_is_per_account(_isolated):
-    """handler 解析出的账户根 + 源码目录 = 该账户自己的 strategies/<source>。"""
+def test_strategy_source_dir_is_shared_and_account_independent(_isolated):
+    """handler 的源码目录 = 共享策略库 ``<data_dir>/strategies/<source>``, 换账户不变。"""
     def _dir_for(account_id: int, source: str) -> Path:
         engine = StrategyEngine(strategy_dirs=[])
         with _as_account(account_id):
-            root = strategy_api._user_root(_request(_isolated, engine))
-        return strategy_api._target_dir(root, source)
+            request = _request(_isolated, engine)
+            strategy_api._user_root(request)  # 账户上下文仍必须可解析 (fail-closed)
+        return strategy_api._strategy_source_dir(_isolated, source)
 
     dir_a = _dir_for(1, "custom")
     dir_b = _dir_for(2, "composite")
+    dir_c = _dir_for(2, "custom")
 
-    assert dir_a == user_paths.user_root(1) / "strategies" / "custom"
-    assert dir_b == user_paths.user_root(2) / "strategies" / "composite"
-    assert dir_a.resolve().is_relative_to(user_paths.user_root(1).resolve())
-    assert not dir_b.resolve().is_relative_to(user_paths.user_root(1).resolve())
+    assert dir_a == _isolated / "strategies" / "custom"
+    assert dir_b == _isolated / "strategies" / "composite"
+    assert dir_c == dir_a  # 换账户不改变源码目录
+    assert not (_isolated / "users" / "1" / "strategies").exists()
+    assert not (_isolated / "users" / "2" / "strategies").exists()

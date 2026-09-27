@@ -636,7 +636,8 @@ async def _iter_openai_text(stream) -> AsyncIterator[str]:
 def _openai_client(api_key: str, timeout: float):
     from openai import AsyncOpenAI
 
-    user_agent = secrets_store.get_ai_config("ai_user_agent", "") or settings.ai_user_agent
+    # 同 streaming.py: 去掉对进程级单例的回退, 第三档已由 AI_ENV_DEFAULTS 快照承担。
+    user_agent = secrets_store.get_ai_config("ai_user_agent", "")
     return AsyncOpenAI(
         api_key=api_key,
         base_url=normalize_openai_base_url(ai_base_url()),

@@ -9,14 +9,17 @@ import queue
 import threading
 import time
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import asdict
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import psutil
+
+if TYPE_CHECKING:  # 仅类型标注: 运行期在函数内惰性导入, 避免子进程启动时的导入环
+    from app.strategy.engine import StrategyEngine
 
 logger = logging.getLogger(__name__)
 
@@ -133,7 +136,24 @@ def encode_optimize_config(config) -> dict[str, Any]:
     return payload
 
 
-def make_worker_task(kind: str, data_dir: Path, config) -> dict[str, Any]:
+def make_worker_task(
+    kind: str,
+    data_dir: Path,
+    config,
+    *,
+    user_root: Path | str | None = None,
+) -> dict[str, Any]:
+    """打包一次 worker 任务。
+
+    ``data_dir`` 是**共享行情目录** (K线/因子所有人一份); ``user_root`` 是**发起账户
+    的私有数据根**。两者必须分开传 —— 子进程没有请求上下文, 账户根只能随载荷下发,
+    否则引擎的 ``override_loader`` 会把共享根当账户根 (被 ``resolve_user_root``
+    fail-closed 拒掉, 或静默读到空覆盖值)。
+
+    ``user_root`` 是**关键字参数且可选**, 既有调用方 (``api/backtest.py``、工具桥
+    ``tool_catalog``) 不必改就能继续工作 —— 拿到账户根需在自己的调用处补
+    ``user_root=`` (见 docs/plan/tick-stock-multiuser-review-fixes-20260927.md §4 C2)。
+    """
     if kind == "backtest":
         encoded = encode_backtest_config(config)
     elif kind == "optimize":
@@ -148,11 +168,50 @@ def make_worker_task(kind: str, data_dir: Path, config) -> dict[str, Any]:
         encoded = dict(config)
     else:
         raise ValueError(f"unsupported worker task kind: {kind}")
-    return {
+    task = {
         "kind": kind,
         "data_dir": str(data_dir.resolve()),
         "config": encoded,
     }
+    # 挖掘载荷把账户根放在 config 里 (mining_manager 的既有约定, 那里同时也用它写
+    # 本账户的 runs 目录): 这里提升为任务级字段, 让 worker 只读一处。
+    resolved_root: Path | str | None = user_root
+    if resolved_root is None and kind == "mining":
+        candidate = encoded.get("user_root")
+        if isinstance(candidate, str) and candidate:
+            resolved_root = candidate
+    if resolved_root is not None:
+        task["user_root"] = str(Path(resolved_root).resolve())
+    return task
+
+
+def worker_user_root(task: Mapping[str, Any]) -> Path:
+    """从任务载荷解析**账户根**。
+
+    兼容: 载荷没带 ``user_root`` 的既有调用方回落到 ``data_dir`` —— 与本次修复前的
+    行为逐字一致 (不是"新引入的静默降级", 只是不让它们从能跑变报错)。
+    """
+    explicit = task.get("user_root")
+    if isinstance(explicit, str) and explicit:
+        return Path(explicit).resolve()
+    return Path(task["data_dir"]).resolve()
+
+
+def build_worker_strategy_engine(data_dir: Path, user_root: Path) -> "StrategyEngine":
+    """构造 worker 子进程的策略引擎。
+
+    策略**源码**目录是共享的 (部署级策略库), 但**覆盖值** ``user_data/strategy_overrides``
+    是账户私有的: ``override_loader`` 在复合策略展开子策略时被调用
+    (``app/strategy/engine.py``), 传错根不会报错 —— 那里是 ``except Exception: pass``
+    —— 只会让子策略的覆盖值静默为空 (算出来的结果与用户在面板上看到的不一致)。
+    """
+    from app.strategy import config as strategy_config
+    from app.strategy.engine import StrategyEngine
+
+    return StrategyEngine(
+        strategy_dirs=_strategy_dirs(data_dir),
+        override_loader=lambda sid: strategy_config.load_override(sid, user_root=user_root),
+    )
 
 
 def _attach_worker_metrics(
@@ -184,11 +243,11 @@ def _worker_entry(task: dict[str, Any], event_queue, cancel_event) -> None:
         from app.backtest.engine import BacktestEngine
         from app.backtest.optimizer import StrategyOptimizer
         from app.backtest.strategy import StrategyBacktestService
-        from app.strategy import config as strategy_config
-        from app.strategy.engine import StrategyEngine
         from app.tickflow.repository import DataStore, KlineRepository
 
         data_dir = Path(task["data_dir"])
+        # 账户根随载荷下发 (make_worker_task); 载荷没带时回落 data_dir, 见 worker_user_root。
+        user_root = worker_user_root(task)
         store = DataStore(data_dir)
         repo = KlineRepository(store)
         # 子进程不继承主进程的因子注册表; 自定义/复合因子 (uf_/cf_) 在任何
@@ -200,11 +259,7 @@ def _worker_entry(task: dict[str, Any], event_queue, cancel_event) -> None:
         from app.factors.store import load_into_registry
 
         load_into_registry()
-        strategy_engine = StrategyEngine(
-            strategy_dirs=_strategy_dirs(data_dir),
-            # worker 子进程没有请求上下文: 仍用共享 data_dir, 需改为按账户扇出。
-            override_loader=lambda sid: strategy_config.load_override(sid, user_root=data_dir),
-        )
+        strategy_engine = build_worker_strategy_engine(data_dir, user_root)
         service = StrategyBacktestService(BacktestEngine(repo), strategy_engine)
 
         def _progress(message: dict) -> None:
@@ -236,6 +291,7 @@ def _worker_entry(task: dict[str, Any], event_queue, cancel_event) -> None:
             result = run_mining_runtime(
                 task["config"],
                 data_dir=data_dir,
+                user_root=user_root,
                 service=service,
                 strategy_engine=strategy_engine,
                 progress_cb=_progress,

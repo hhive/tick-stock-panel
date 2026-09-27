@@ -24,6 +24,14 @@ _DENIED = (401, 403, 429)
 # 一条典型的每用户(安装级)状态路由: 必须始终需要登录
 _PER_USER_PATH = "/api/watchlist"
 
+# 需要登录、但**不需要账户身份**的路由。单密码应急入口没有账号 id, 因此每账户路由
+# (/api/watchlist 等)对它由 handler 侧拒绝 —— A4 修复后统一是 401(与"未登录"同
+# 语义, 见 main.py 的 MissingUserContextError handler), 与"中间件把游客拦下"的响应
+# 完全同形, 再也不能用来区分"中间件放行 / 拦截"。
+# 这条路由既不放给游客(未登录 → 401), handler 又不需要账户上下文(→ 200),
+# 是"中间件是否把该会话认作已登录"的干净探针。
+_LOGIN_ONLY_PATH = "/api/capabilities"
+
 
 @pytest.fixture(autouse=True)
 def _isolated(tmp_path, monkeypatch):
@@ -32,6 +40,13 @@ def _isolated(tmp_path, monkeypatch):
     importlib.reload(account_sessions)
     account_api._register_hits.clear()
     app_main._guest_hits.clear()
+    # auth_service 的「是否已设密码」缓存是模块级全局, **不随 data_dir 变化**:
+    # 只要同进程里更早的测试走过 set_password + login(本套件自己也会, 如
+    # test_auth_status_legacy_session_is_authenticated), 它就会停在 True,
+    # 于是本文件里"全新面板"的断言(test_unclaimed_panel_denies_public_ip_with_403)
+    # 会读到别的测试留下的 True 而拿到 401。这里显式失效, 让每个测试都从自己的
+    # 临时 data_dir 重新判定 —— 否则本文件的通过与否取决于测试收集顺序。
+    auth_service._configured_cache = None  # noqa: SLF001
     yield tmp_path
 
 
@@ -83,11 +98,12 @@ def test_public_read_set_is_frozen():
         "/api/regime/coverage", "/api/regime/history", "/api/regime/latest",
         "/api/regime/mainline", "/api/regime/phases", "/api/regime/states",
         "/api/rps/rotation",
-        "/api/screener/cached-summary", "/api/screener/strategies",
         "/api/sector-rotation",
         "/api/stock-analysis/levels",
     ])
-    assert app_main._PUBLIC_READ_PREFIX == ("/api/screener/cached-result/",)
+    # screener 的 cached-* 系列读的是**本账户**的选股缓存, 已从公开名单移除 ——
+    # 它们对游客只会抛 MissingUserContextError(修复前是 500)。
+    assert app_main._PUBLIC_READ_PREFIX == ()
     assert app_main._PUBLIC_READ_POST == ("/api/kline/instruments/names",)
 
 
@@ -184,23 +200,43 @@ def test_auth_status_legacy_session_is_authenticated(client):
 
 
 def test_legacy_password_session_still_works(client):
-    """既有的单密码路径必须继续可用(应急入口), 且行为不变。"""
+    """既有的单密码路径必须继续可用(应急入口), 且行为不变。
+
+    探针用 _LOGIN_ONLY_PATH 而非 _PER_USER_PATH: 后者是每账户资源, 应急入口没有
+    账号 id, 修复后必然由 handler 侧回 401 —— 那测的是"有没有账户", 不是"中间件
+    认不认这个会话"。
+    """
     auth_service.set_password("legacy-pass-123")
     client.cookies.clear()
 
-    assert client.get(_PER_USER_PATH).status_code == 401  # 未登录仍是 401
+    assert client.get(_LOGIN_ONLY_PATH).status_code == 401  # 未登录仍是 401
 
     r = client.post("/api/auth/login", json={"password": "legacy-pass-123"})
     assert r.status_code == 200
-    assert client.get(_PER_USER_PATH).status_code not in (401, 403)
+    assert client.get(_LOGIN_ONLY_PATH).status_code not in (401, 403)
 
 
 def test_legacy_session_reports_admin_role(client):
     auth_service.set_password("legacy-pass-123")
     client.cookies.clear()
     client.post("/api/auth/login", json={"password": "legacy-pass-123"})
-    # 应急入口等价管理员: 用它访问受保护路由应放行
-    assert client.get(_PER_USER_PATH).status_code not in (401, 403)
+    # 应急入口被中间件认作已登录(不是游客): 需登录的只读路由应放行
+    assert client.get(_LOGIN_ONLY_PATH).status_code not in (401, 403)
+
+
+def test_legacy_session_cannot_use_per_account_routes(client):
+    """应急入口没有账号 id ⇒ 每账户路由必须被拒 (fail-closed), 且是 403 而非 500。
+
+    这条把"每账户路由需要账户身份"钉成契约: 与
+    test_multiuser_job_registry_isolation.py::test_legacy_password_session_has_no_
+    account_and_is_refused (回测侧的 403) **同向同码** —— 该侧走 require_account_id,
+    这里走 MissingUserContextError 的 handler, 两条路径对同一条件必须只有一套答案。
+    不用 401: 应急入口是已认证会话, 401 会让前端跳登录再被 Auth.tsx 弹回。
+    """
+    auth_service.set_password("legacy-pass-123")
+    client.cookies.clear()
+    client.post("/api/auth/login", json={"password": "legacy-pass-123"})
+    assert client.get(_PER_USER_PATH).status_code == 403
 
 
 # ================================================================
@@ -337,6 +373,26 @@ def test_dangerous_endpoints_are_gated_by_real_path(method, path):
     是为了让"新增一个危险端点却忘了加门控"在 diff 里看得见。
     """
     assert app_main._is_admin_only(method, path), f"{method} {path} 未被门控"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/custom-signals",
+        "/api/custom-signals/ai/generate",
+        "/api/factors/custom",
+        "/api/factors/composite",
+    ],
+)
+def test_read_methods_are_not_caught_by_the_admin_list(path):
+    """只读方法不得被 admin 清单挡住。
+
+    `_ADMIN_ONLY_EXACT` 是**方法无关**集合: 把 `/api/custom-signals` 放进去, 连
+    `GET /api/custom-signals`(普通用户要读的信号列表)都会 403 —— 复审实测过这个
+    回归。创作/定义专属只针对**写**方向, 因此这几条只能按方法登记。
+    """
+    assert not app_main._is_admin_only("GET", path), f"GET {path} 被误门控"
+    assert app_main._is_admin_only("POST", path), f"POST {path} 未被门控"
 
 
 def test_gated_paths_exist_in_the_route_table():

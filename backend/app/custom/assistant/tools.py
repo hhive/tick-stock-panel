@@ -565,7 +565,17 @@ def _run_strategy(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     as_of = svc.latest_date()
     if as_of is None:
         raise ValueError("本地暂无行情数据, 无法执行策略。")
-    overrides = load_override(strategy_id, user_root=ctx.data_dir) or {} if ctx.data_dir else {}
+    # ctx.data_dir 是**共享行情根**, 不是账户根。把它当 user_root 传会让
+    # load_override 的 _validate_explicit_root fail-closed 抛 InvalidAccountIdError
+    # —— 于是助手里跑策略要么直接报错、要么(若被上层吞掉)静默丢掉该账户的覆盖值。
+    # 正确来源是认证中间件注入 contextvar 的账户根; 确实没有上下文时退化为"无覆盖值",
+    # 而不是拿共享目录冒充账户根。
+    from app.services.user_paths import MissingUserContextError, resolve_user_root
+
+    try:
+        overrides = load_override(strategy_id, user_root=resolve_user_root()) or {}
+    except MissingUserContextError:
+        overrides = {}
     context = svc.build_strategy_context(
         ctx.engine, as_of, [strategy_id], overrides_map={strategy_id: overrides},
     )

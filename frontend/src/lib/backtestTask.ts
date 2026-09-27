@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from 'react'
+import { registerAccountScopedReset } from './account'
 import type { StrategyBacktestResult } from './api'
 
 /**
@@ -296,3 +297,23 @@ export function tryReconnect(): boolean {
 export function useBacktestTask(): BacktestTask | null {
   return useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot)
 }
+
+/**
+ * 换账号时复位 (登出/登录成功由 lib/account.ts 触发, 不放第二条清理入口)。
+ *
+ * 与上面的 clearBacktest() 分工不同, 别互相顶替: clearBacktest 只是把 current 置 null
+ * 让 UI 收起提示 —— **它既不关 SSE 也不清续连键**; 换账号要断掉对上一账号任务的观察,
+ * 并让下一个账号既不看到它的进度、也不会去重连它。
+ *
+ * 不发 cancel: 上一账号的后端任务该继续跑 (他自己重新登录还能接回来), 这里只断本浏览器
+ * 这条观察通道。current 置 null 之后, 已注册的 SSE 回调全部被 `current?.id !== id` 挡住。
+ */
+export function resetBacktestForAccountSwitch(): void {
+  eventSource?.close()
+  eventSource = null
+  current = null
+  localStorage.removeItem(RECONNECT_KEY)
+  emit()
+}
+
+registerAccountScopedReset(resetBacktestForAccountSwitch)

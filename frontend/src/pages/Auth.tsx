@@ -22,7 +22,9 @@ import { api } from '@/lib/api'
 import { Logo } from '@/components/Logo'
 import { toast } from '@/components/Toast'
 import { cn } from '@/lib/cn'
-import { SUB2API_SITE_URL, getHeldJumpKey, setHeldJumpKey } from '@/lib/account'
+import {
+  SUB2API_SITE_URL, applyAccountIdentity, clearAccountScopedStorage, getHeldJumpKey, setHeldJumpKey,
+} from '@/lib/account'
 
 /** login/register = 邮箱密码; legacy = 旧的单访问密码通道 */
 type AuthMode = 'login' | 'register' | 'legacy'
@@ -59,6 +61,8 @@ export function Auth() {
   useEffect(() => {
     api.authStatus().then(s => {
       setStatus(s)
+      // 打开登录页时先把身份对齐: 带着会话进来时助手抽屉要能读到"自己那份"历史。
+      applyAccountIdentity(s.authenticated ? s.email : null)
       // 已登录(账号会话或单密码会话)直接进面板, 避免登录页死循环。
       // authenticated 由服务端同时判定两个会话表, 前端不必再探 /api/account/me。
       if (s.authenticated) navigate('/', { replace: true })
@@ -68,8 +72,13 @@ export function Auth() {
   const isSetup = !status?.configured  // configured=false → 设密码模式
   const isLegacy = mode === 'legacy'
 
-  /** 登录/注册成功后的收尾: 绑定跳转凭证(若有) → 进入面板 */
-  const enterApp = async () => {
+  /** 登录/注册成功后的收尾: 清上一账号的指针残留 → 切身份 → 绑定跳转凭证 → 进入面板 */
+  const enterApp = async (identity?: string | null) => {
+    // 登录成功也必须清 (不只是登出): 会话过期后换人登录不经过 signOut, 上一账号落盘的
+    // 模拟盘账户等指针会直接留给新登录的人看 (2026-09-27 复核 B3)。
+    clearAccountScopedStorage()
+    // 身份切换: 助手会话这类用户内容按身份命名空间隔离 (旧单密码通道无 email → 哨兵)
+    applyAccountIdentity(identity ?? null)
     const pending = getHeldJumpKey()
     if (pending) {
       try {
@@ -97,7 +106,7 @@ export function Auth() {
       if (mode === 'register') return api.accountRegister(email.trim(), pwd)
       return api.accountLogin(email.trim(), pwd)
     },
-    onSuccess: () => { void enterApp() },
+    onSuccess: () => { void enterApp(email.trim()) },   // 有 email → 用他的命名空间
     onError: (err: unknown) => {
       setLocalError(emailErrorText(err, mode === 'register' ? 'register' : 'login'))
     },
@@ -111,7 +120,7 @@ export function Auth() {
       }
       return api.authLogin(password)
     },
-    onSuccess: () => { void enterApp() },
+    onSuccess: () => { void enterApp(null) },   // 旧单密码通道没有 email → 哨兵命名空间
     onError: (err: any) => {
       const msg = err?.message || (isSetup ? '设置失败' : '登录失败')
       // 设密码/登录失败必须显示: 401(密码错)/403(公网设密码被拒)/429(限流) 都要提示

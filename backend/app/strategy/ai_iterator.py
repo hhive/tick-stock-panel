@@ -2,12 +2,13 @@
 
 只自动化「生成—诊断—修改」, 回测只读、轮次有上限, 最终仍由人拍板
 (docs/strategy-iteration.md 第 0/1 节纪律)。产物落盘到
-``<user_root>/strategies/ai/`` (**每账户一份**), 不自动上线。复用
-ai_generator.AIStrategyGenerator 做生成与校验, 复用 services.tool_catalog 做工具目录 + 回测桥。
+``<data_dir>/strategies/ai/`` (**共享策略库**, 与 ``main.py`` 的引擎加载目录同源),
+不自动上线。复用 ai_generator.AIStrategyGenerator 做生成与校验, 复用
+services.tool_catalog 做工具目录 + 回测桥。
 
-两个根目录刻意分开传, 不得混用:
-  - ``user_root``: 草稿落盘位置 (用户资产, 按账户分家);
-  - ``data_dir``: 共享行情数据根 + 回测 worker 的数据根 (所有人同一份)。
+草稿落盘位置**必须**是引擎的加载目录: 引擎是进程级单例、目录集启动后固定, 写进
+``<data_dir>/users/<id>/strategies/ai/`` 的话 reload 后 ``engine.get(draft_id)``
+会落空 (保存被回滚 → 400)。原「每账户一份」的注释是错的, 已按 D1 收回。
 """
 from __future__ import annotations
 
@@ -20,7 +21,6 @@ from typing import Any
 
 from app.services import tool_catalog
 from app.services.ai_provider import generate_ai_text_with_tools
-from app.services.user_paths import resolve_user_root
 from app.strategy.ai_generator import AIStrategyGenerator, _SYSTEM_PREFIX, find_meta_assignment
 
 # 每轮 (生成/诊断/修改一次) 内部的工具调用预算: 至少 2 次 LLM 调用
@@ -58,7 +58,6 @@ class AIStrategyIterator:
         *,
         engine,
         data_dir: str,
-        user_root: str | Path | None = None,
     ) -> dict[str, Any]:
         """执行有界迭代, 返回:
         {
@@ -80,7 +79,7 @@ class AIStrategyIterator:
 
         draft_id = self._alloc_draft_id(engine)
         code, meta = result["code"], result["meta"]
-        self._save_draft(engine, user_root, draft_id, code, meta)
+        self._save_draft(engine, data_dir, draft_id, code, meta)
         current_code, current_meta = code, {**meta, "id": draft_id}
 
         rounds: list[dict[str, Any]] = []
@@ -117,7 +116,7 @@ class AIStrategyIterator:
                 final_backtested = True  # 收敛, final 仍是 current_code
                 break
 
-            self._save_draft(engine, user_root, draft_id, new_code, new_meta)
+            self._save_draft(engine, data_dir, draft_id, new_code, new_meta)
             current_code, current_meta = new_code, {**new_meta, "id": draft_id}
             rounds.append({
                 "round": round_no,
@@ -159,14 +158,16 @@ class AIStrategyIterator:
                 return draft_id
 
     @staticmethod
-    def _save_draft(engine, user_root: str | Path | None, draft_id: str, code: str, meta: dict) -> None:
+    def _save_draft(engine, data_dir: str | Path, draft_id: str, code: str, meta: dict) -> None:
         """写草稿文件 + 热重载; META.id 强制对齐 draft_id (engine 以 meta["id"] 为键)。
+
+        落盘目录是**共享策略库** ``<data_dir>/strategies/ai`` —— 与 ``main.py`` 传给
+        StrategyEngine 的加载目录同源, 否则 reload 后 engine 找不到这份草稿。
 
         草稿强制 research_only=True (复用 #255 的发布闸): 不进公开列表、不可运行,
         只有人点 publish 才上线, 守住「回测验证与上线由人拍板」的纪律。
         """
-        root = resolve_user_root(Path(user_root) if user_root is not None else None)
-        out_dir = root / "strategies" / "ai"
+        out_dir = Path(data_dir) / "strategies" / "ai"
         out_dir.mkdir(parents=True, exist_ok=True)
         path = out_dir / f"{draft_id}.py"
         meta = {**meta, "research_only": True}

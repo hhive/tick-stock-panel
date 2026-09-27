@@ -10,6 +10,7 @@ import pytest
 
 from app.backtest.candidates import CandidateStore, CandidateValidationError
 from app.backtest.mining import compute_candidate_signature
+from app.services import mining_candidates
 from app.services.mining_candidates import (
     MiningCandidateService,
     _published_strategy_id,
@@ -17,6 +18,26 @@ from app.services.mining_candidates import (
 from app.services.mining_jobs import MiningRunStore
 from app.strategy import config as strategy_config
 from app.strategy.engine import StrategyEngine
+
+
+def _account_root(tmp_path) -> Path:
+    """面板账户私有根 —— 生产形态 ``<data_dir>/users/<账号ID>``。"""
+    return tmp_path / "users" / "1"
+
+
+@pytest.fixture(autouse=True)
+def _shared_strategy_library(tmp_path, monkeypatch):
+    """把**共享策略库根**指到 tmp, 与引擎的加载目录 (``<data_dir>/strategies/*``) 同源。
+
+    ``MiningCandidateService`` 在生产里以 ``settings.data_dir`` 解析共享库; 用例替换
+    的就是这一层"共享库在哪"的接缝, 而**账户根仍然另处** (见 ``_account_root``) ——
+    两边必须分开, 否则"源码写进账户根 ⇒ 引擎扫不到"这个缺陷在测试里同样看不见
+    (复核前此处 user_root 与共享目录恰是同一条 tmp_path, 于是恒绿)。
+    """
+    monkeypatch.setattr(
+        mining_candidates, "shared_strategies_root", lambda: tmp_path / "strategies"
+    )
+    return tmp_path / "strategies"
 
 
 class _StrategyEngine:
@@ -120,7 +141,7 @@ def _create_run(
 
 def _service(tmp_path, store: MiningRunStore) -> MiningCandidateService:
     return MiningCandidateService(
-        tmp_path,
+        _account_root(tmp_path),
         store,
         CandidateStore(tmp_path),
         _StrategyEngine(),
@@ -135,11 +156,12 @@ def _real_service(
     cache_invalidator=None,
     monitor_invalidator=None,
 ) -> tuple[MiningCandidateService, StrategyEngine]:
+    """真引擎 + 真发布落盘。引擎目录集与 ``main.py`` 同源 (共享策略库)。"""
     builtin_dir = Path(__file__).resolve().parents[1] / "app" / "strategy" / "builtin"
     custom_dir = tmp_path / "strategies" / "custom"
     engine = StrategyEngine(strategy_dirs=[builtin_dir, custom_dir])
     service = MiningCandidateService(
-        tmp_path,
+        _account_root(tmp_path),
         store,
         CandidateStore(tmp_path),
         engine,
@@ -147,6 +169,43 @@ def _real_service(
         monitor_state_invalidator=monitor_invalidator,
     )
     return service, engine
+
+
+def test_strategies_root_argument_overrides_shared_strategy_library(tmp_path, monkeypatch) -> None:
+    """``strategies_root=`` 必须真正决定发布落盘位置, 且省略时回落共享库默认值。
+
+    api 层显式传 ``repo.store.data_dir/"strategies"``, 让"写策略"与引擎的"读策略"
+    同源到同一个 store (而不是各自去读 settings.data_dir)。本用例用**与默认值不同的**
+    目录, 因此只要参数被忽略 (仍走 shared_strategies_root) 就会红。
+    """
+    store, _run_id, _signature = _create_run(tmp_path)
+    explicit_root = tmp_path / "explicit" / "strategies"
+    service = MiningCandidateService(
+        _account_root(tmp_path),
+        store,
+        CandidateStore(tmp_path),
+        _StrategyEngine(),
+        strategies_root=explicit_root,
+        strategy_cache_invalidator=lambda _data_dir: None,
+    )
+
+    path = service._custom_strategy_path("mined_factor_probe")
+
+    assert path == explicit_root / "custom" / "mined_factor_probe.py"
+    assert not path.exists()  # 只解析路径 (顺带建 custom 目录), 不落盘文件
+
+    # 省略该参数 → 回落 shared_strategies_root() (autouse fixture 指向 tmp/strategies)
+    default_service = MiningCandidateService(
+        _account_root(tmp_path),
+        store,
+        CandidateStore(tmp_path),
+        _StrategyEngine(),
+        strategy_cache_invalidator=lambda _data_dir: None,
+    )
+    assert (
+        default_service._custom_strategy_path("mined_factor_probe")
+        == mining_candidates.shared_strategies_root() / "custom" / "mined_factor_probe.py"
+    )
 
 
 def test_promote_rereads_artifact_and_repairs_backlink_idempotently(tmp_path) -> None:
@@ -449,13 +508,22 @@ def test_publish_factor_discovers_public_strategy_and_repairs_runtime_state(tmp_
     assert result["strategy_id"] in {
         meta["id"] for meta in engine.list_strategies()
     }
+    # 发布产物落在**共享策略库** (= 引擎的加载目录), 而非账户根 —— 若落账户根,
+    # 引擎 reload 后 get() 落空, 发布必被回滚 (复核前的缺陷形态)。
+    published_path = tmp_path / "strategies" / "custom" / f"{result['strategy_id']}.py"
+    assert strategy.file_path == published_path
+    assert published_path.exists()
+    assert not (_account_root(tmp_path) / "strategies").exists()
     assert strategy_config.load_override(
         "factor_rank_research", user_root=tmp_path
     ) == {"params": {"entry_score": 99.0}}
     assert not (tmp_path / "user_data" / "strategy_overrides" / f"{result['strategy_id']}.json").exists()
     persisted = pl.read_parquet(store.artifact_path(run_id, "candidates")).row(0, named=True)
     assert persisted["published_strategy_id"] == result["strategy_id"]
-    assert invalidations == [tmp_path, "monitor", tmp_path, "monitor"]
+    assert invalidations == [
+        _account_root(tmp_path), "monitor",
+        _account_root(tmp_path), "monitor",
+    ]
 
 
 def test_publish_factor_repairs_backlink_after_source_was_verified(

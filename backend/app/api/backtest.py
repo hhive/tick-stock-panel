@@ -421,7 +421,10 @@ def strategy_run(req: StrategyBacktestRequest, request: Request):
         minute_fill=req.minute_fill,
         regime_filter=req.regime_filter,
     )
-    task = make_worker_task("backtest", settings.data_dir, cfg)
+    # user_root 必须显式带上: worker 子进程没有请求上下文, 缺它会让引擎的
+    # override_loader 拿共享 data_dir 去解析账户根 → fail-closed 抛错 →
+    # composite 的子策略覆盖值静默变空 (engine 那侧是 except Exception: pass)。
+    task = make_worker_task("backtest", settings.data_dir, cfg, user_root=_user_root(request))
     from app.services.heavy_job_limiter import shared_heavy_job_limiter
 
     with shared_heavy_job_limiter.slot("normal"):
@@ -680,6 +683,12 @@ async def strategy_stream(
                 regime_filter=json.loads(regime_filter) if regime_filter else None,
             )
 
+            # 账户根必须在**请求线程**里取好再闭包进去: _run_backtest 跑在原生
+            # threading.Thread 里, 而 threading 不复制 contextvars —— 在线程内调
+            # _user_root(request) 会抛 MissingUserContextError, 被下面的 except
+            # 变成一条 SSE error 帧, 整个流式回测直接不可用。
+            account_root = _user_root(request)
+
             def _run_backtest():
                 from app.services.heavy_job_limiter import (
                     HeavyJobCancelledError,
@@ -691,7 +700,9 @@ async def strategy_stream(
                         "normal",
                         cancel_event=job.cancel_event,
                     ):
-                        task = make_worker_task("backtest", settings.data_dir, cfg)
+                        task = make_worker_task(
+                            "backtest", settings.data_dir, cfg, user_root=account_root,
+                        )
                         result = run_worker_task(
                             task,
                             lambda d: job.progress.append(d),
@@ -985,6 +996,9 @@ async def optimize_stream(
                     backtest_kwargs=bt_kwargs,
                 )
 
+                # 同 strategy_stream: 账户根必须在请求线程里取好 (见该处注释)。
+                account_root = _user_root(request)
+
                 def _run_opt():
                     from app.services.heavy_job_limiter import (
                         HeavyJobCancelledError,
@@ -996,7 +1010,9 @@ async def optimize_stream(
                             "normal",
                             cancel_event=job.cancel_event,
                         ):
-                            task = make_worker_task("optimize", settings.data_dir, ocfg)
+                            task = make_worker_task(
+                                "optimize", settings.data_dir, ocfg, user_root=account_root,
+                            )
                             result = run_worker_task(
                                 task,
                                 lambda d: job.progress.append(d),
@@ -1213,6 +1229,9 @@ async def walkforward_stream(
                     matrix_cache_max_mb=int(matrix_cache_max_mb),
                 )
 
+                # 同 strategy_stream: 账户根必须在请求线程里取好 (见该处注释)。
+                account_root = _user_root(request)
+
                 def _run_wf():
                     from app.services.heavy_job_limiter import (
                         HeavyJobCancelledError,
@@ -1224,7 +1243,9 @@ async def walkforward_stream(
                             "normal",
                             cancel_event=job.cancel_event,
                         ):
-                            task = make_worker_task("walkforward", settings.data_dir, wf_cfg)
+                            task = make_worker_task(
+                                "walkforward", settings.data_dir, wf_cfg, user_root=account_root,
+                            )
                             result = run_worker_task(
                                 task,
                                 lambda d: job.progress.append(d),

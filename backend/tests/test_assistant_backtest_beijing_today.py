@@ -38,10 +38,11 @@ def _patch_clocks(monkeypatch: pytest.MonkeyPatch) -> None:
 def _patch_worker(monkeypatch: pytest.MonkeyPatch, captured: dict[str, Any]) -> None:
     """避开真实回测子进程, 只记录 StrategyBacktestConfig 的 start/end。"""
 
-    def fake_make_worker_task(kind, data_dir, cfg):
+    def fake_make_worker_task(kind, data_dir, cfg, *, user_root=None):
         captured["kind"] = kind
         captured["start"] = cfg.start
         captured["end"] = cfg.end
+        captured["user_root"] = user_root
         return {"kind": kind}
 
     def fake_run_worker_task(task):

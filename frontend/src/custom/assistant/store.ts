@@ -4,8 +4,14 @@
  * 后端无状态, 会话历史仅存 localStorage(最近 20 个会话); 每轮请求把可见的
  * user/assistant 消息回传, 由后端负责截断。工具往返(footprint)只用于本地
  * 展示, 不进入请求历史。
+ *
+ * 存哪: ``assistant.sessions.v1.<身份>`` —— **按身份命名空间**, 身份见 lib/account.ts。
+ * 这是对话唯一的存放处, 所以换账号只切命名空间、绝不删除: A 登出后 B 读到的是 B 自己
+ * 那份(空), A 重新登录原样读回自己那份。(旧的无命名空间键 ``assistant.sessions.v1``
+ * 已不再读写; 它无法归属到任何身份, 迁移给先登录的人就是泄漏, 故刻意留成惰性数据。)
  */
 import { useSyncExternalStore } from 'react'
+import { ANONYMOUS_IDENTITY, onAccountIdentityChange } from '@/lib/account'
 import {
   assistantChatStream,
   type AssistantChart,
@@ -47,10 +53,18 @@ interface AssistantState {
   sending: boolean
 }
 
+/** 键前缀, 实际键名 = `${STORAGE_KEY}.${identity}` (identity 由 lib/account.ts 给) */
 const STORAGE_KEY = 'assistant.sessions.v1'
 const MAX_SESSIONS = 20
 const MAX_SESSION_MESSAGES = 200
 const MAX_INPUT_CHARS = 4000
+
+/** 当前身份命名空间 (身份就位前先按哨兵装载, 见 applyAccountIdentity) */
+let identity: string = ANONYMOUS_IDENTITY
+
+function storageKey(): string {
+  return `${STORAGE_KEY}.${identity}`
+}
 
 let state: AssistantState = {
   sessions: [],
@@ -78,13 +92,14 @@ function persistSessions() {
     const trimmed = state.sessions
       .slice(0, MAX_SESSIONS)
       .map(session => ({ ...session, messages: session.messages.slice(-MAX_SESSION_MESSAGES) }))
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ sessions: trimmed, activeId: state.activeId }))
+    localStorage.setItem(storageKey(), JSON.stringify({ sessions: trimmed, activeId: state.activeId }))
   } catch { /* 存储满/隐私模式时静默降级为内存态 */ }
 }
 
+/** 读取**当前命名空间**的会话并替换内存态 (切命名空间时由 switchAssistantIdentity 先清空内存) */
 function loadSessions() {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY)
+    const raw = localStorage.getItem(storageKey())
     if (!raw) return
     const parsed = JSON.parse(raw) as { sessions?: AssistantSession[]; activeId?: string }
     if (!Array.isArray(parsed.sessions)) return
@@ -315,4 +330,26 @@ export function useAssistantStore(): AssistantState {
   return useSyncExternalStore(subscribe, () => state, () => state)
 }
 
+/**
+ * 切换到某个身份的命名空间 —— 由 lib/account.ts 在身份变化时触发 (登出/登录成功/刷新后
+ * authStatus 就位)。
+ *
+ * 是"换窗口"不是"销毁": 上一个身份的会话留在它自己的键里, 换回来能原样读回。必须重装
+ * 内存态 —— 本 store 是模块级单例, 换身份走客户端路由不重载模块, 内存里的
+ * state.sessions 会把上一个账号的对话直接带进下一个账号。在飞的那轮也要 abort, 否则
+ * 流事件会继续往新身份的会话里写。
+ */
+function switchAssistantIdentity(next: string): void {
+  if (next === identity) return
+  abortController?.abort()
+  abortController = null
+  identity = next
+  state = { sessions: [], activeId: '', open: false, sending: false }
+  loadSessions()
+  emit()
+}
+
+onAccountIdentityChange(switchAssistantIdentity)
+
+// 初值: 身份还没就位 (authStatus 未回) 时先按哨兵装载, 身份就位后由上面的监听切过去
 loadSessions()

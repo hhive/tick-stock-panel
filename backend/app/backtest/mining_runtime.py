@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import time
@@ -60,8 +61,11 @@ from app.factors.registry import factor_columns_view
 from app.services.mining_jobs import MiningRunStore
 from app.services.mining_preflight import enriched_partition_dates
 from app.services.mining_schedule import MINING_ALGORITHM_VERSION
+from app.services.user_paths import InvalidAccountIdError
 from app.strategy import config as strategy_config
 from app.strategy.engine import StrategyEngine
+
+logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[dict[str, Any]], None]
 CancelCheck = Callable[[], bool] | Any
@@ -146,14 +150,16 @@ class MatcherCandidateEvaluator:
         self,
         service: StrategyBacktestService,
         strategy_engine: StrategyEngine,
-        data_dir: Path,
+        user_root: Path,
         request: RuntimeRequest,
         base_market,
         cancel_check: CancelCheck | None,
     ) -> None:
         self.service = service
         self.strategy_engine = strategy_engine
-        self.data_dir = data_dir
+        # 覆盖值 (user_data/strategy_overrides) 是**账户私有**数据: 这里要的是账户根,
+        # 不是共享行情根 data_dir。传错会被 resolve_user_root 拒掉。
+        self.user_root = user_root
         self.request = request
         self.base_market = base_market
         self.cancel_check = cancel_check
@@ -241,6 +247,17 @@ class MatcherCandidateEvaluator:
                     error="backtest did not return a finite sharpe",
                 )
             return CandidateEvaluation(score=score, metrics=metrics)
+        except InvalidAccountIdError:
+            # 账户根传错是**编程错误** (调用方把共享目录当账户根), 不是"这个候选跑不
+            # 出来"。InvalidAccountIdError 是 ValueError 子类, 旧实现让它落进下面的
+            # 兜底 → 每个 existing_strategy 候选静默 score=None 被淘汰: 运行"成功"
+            # 却没有任何策略候选, 谁也不知道是根传错了。这里必须响 (冒泡到运行级失败)。
+            logger.error(
+                "挖掘候选 %r 读取策略覆盖值失败: 账户根 %s 非法 (共享目录不能作为账户根)",
+                definition.get("strategy_id"),
+                self.user_root,
+            )
+            raise
         except (OSError, ValueError, TypeError) as exc:
             return CandidateEvaluation(score=None, error=str(exc))
 
@@ -255,7 +272,7 @@ class MatcherCandidateEvaluator:
         if kind == "existing_strategy":
             strategy_id = str(definition.get("strategy_id") or "")
             strategy = self.strategy_engine.get(strategy_id)
-            overrides = strategy_config.load_override(strategy_id, user_root=self.data_dir)
+            overrides = strategy_config.load_override(strategy_id, user_root=self.user_root)
             params = self.strategy_engine.resolve_params(strategy, overrides=overrides)
         elif kind == "factor_rank":
             strategy_id = "factor_rank_research"
@@ -438,13 +455,23 @@ def run_mining_runtime(
     payload: Mapping[str, Any],
     *,
     data_dir: Path,
+    user_root: Path | str | None = None,
     service: StrategyBacktestService,
     strategy_engine: StrategyEngine,
     progress_cb: ProgressCallback | None = None,
     cancel_check: CancelCheck | None = None,
     rss_sampler: Any | None = None,
 ) -> dict[str, Any]:
-    """Run one persistent mining job and return only a compact IPC summary."""
+    """Run one persistent mining job and return only a compact IPC summary.
+
+    ``data_dir`` 是共享行情根 (面板/因子/撮合矩阵), ``user_root`` 是**发起账户的私有
+    数据根** (运行产物、策略覆盖值)。两者不可混用: 子进程没有请求上下文, 账户根只能
+    由调用方显式传 (worker 从任务载荷取), 用 data_dir 顶替会被 ``resolve_user_root``
+    fail-closed 拒掉。
+
+    兼容: ``user_root`` 省略时回落读载荷里的 ``user_root`` (manager 的既有约定),
+    因此直调方 (内部脚本/测试) 无需改动。
+    """
     started = time.perf_counter()
     emit = progress_cb or (lambda _message: None)
     request = _decode_runtime_request(payload, data_dir, strategy_engine)
@@ -456,13 +483,15 @@ def run_mining_runtime(
     )
     if not isinstance(expected_generation, str) or not expected_generation:
         raise ValueError("mining worker payload is missing its data generation")
-    # 运行产物 (manifest/工件) 是**账户私有**数据: 账户根由父进程随载荷显式传下来
-    # —— 子进程是 spawn 出来的, 没有请求上下文, 用 data_dir (共享行情根) 建 store
-    # 会既写错位置又被 resolve_user_root 拒绝 (fail-closed)。
-    user_root = payload.get("user_root")
-    if not isinstance(user_root, str) or not user_root:
-        raise ValueError("mining worker payload is missing its account root")
-    store = MiningRunStore(Path(user_root))
+    if user_root is not None:
+        account_root = Path(user_root)
+    else:
+        account_root = payload.get("user_root")
+        if not isinstance(account_root, str) or not account_root:
+            raise ValueError("mining worker payload is missing its account root")
+        account_root = Path(account_root)
+    # 运行产物 (manifest/工件) 是**账户私有**数据: 落 account_root, 不是共享 data_dir。
+    store = MiningRunStore(account_root)
     phase_peak_rss_bytes: dict[str, int] = {}
 
     def start_phase() -> None:
@@ -561,8 +590,8 @@ def run_mining_runtime(
             base_market = _prepare_base_market(
                 service,
                 strategy_engine,
-                data_dir,
                 request,
+                user_root=account_root,
                 expected_generation=generation,
                 cancel_check=cancel_check,
             )
@@ -592,7 +621,7 @@ def run_mining_runtime(
     evaluator = MatcherCandidateEvaluator(
         service,
         strategy_engine,
-        data_dir,
+        account_root,
         request,
         base_market,
         cancel_check,
@@ -631,6 +660,7 @@ def run_mining_runtime(
         metric_provider,
         evaluator,
         cancel_check,
+        data_dir=data_dir,
     )
     for done, (name, frame) in enumerate(artifact_frames.items(), start=1):
         _raise_if_cancelled(cancel_check)
@@ -949,9 +979,9 @@ def _decode_runtime_request(
 def _prepare_base_market(
     service: StrategyBacktestService,
     strategy_engine: StrategyEngine,
-    data_dir: Path,
     request: RuntimeRequest,
     *,
+    user_root: Path,
     expected_generation: str | None = None,
     cancel_check: CancelCheck | None = None,
 ):
@@ -975,7 +1005,9 @@ def _prepare_base_market(
         ))
     for strategy_id in request.strategy_ids:
         strategy = strategy_engine.get(strategy_id)
-        overrides = strategy_config.load_override(strategy_id, user_root=data_dir)
+        # 覆盖值是账户私有数据: 用账户根读, **不是**共享行情根 (见 run_mining_runtime
+        # 的 docstring)。这里没有兜底 except: 根传错就该让整轮运行响亮地失败。
+        overrides = strategy_config.load_override(strategy_id, user_root=user_root)
         params = strategy_engine.resolve_params(strategy, overrides=overrides)
         plans.append(resolver.resolve(
             strategy,
@@ -1020,7 +1052,17 @@ def _build_artifacts(
     metric_provider: TrainingMetricProvider,
     evaluator: MatcherCandidateEvaluator,
     cancel_check: CancelCheck | None,
+    *,
+    data_dir: Path,
 ) -> dict[str, pl.DataFrame]:
+    """注意 ``data_dir`` 是**共享行情根**, 不是账户根。
+
+    它只用于 ``_regime_date_count`` 去读全市场环境数据 (见 ``_build_regime_mask``);
+    账户根 (``evaluator.user_root``) 是另一回事, 两者不能互换。此处曾误用
+    ``evaluator.data_dir`` —— 该属性已随"账户根"改名而消失, 而所有 worker 测试都
+    写死 ``require_regime: False``, 于是这一行在 2907 条测试里不可达、正常出结果的
+    挖掘运行却必然 AttributeError。故改为**显式参数**, 由调用方传入。
+    """
     nested = generate_nested_folds(_date_labels(panel), request.mining_request.validation)
     last_train = _panel_for_dates(panel, nested[-1].outer.train_labels)
     if "_target_date" in last_train.columns:
@@ -1147,7 +1189,7 @@ def _build_artifacts(
                 panel,
                 nested_fold.outer,
                 state,
-                evaluator.data_dir,
+                data_dir,
             )
             fold_rows.append(_fold_row(
                 fold.outer_index,

@@ -1489,12 +1489,18 @@ def test_release_of_extracts_from_presigned_url():
 
 
 def test_test_dataset_daily_preview(monkeypatch):
-    bars = {"000001.SZ": [_bar(date(2026, 8, 27), 11.05), _bar(date(2026, 8, 28), 11.65)]}
+    # 日期必须**相对今天**: provider 的 daily 预览窗口是 [now-30d, now]
+    # (app/plugins/fuyao/provider.py:1143)。硬编码绝对日期会随日历漂出窗口,
+    # 让这条测试在一段时间后**永久变红** —— 这不是假设: 原用例写死
+    # 2026-08-27 / 08-28, 到 2026-09-27 时前者已是 31 天前, 断言 2 行只剩 1 行。
+    today = datetime.now().date()
+    d_old, d_new = today - timedelta(days=2), today - timedelta(days=1)
+    bars = {"000001.SZ": [_bar(d_old, 11.05), _bar(d_new, 11.65)]}
     provider = _hist_provider(monkeypatch, _FakeHistClient(bars))
     out = provider.test_dataset("daily", ["000001.SZ"])
     assert out["provider"] == "fuyao" and out["dataset"] == "daily"
     assert out["rows"] == 2
-    assert out["preview"][0]["date"] == "2026-08-27"  # date → ISO 字符串
+    assert out["preview"][0]["date"] == d_old.isoformat()  # date → ISO 字符串
 
 
 def test_test_dataset_adj_factor_preview(monkeypatch):

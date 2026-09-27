@@ -40,17 +40,54 @@ def _write_parquet_placeholder(path: Path) -> None:
     path.write_bytes(b"parquet-placeholder")
 
 
-def _stub_clear_side_effects(monkeypatch: pytest.MonkeyPatch) -> None:
+def _stub_clear_side_effects(
+    monkeypatch: pytest.MonkeyPatch, *, stub_alerts: bool = True,
+) -> None:
     from app.api import overview
     from app.services import alert_store
     from app.services.pipeline_jobs import job_store
     from app.services.screener import ScreenerService
 
     monkeypatch.setattr(job_store, "clear", lambda: None)
-    monkeypatch.setattr(alert_store, "clear", lambda *a, **k: None)
+    if stub_alerts:
+        monkeypatch.setattr(alert_store, "clear", lambda *a, **k: None)
     monkeypatch.setattr(ScreenerService, "clear_history_cache", lambda: None)
     monkeypatch.setattr(overview, "invalidate_overview_cache", lambda: None)
     monkeypatch.setattr(data_api, "invalidate_data_cache", lambda _table=None: None)
+
+
+def test_clear_data_clears_alerts_for_every_account(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """「清空全站数据」必须清掉**每个账户**的触发记录, 且不依赖调用者的账户上下文。
+
+    原实现是 `alert_store.clear()` 无参 —— 靠 contextvar 取账户根, 两个后果:
+      ① 只清调用者那一份, 别人的触发记录留着, 与"清空全站数据"的语义不符;
+      ② **没有账号身份**的会话(单密码应急入口)会抛 MissingUserContextError,
+         端点直接变成 4xx —— 与"应急入口等价 admin"的契约冲突(该契约由
+         test_auth_tiers.py::test_legacy_password_session_counts_as_admin 守着)。
+    """
+    from app import config as app_config
+    from app.services import accounts, user_paths
+
+    monkeypatch.setattr(app_config.settings, "data_dir", tmp_path)
+    accounts.reset_state_for_tests()
+    accounts.create_account("alerts-a@example.com", "Passw0rd!1")
+    accounts.create_account("alerts-b@example.com", "Passw0rd!2")
+
+    roots = [user_paths.user_root(1), user_paths.user_root(2)]
+    for index, root in enumerate(roots, start=1):
+        p = root / "user_data" / "alerts.jsonl"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"ts": index, "message": "boom"}) + "\n", encoding="utf-8")
+
+    _stub_clear_side_effects(monkeypatch, stub_alerts=False)
+    data_api.clear_data(_request(_RepoStub(tmp_path)))
+
+    for root in roots:
+        p = root / "user_data" / "alerts.jsonl"
+        assert p.read_text(encoding="utf-8") == "", f"{p} 未被清空"
 
 
 def test_clear_data_bumps_enriched_generations_and_invalidates_panel_cache(

@@ -59,6 +59,22 @@ _ARTIFACT_SCHEMA = {
 _LOCK = threading.RLock()
 
 
+def shared_strategies_root() -> Path:
+    """**共享策略库**根 ``<data_dir>/strategies`` —— 与 ``main.py`` 的引擎目录集同源。
+
+    发布产物必须落在这里: StrategyEngine 是进程级单例、目录集启动后固定
+    (``main.py`` 的 ``strategy_dirs`` = ``store.data_dir/strategies/{custom,ai,composite}``),
+    写进账户根的话 reload 后 ``get()`` 落空, 发布会被回滚。
+
+    这是**默认值**: 请求路径上 api 层宜显式传 ``repo.store.data_dir/"strategies"``
+    (见 ``MiningCandidateService`` 的 ``strategies_root``), 让"写"与引擎的"读"同源到
+    同一个 store。单独抽成模块级函数是为了给测试一个替换"共享库在哪"的接缝。
+    """
+    from app.config import settings
+
+    return Path(settings.data_dir) / "strategies"
+
+
 class MiningCandidateService:
     def __init__(
         self,
@@ -67,14 +83,26 @@ class MiningCandidateService:
         candidate_store: CandidateStore,
         strategy_engine: StrategyEngine,
         *,
+        strategies_root: Path | str | None = None,
         strategy_cache_invalidator: Callable[[Path], None] | None = None,
         monitor_state_invalidator: Callable[[], None] | None = None,
     ) -> None:
-        # user_root 是该账户私有数据根 (策略源码目录 / 策略缓存 / 候选池) —— 本类
-        # 不需要共享行情根: 运行产物与工件一律经 run_store 读取 (它自己绑定账户)。
-        # 传 None 时按请求上下文解析 (fail-closed: 解析不到就报错, 不回退共享目录)。
+        # user_root 是该账户私有数据根 (策略缓存 / 候选池) —— 本类不需要共享行情根:
+        # 运行产物与工件一律经 run_store 读取 (它自己绑定账户)。
+        # **策略源码不在其中**: 发布产物落共享策略库 (见 strategies_root),
+        # 因为引擎目录集启动后固定。传 None 时按请求上下文解析
+        # (fail-closed: 解析不到就报错, 不回退共享目录)。
         explicit = Path(user_root) if user_root is not None else None
         self.user_root = resolve_user_root(explicit).resolve()
+        # strategies_root 是**共享策略库根** ``<data_dir>/strategies`` —— 它的
+        # ``custom/`` 子目录才是发布产物的落盘位置 (即 <data_dir>/strategies/custom),
+        # 别把 data_dir 或 .../strategies/custom 传进来。
+        # None → 回落 shared_strategies_root() (settings.data_dir); 请求路径上应由
+        # api 层显式传 repo.store.data_dir/"strategies", 使"写"与引擎的"读"同源到
+        # 同一个 store, 而不是各自去读 settings。
+        self.strategies_root = (
+            Path(strategies_root) if strategies_root is not None else shared_strategies_root()
+        )
         self.run_store = run_store
         self.candidate_store = candidate_store
         self.strategy_engine = strategy_engine
@@ -543,13 +571,14 @@ class MiningCandidateService:
             raise ValueError("candidate publication backlink is inconsistent")
 
     def _custom_strategy_path(self, strategy_id: str) -> Path:
-        unresolved_root = self.user_root / "strategies" / "custom"
+        library_root = self.strategies_root
+        unresolved_root = library_root / "custom"
         unresolved_root.mkdir(parents=True, exist_ok=True)
         if unresolved_root.is_symlink():
             raise ValueError("custom strategy directory must not be a symlink")
         root = unresolved_root.resolve()
-        if not root.is_relative_to(self.user_root):
-            raise ValueError("custom strategy directory escapes user_root")
+        if not root.is_relative_to(library_root.resolve()):
+            raise ValueError("custom strategy directory escapes the shared strategy library")
         path = (root / f"{strategy_id}.py").resolve(strict=False)
         if path.parent != root:
             raise ValueError("strategy publication path escapes custom directory")

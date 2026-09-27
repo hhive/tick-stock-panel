@@ -13,18 +13,33 @@ from app.strategy.engine import StrategyEngine
 
 
 @pytest.fixture
-def user_root(tmp_path, monkeypatch):
-    """账户私有根目录 —— 生产形态 ``<data_dir>/users/<账号ID>``。
+def data_dir(tmp_path, monkeypatch):
+    """**共享**数据根 (settings.data_dir) —— 策略源码库 ``<data_dir>/strategies/*`` 在其下。
 
-    ``tmp_path`` 是共享数据目录 (settings.data_dir); 策略源码
-    (``<user_root>/strategies/{custom,ai,composite}``)、覆盖配置和策略缓存都落在
-    账户根之下 —— data_dir 自身是共享位置, 不能当账户根。
+    这里同时充当请求替身里 ``repo.store.data_dir`` 的值 (见 ``_request``), 也就是
+    ``main.py`` 给策略引擎的那两个加载目录的来源。
     """
     from app import config as app_config
-    from app.services import user_paths
 
     monkeypatch.setattr(app_config.settings, "data_dir", tmp_path)
+    return tmp_path
+
+
+@pytest.fixture
+def user_root(data_dir):
+    """账户私有根目录 —— 生产形态 ``<data_dir>/users/<账号ID>``。
+
+    覆盖配置、策略缓存、监控规则等仍按账户分家; **策略源码不在此列** (D1: 回到共享
+    策略库, 因为引擎是进程级单例、目录集启动即固定, 创作端点又全部 admin-only)。
+    """
+    from app.services import user_paths
+
     return user_paths.user_root(1)
+
+
+def _custom_dir(data_dir: Path) -> Path:
+    """引擎的加载目录 (= 策略源码落盘目录) —— 与 ``main.py`` 的接线同源。"""
+    return data_dir / "strategies" / "custom"
 
 
 @pytest.fixture(autouse=True)
@@ -78,8 +93,8 @@ def _request(data_dir: Path, engine: StrategyEngine, monitor: _MonitorEngine | N
     )
 
 
-def test_delete_strategy_is_not_blocked_by_another_broken_file(monkeypatch, tmp_path, user_root):
-    custom_dir = user_root / "strategies" / "custom"
+def test_delete_strategy_is_not_blocked_by_another_broken_file(monkeypatch, data_dir, user_root):
+    custom_dir = _custom_dir(data_dir)
     custom_dir.mkdir(parents=True)
     strategy_path = custom_dir / "target.py"
     strategy_path.write_text(_strategy_code("target"), encoding="utf-8")
@@ -117,7 +132,7 @@ def test_delete_strategy_is_not_blocked_by_another_broken_file(monkeypatch, tmp_
     )
     monitor = _MonitorEngine()
 
-    result = delete_strategy("target", _request(tmp_path, engine, monitor))
+    result = delete_strategy("target", _request(data_dir, engine, monitor))
 
     assert result == {"ok": True, "warnings": []}
     assert not strategy_path.exists()
@@ -132,13 +147,13 @@ def test_delete_strategy_is_not_blocked_by_another_broken_file(monkeypatch, tmp_
     assert monitor.rules and monitor.rules[0]["enabled"] is False
 
 
-def test_delete_strategy_reports_read_only_volume_without_unregistering(monkeypatch, tmp_path, user_root):
-    custom_dir = user_root / "strategies" / "custom"
+def test_delete_strategy_reports_read_only_volume_without_unregistering(monkeypatch, data_dir, user_root):
+    custom_dir = _custom_dir(data_dir)
     custom_dir.mkdir(parents=True)
     strategy_path = custom_dir / "target.py"
     strategy_path.write_text(_strategy_code("target"), encoding="utf-8")
     engine = StrategyEngine(strategy_dirs=[custom_dir])
-    request = _request(tmp_path, engine)
+    request = _request(data_dir, engine)
 
     original_unlink = Path.unlink
 
@@ -157,3 +172,35 @@ def test_delete_strategy_reports_read_only_volume_without_unregistering(monkeypa
     assert "只读挂载" in exc_info.value.detail
     assert strategy_path.exists()
     assert engine.has("target")
+
+
+def test_delete_strategy_allows_source_in_shared_strategy_library(data_dir, user_root):
+    """回归: 源码在共享策略库 (引擎的加载目录) 时必须可删。
+
+    复核前 ``allowed_dir`` 取自账户根 ``<user_root>/strategies/{source}``, 而
+    ``file_path`` 在共享库 —— ``is_relative_to`` 恒假, 删除恒 400。
+    """
+    custom_dir = _custom_dir(data_dir)
+    custom_dir.mkdir(parents=True)
+    strategy_path = custom_dir / "target.py"
+    strategy_path.write_text(_strategy_code("target"), encoding="utf-8")
+    engine = StrategyEngine(strategy_dirs=[custom_dir])
+
+    assert delete_strategy("target", _request(data_dir, engine)) == {"ok": True, "warnings": []}
+    assert not strategy_path.exists()
+    assert not engine.has("target")
+
+
+def test_delete_strategy_refuses_source_outside_shared_strategy_library(data_dir, user_root):
+    """共享库之外的源文件仍拒绝删除 —— 路径校验没有被削弱成"一律放行"。"""
+    rogue_dir = data_dir / "rogue" / "custom"
+    rogue_dir.mkdir(parents=True)
+    strategy_path = rogue_dir / "target.py"
+    strategy_path.write_text(_strategy_code("target"), encoding="utf-8")
+    engine = StrategyEngine(strategy_dirs=[rogue_dir])
+
+    with pytest.raises(HTTPException) as exc_info:
+        delete_strategy("target", _request(data_dir, engine))
+
+    assert exc_info.value.status_code == 400
+    assert strategy_path.exists()

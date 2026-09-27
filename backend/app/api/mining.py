@@ -49,6 +49,45 @@ _MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
 _SSE_POLL_SECONDS = 0.5
 _SSE_HEARTBEAT_SECONDS = 15.0
 
+# ---------------------------------------------------------------------------
+# 对客错误文案
+# ---------------------------------------------------------------------------
+# 运行的失败原文由 worker 子进程写入 manifest (manager._finish_failed), 里面可能带
+# 内部路径 (data_dir、users/<id>)、异常类名 (InvalidAccountIdError) 或 traceback 片段
+# —— 这些都是内部结构, 不进 API 响应 (与 app/backtest/worker.py::_error_message 同口径)。
+#
+# 用**白名单**而不是黑名单: ``public_error_message`` 的返回值只可能是我方文案或下面
+# 这一句兜底, 因此"将来多出一种泄漏形态"不会漏网 —— 黑名单 (过滤 "/"、"…Error")
+# 永远追不上新形态。原始 error 仍留在 manifest 里 (磁盘/日志/审计可见), 只是不外发。
+MINING_ERROR_FALLBACK = "挖掘运行失败, 请稍后重试"
+
+PUBLIC_ERROR_MESSAGES: tuple[str, ...] = (
+    # app/backtest/worker.py::_error_message —— enriched 发布中的"稍后再试"
+    "指标数据正在发布更新，请稍后重试",
+    # app/backtest/mining_runtime.py —— 快照世代反复变化
+    "行情数据正在更新: 挖掘读取期间 enriched 数据世代反复变化, 重试后仍拿不到稳定快照; "
+    "请等数据更新完成后再开始挖掘",
+)
+
+
+def public_error_message(raw: Any) -> str | None:
+    """把内部错误原文收敛成对客文案 (None/空 → None)。
+
+    命中白名单时返回**那一句指引本身**: 原文常常是 ``f"{message}\\n{traceback}"``
+    (见 ``worker.run_worker_task``), 整段透出同样会带出内部路径, 所以截到文案为止,
+    不返回原文的任何多余片段。
+    """
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    for message in PUBLIC_ERROR_MESSAGES:
+        if text.startswith(message):
+            return message
+    return MINING_ERROR_FALLBACK
+
+
 
 class MiningStartRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
@@ -438,6 +477,10 @@ def stream_events(
                 if event_type in TERMINAL_RUN_STATUSES:
                     payload.setdefault("status", event_type)
                     terminal_sent = True
+                if event.get("type") == "error" and "message" in payload:
+                    # 事件里的 message 与 manifest["error"] 同源 (manager._finish_failed),
+                    # 同样不外发内部路径/异常类名 —— 走同一套白名单脱敏。
+                    payload["message"] = public_error_message(payload.get("message"))
                 yield {
                     "id": str(cursor),
                     "event": event_type,
@@ -455,7 +498,10 @@ def stream_events(
                         "id": str(cursor),
                         "event": event_type,
                         "data": json.dumps(
-                            {"status": status, "message": manifest.get("error")},
+                            {
+                                "status": status,
+                                "message": public_error_message(manifest.get("error")),
+                            },
                             ensure_ascii=False,
                         ),
                     }
@@ -552,6 +598,12 @@ def _candidate_service(request: Request):
     按账户根缓存 (而不是单个进程级实例): 服务内部绑定该账户的候选池与策略目录,
     跨账户复用 = B 能看到/发布到 A 的候选与策略。缓存键就是用户根路径, 账户之间
     天然分开。
+
+    共享策略库根 (发布产物的落盘位置) 显式取 ``repo.store.data_dir/"strategies"``:
+    引擎是进程级单例、目录集由 ``main.py`` 用同一个 ``store.data_dir`` 构建 ——
+    "写"与"读"必须同源。让服务自己去 ``settings.data_dir`` 解析在生产上只是**恰好**
+    相等 (``DataStore()`` 默认取 settings), 一旦 settings 被覆盖就会漂移, 且失败点很远
+    (发布成功、引擎 reload 后策略消失)。
     """
     from app.backtest.candidates import CandidateStore
     from app.services.mining_candidates import MiningCandidateService
@@ -574,6 +626,7 @@ def _candidate_service(request: Request):
         manager.store_for(user_root),
         CandidateStore(user_root),
         request.app.state.strategy_engine,
+        strategies_root=Path(request.app.state.repo.store.data_dir) / "strategies",
         monitor_state_invalidator=(
             monitor_engine.invalidate_strategy_state
             if monitor_engine is not None
@@ -627,7 +680,8 @@ def _project_run(store: MiningRunStore, manifest: Mapping[str, Any]) -> dict[str
             if isinstance(summary.get("progress"), Mapping)
             else None
         ),
-        "error": manifest.get("error"),
+        # 对客文案: 内部原文 (路径/异常类名) 不外发, 见 public_error_message。
+        "error": public_error_message(manifest.get("error")),
         "summary": compact,
     }
 

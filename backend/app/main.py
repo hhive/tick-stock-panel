@@ -91,6 +91,35 @@ if not getattr(sys, "frozen", False):
         logger.warning("文件日志初始化失败, 仅输出到终端: %s", _e)
 
 
+def _strategy_override_loader():
+    """复合/叠加策略给**子策略**加载覆盖值的加载器 (进程内唯一一份)。
+
+    覆盖值存在每账户目录 (``<user_root>/user_data/strategy_overrides/<sid>.json``),
+    所以加载器**不能**绑定某个固定目录 —— 它必须按调用时的账户上下文解析:
+
+      - 请求路径: 认证中间件已注入该账户的 user_root, 这里**不传** user_root=
+        就会自动取到当前账户的根, 子策略用的是"我的参数";
+      - 后台线程/调度器: 没有上下文 ⇒ resolve_user_root 抛 MissingUserContextError,
+        被引擎的 ``except Exception: pass`` 吞掉, 子策略退回默认参数
+        (与改动前**同样是空**, 不构成退化)。
+
+    **历史坑, 不要改回去**: 这里原先是
+    ``override_loader=lambda sid: load_override(sid, user_root=store.data_dir)``。
+    ``store.data_dir`` 是**共享行情根**, resolve_user_root 对它会 fail-closed 抛
+    ``InvalidAccountIdError`` ⇒ **任何**调用都拿不到覆盖值, 复合/叠加策略的子策略
+    恒用默认参数出数; 而引擎那个 ``except Exception: pass`` 让它全程静默, 页面上
+    没有任何提示 (worker 子进程侧同症状的那份已另行修掉)。
+
+    之所以做成工厂而不是内联 lambda: 起 lifespan 才能拿到 app.state.strategy_engine,
+    而本仓的测试一律**不启动 lifespan**(会拉起调度器/行情轮询)。留一个模块级接缝,
+    测试才能拿**真正被引擎使用**的那个加载器去验，而不是自造一个替身 ——
+    自造替身的测试在"接缝没接上"时照样全绿。
+    """
+    from app.strategy import config as strategy_config
+
+    return lambda sid: strategy_config.load_override(sid)
+
+
 @asynccontextmanager
 async def _application_lifespan(app: FastAPI):
     logger.info(
@@ -263,6 +292,8 @@ async def _application_lifespan(app: FastAPI):
 
     _screener_svc = ScreenerService(repo)
     _etf_screener_svc = ScreenerService(repo, asset_type="etf")
+    # 策略**源码**是共享策略库 (D1 决策, 见 api/strategy.py): 创作端点全部 admin-only,
+    # 引擎也是进程级单例、目录集启动后固定, 因此这里指向共享目录是正确形态, 不是待办。
     strategy_dirs = [
         Path(__file__).resolve().parent / "strategy" / "builtin",
         store.data_dir / "strategies" / "custom",
@@ -271,8 +302,8 @@ async def _application_lifespan(app: FastAPI):
     ]
     strategy_engine = StrategyEngine(
         strategy_dirs=strategy_dirs,
-        # TODO(multiuser): 引擎启动加载仍用共享 data_dir, 需改为按账户扇出 (S3)。
-        override_loader=lambda sid: strategy_config.load_override(sid, user_root=store.data_dir),
+        # 子策略**覆盖值**是每账户的, 按账户上下文解析 (见工厂的 docstring)。
+        override_loader=_strategy_override_loader(),
     )
     app.state.strategy_engine = strategy_engine
     logger.info("strategy engine loaded: %d strategies", len(strategy_engine.list_strategies()))
@@ -484,9 +515,10 @@ _PUBLIC_READ_EXACT = (
     "/api/sector-rotation",
     "/api/rps/rotation",
     "/api/abnormal/intraday", "/api/abnormal/overview",
-    "/api/screener/cached-summary", "/api/screener/strategies",
 )
-_PUBLIC_READ_PREFIX = ("/api/screener/cached-result/",)
+# 曾经的 /api/screener/cached-result/ 前缀已移除: 它读的是**本账户**的选股缓存,
+# 放在公开只读里是分类错误 (游客只会拿到 500)。当前无任何前缀公开项。
+_PUBLIC_READ_PREFIX = ()
 # 唯一的公开 POST: 纯粹的 code→name 批量查询, 无副作用、不打上游。
 _PUBLIC_READ_POST = ("/api/kline/instruments/names",)
 
@@ -494,7 +526,7 @@ _PUBLIC_READ_POST = ("/api/kline/instruments/names",)
 # 反复击穿 → 单独给更紧的额度。全站原本零限流, 这是游客分层引入的新放大面。
 _PUBLIC_READ_EXPENSIVE = (
     "/api/overview/market", "/api/sector-rotation", "/api/rps/rotation",
-    "/api/screener/cached-summary", "/api/abnormal/intraday",
+    "/api/abnormal/intraday",
     "/api/abnormal/overview", "/api/stock-analysis/levels",
 )
 
@@ -511,16 +543,16 @@ _ADMIN_ONLY_EXACT = frozenset({
     "/api/strategies/code/save",
     "/api/strategies/composite/save",
     "/api/strategies/reload",
-    # 自定义信号的定义端点。信号是**部署级**的(产出共享 enriched 表的 csg_* 列),
-    # 且用户提交的是表达式 —— 与策略创作面同类, 故创作侧仅管理员可用。
-    # 只读端点(/options、列表)不门控; /intraday/replay 是回放分析, 不改定义。
-    "/api/custom-signals",
-    "/api/custom-signals/ai/generate",
-    # 自定义/复合因子的**定义**端点。因子同样是部署级(产出共享 enriched 帧的列),
-    # 与信号/策略创作面同类。只读端点(GET 列表、/validate、/trial)不门控 ——
-    # 它们不落定义。
-    "/api/factors/custom",
-    "/api/factors/composite",
+    # 破坏**原始**数据的端点。判据见 _is_admin_only 的 docstring:
+    # "删/覆盖**原始**数据且本地无法重建"。
+    #   - clear_minute: 实现是 shutil.rmtree(<data_dir>/kline_minute) —— 删掉的
+    #     分钟 K 必须回上游重下, 本地无从恢复;
+    #   - minute-migrate: 把分钟数据整体重写一遍(格式/分区迁移), 同属覆盖原始数据。
+    # 注意**不要**顺手把"能从本地源数据重算"的端点加进来 (rebuild_enriched /
+    # repair_daily / refresh_views / regime/recompute / pipeline/run / sync* 等):
+    # 它们可本地恢复, 且大多有用户可见入口, 门控它们会直接打断普通用户的功能。
+    "/api/kline/clear_minute",
+    "/api/kline/minute-migrate",
     # 写**部署级**凭据的设置端点。这些键喂的是共享行情, 全站一份 —— 普通用户改了
     # 就是改了所有人的取数路径:
     #   - /switch_endpoint 写 tickflow_base_url(站点行情**端点**);
@@ -535,10 +567,27 @@ _ADMIN_ONLY_EXACT = frozenset({
 #   - `^/api/strategies/[^/]+$` 若对 POST 也生效, 会连 `POST /api/strategies/run`
 #     一起挡掉 —— 那是普通用户的核心功能(用内置策略跑自己的参数), 不能门控。
 #   - DELETE 下它匹配的才是 `DELETE /api/strategies/{id}`(删除策略本体)。
+#
+# 同理, **只读列表不得放进 _ADMIN_ONLY_EXACT**: 那个集合不区分方法, 把
+# `/api/custom-signals` 放进去会连 `GET /api/custom-signals`(普通用户要读的信号
+# 列表)一起挡掉 —— 复审实测 403。"定义/创作专属"只针对**写**方向, 因此这几条
+# 一律按方法落在下面的正则里。
 _ADMIN_ONLY_RE_POST = (
     re.compile(r"^/api/strategies/[^/]+/publish$"),
+    # 自定义信号的定义端点。信号是**部署级**的(产出共享 enriched 表的 csg_* 列),
+    # 且用户提交的是表达式 —— 与策略创作面同类, 故创作侧仅管理员可用。
+    # 只读端点(/options、GET 列表)不门控; /intraday/replay 是回放分析, 不改定义。
+    re.compile(r"^/api/custom-signals$"),
+    re.compile(r"^/api/custom-signals/ai/generate$"),
+    # 自定义/复合因子的**定义**端点。因子同样是部署级(产出共享 enriched 帧的列),
+    # 与信号/策略创作面同类。只读端点(GET 列表、/validate、/trial)不门控 ——
+    # 它们不落定义。
+    re.compile(r"^/api/factors/custom$"),
+    re.compile(r"^/api/factors/composite$"),
     # 因子定义的新增/更新/状态/分组: /api/factors/custom/{id}/update 等
     re.compile(r"^/api/factors/custom/"),
+    # 数据源插件的安装/卸载 (写部署级依赖, 装的是全站共用的那份)。
+    re.compile(r"^/api/settings/plugins/[^/]+/install$"),
     # 扩展表的**写**端点 (建定义; 往共享 parquet 写数据)。定义/数据/凭据三样都只有
     # 一份且喂所有人的共享计算, 理由见 _is_admin_only。只读端点(列表/行/维度)不门控。
     # 注意: 不能用 _ADMIN_ONLY_EXACT —— 那个集合**不区分方法**, 会把 GET /api/ext-data
@@ -568,6 +617,8 @@ _ADMIN_ONLY_RE_DELETE = (
     re.compile(r"^/api/settings/data-sources/[^/]+$"),
     # DELETE /api/settings/plugin-key/{name} —— 清除数据源插件的**部署级** Key
     re.compile(r"^/api/settings/plugin-key/[^/]+$"),
+    # 卸载数据源插件 (与安装同一资源的写面)
+    re.compile(r"^/api/settings/plugins/[^/]+/install$"),
 )
 
 # 游客限流额度(按 IP, 滑动窗口 60s)。普通只读 / 重算类分开计量。
@@ -648,6 +699,34 @@ def _is_admin_only(method: str, path: str) -> bool:
         custom-signals 的分法一致(读开放, 写专属)。
       - `POST|DELETE /api/settings/data-sources`: 自定义数据源只有一份 yaml, 且它是
         **全站共享行情**的取数入口 —— 能改它就能把全站的取数与鉴权重定向到任意 URL。
+      - `/api/kline/clear_minute`、`/api/kline/minute-migrate`: 删/重写的是**原始**
+        分钟 K 数据, 本地无法重建(clear_minute 的实现就是 rmtree)。
+      - `/api/settings/plugins/{name}/install`: 装/卸的是**部署级**数据源插件依赖
+        (改的是进程的 pip/npm 环境)。
+
+    **判据的分界线**(2026-09-27 复核裁定, 请勿凭直觉扩大清单):
+
+        判据**不是**"有没有全站副作用", 而是
+        「**删/覆盖原始数据且本地无法重建**」或「**改部署配置/环境**」。
+
+    由此**刻意保持开放**的那批 —— 它们能从本地源数据重算回来, 且大多有普通用户
+    可见的入口 (点一下就 403 就是功能性回归):
+      - `POST /api/pipeline/run`: 管道本身是部署级单飞资源, 但"触发"与"破坏"是两件事。
+        既有契约(``pipeline_jobs.may_cancel`` 与 test_multiuser_pipeline_job_ownership.py)
+        明写: **任何已登录账户都能触发**, 跨账户防的是**谁能取消**(发起者或管理员)。
+      - `POST /api/data/refresh-cache`: 只是重载进程级 Polars 缓存, 不删任何数据;
+        Dashboard「手动刷新」按钮打的就是它。
+      - `rebuild_enriched` / `repair_daily` / `refresh_views`: 从**本地**日K重算
+        共享 enriched/视图 (EnrichedRebuildPanel / RepairDailyPanel 是用户可见入口)。
+      - `regime/{,mainline/}recompute`、`rps/rotation-analyze`: 同样是本地重算。
+      - `POST /api/kline/sync*`、`/api/index/sync_*`、`/api/financials/sync/*`:
+        同步 = 从上游**取数**(上游是权威源, 重跑一次就回来), 不是删除; 且
+        StockMultiDayIntradayChart「同步分时」、Indices 页「同步」都是可见入口。
+
+    **只读不等于写面**: 上面"写专属"的条目一律**按方法**登记, 不得放进
+    `_ADMIN_ONLY_EXACT`(那个集合不区分方法)。`GET /api/custom-signals` 是普通
+    用户要读的信号列表, 被误放进 EXACT 后**恒 403**(复审实测); 因子侧同理 ——
+    注意 `/api/factors/custom` 只有 POST 路由, 读的列表是 `GET /api/factors`。
 
     刻意**不**设为 admin 的: `POST /run`、`/run-all`、`PATCH|DELETE /config/{id}`
     —— 用内置策略跑自己的参数、存自己的覆盖值, 是多用户的核心产品功能。
@@ -739,6 +818,9 @@ async def auth_middleware(request: Request, call_next):
     ctx_token = preferences.set_current_user_root(
         user_paths.user_root(account_id) if account_id is not None else None,
     )
+    # 注入角色上下文 —— preferences.save() 的结构性闸门据此拒绝"非管理员写全局键"。
+    # 与 user_root 同一个 try/finally: 有值即"这是请求路径", None 即后台线程。
+    role_token = preferences.set_current_role(role)
     try:
         denial = _authorize(request, path, role)
         if denial is not None:
@@ -746,6 +828,7 @@ async def auth_middleware(request: Request, call_next):
         return await call_next(request)
     finally:
         # 必须复位: contextvar 在同一次请求的并发任务间共享, 泄漏会串到别的请求
+        preferences.reset_current_role(role_token)
         preferences.reset_current_user_root(ctx_token)
 
 
@@ -800,6 +883,48 @@ async def capability_denied_handler(request: Request, exc: CapabilityDenied) -> 
     return JSONResponse(
         status_code=403,
         content={"detail": str(exc), "suggestion": exc.suggestion},
+    )
+
+
+# 结构性闸门(preferences.save 的全局键角色判定)被触发 → 403。
+# 文案与 _authorize 的 admin 拒绝**逐字一致**: 对客户端而言这就是同一件事
+# (你没有管理员权限), 不该因为拦住它的是哪一层而出现两套文案。
+from app.services.preferences import GlobalScopeWriteDenied
+
+
+@app.exception_handler(GlobalScopeWriteDenied)
+async def global_scope_write_denied_handler(
+    request: Request, exc: GlobalScopeWriteDenied,
+) -> JSONResponse:
+    logger.warning("global-scope preference write denied: %s", exc)
+    return JSONResponse(
+        status_code=403,
+        content={"detail": "需要管理员权限", "code": "ADMIN_REQUIRED"},
+    )
+
+
+# 依赖账户上下文的端点被**没有账号身份**的会话打到 → 403, 与 api/deps.py 的
+# require_account_id 同一语义、同一状态码、同一文案。
+#
+# 为什么是 403 而不是 401: 单密码应急入口是**已认证**会话 (`/api/auth/status` 对它
+# 回 authenticated=true)。对已认证会话回"未登录或会话已过期"是事实错误, 而且会让
+# 前端走整页跳登录 → Auth.tsx 见 authenticated 为真又弹回 ⇒ 一次无意义的往返。
+# 403 的文案不含拦截器匹配的 `未登录`/`会话已过期`/`401`, 因此不会触发跳转。
+# 不注册 handler 时它会冒泡成 500: 语义错误(这不是服务端故障), 还会把内部类名
+# 连同堆栈暴露给客户端。
+# 典型来源: screener 的 cached-* 系列 (读的是**本账户**的选股缓存)。
+from app.api.deps import ACCOUNT_REQUIRED_DETAIL
+from app.services.user_paths import MissingUserContextError
+
+
+@app.exception_handler(MissingUserContextError)
+async def missing_user_context_handler(
+    request: Request, exc: MissingUserContextError,
+) -> JSONResponse:
+    logger.info("request without account context: %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=403,
+        content={"detail": ACCOUNT_REQUIRED_DETAIL, "code": "ACCOUNT_REQUIRED"},
     )
 
 # 生产期静态文件(前端 dist)

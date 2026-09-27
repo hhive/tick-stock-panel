@@ -17,6 +17,13 @@ from fastapi import HTTPException, Request
 
 from app.services.user_paths import validate_account_id
 
+# "没有账号身份"的统一文案 —— 供本模块与本文件的 403 使用, 也被 main.py 的
+# MissingUserContextError handler 复用, 保证同一条件只有**一套**对客措辞。
+# 注意: 文案里**不得**出现 `未登录` / `会话已过期` / `401` 字样 —— 前端拦截器
+# (main.tsx) 按这些子串匹配并整页跳登录; 而单密码应急入口是**已认证**会话,
+# 把它弹到登录页会被 Auth.tsx 立刻弹回。
+ACCOUNT_REQUIRED_DETAIL = "当前会话没有账号身份 (游客或单密码应急入口), 无法访问每账户数据"
+
 
 def require_account_id(request: Request) -> int:
     """返回当前请求的面板账号 id (正整数); 无账户身份时抛 403。"""
@@ -25,10 +32,7 @@ def require_account_id(request: Request) -> int:
     state = getattr(request, "state", None)
     raw = getattr(state, "account_id", None)
     if raw is None:
-        raise HTTPException(
-            status_code=403,
-            detail="当前会话没有账号身份 (游客或单密码应急入口), 无法访问每账户数据",
-        )
+        raise HTTPException(status_code=403, detail=ACCOUNT_REQUIRED_DETAIL)
     try:
         return validate_account_id(raw)
     except ValueError as e:

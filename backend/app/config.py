@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
+from typing import Any
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -200,3 +203,28 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+# ── AI 配置的 env 初值快照(只读) ───────────────────────────────
+# AI 的 Key / 模型 / UA / token 上限都是**每用户**配置(存 `secrets.json`), 而
+# `settings` 是**进程级单例**。两者混用会串号: 甲保存自己的 Key 顺手把单例改写,
+# 于是所有未自配的账户(含管理员)都以**甲的 Key** 出网、记在甲的网关账上, 设置页
+# 还回显甲的脱敏 Key(2026-09-27 多用户复核 A5, 已实证)。
+#
+# 所以每用户 AI 配置的回落档只允许读这份**冻结快照** —— 它取的是 import 期的 env
+# 初值, 之后没有任何请求改得到。"env 里给了部署级默认 Key" 这个正当能力由此保留:
+# 未自配账户仍能拿到它, 但它永远不会变成"最后一个保存者的值"。
+AI_ENV_DEFAULTS: Mapping[str, Any] = MappingProxyType({
+    field: getattr(settings, field)
+    for field in (
+        "ai_provider",
+        "ai_base_url",
+        "ai_api_key",
+        "ai_model",
+        "ai_codex_command",
+        "ai_codex_reasoning_effort",
+        "ai_user_agent",
+        "ai_max_output_tokens",
+        "ai_context_window",
+    )
+})

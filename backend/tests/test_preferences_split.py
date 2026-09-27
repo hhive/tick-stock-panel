@@ -99,11 +99,18 @@ def test_per_user_key_lands_in_user_file(user_root):
 
 
 def test_per_user_key_without_context_raises(_isolated):
-    """有每用户键却没有账户上下文 = 调用方 bug，必须炸出来而不是静默写全局。
+    """有每用户键却没有账户上下文, 必须炸出来而不是静默写全局。
 
-    静默写全局会让一个本该私有的设置被所有账户共享，且不报错、不提醒。
+    静默写全局会让一个本该私有的设置被所有账户共享, 且不报错、不提醒。
+
+    断言类型是 ``MissingUserContextError`` 而不是笼统的 ``RuntimeError``: 读路径
+    (``resolve_user_root``) 抛的就是它, main.py 已为它注册 handler → 403。
+    写路径若抛裸 ``RuntimeError`` 则冒泡成 500, 同一条件两个答案 —— 这正是本轮
+    在根除的那类不一致。两者是**同一个异常类型**, 这条断言把它钉住。
     """
-    with pytest.raises(RuntimeError, match="缺少账户上下文"):
+    from app.services.user_paths import MissingUserContextError
+
+    with pytest.raises(MissingUserContextError, match="缺少账户上下文"):
         preferences.save({"nav_order": ["a"]})
 
 

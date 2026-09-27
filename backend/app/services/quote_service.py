@@ -30,6 +30,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import date, datetime, time as dt_time
+from pathlib import Path
 
 import polars as pl
 
@@ -37,7 +38,7 @@ from app.market_time import CN_TZ, cn_now, cn_today
 from app.parquet import scan_daily_parquet
 from app.polars_guard import guarded_collect
 from app.services.index_const import CORE_INDEX_SYMBOLS
-from app.services.user_paths import MissingUserContextError, validate_account_id
+from app.services.user_paths import validate_account_id
 from app.strategy.intraday_signals import IntradaySignalEvaluator
 from app.strategy.monitor import format_alert_quote
 
@@ -71,20 +72,6 @@ def _body_with_quote(body: str, ev: dict) -> str:
     return f"{body} · {quote_tail}"
 
 logger = logging.getLogger(__name__)
-
-# 模拟盘钩子在无账户上下文时只告警一次 —— 行情轮询是高频循环, 每轮告警会淹掉日志
-_paper_scope_warned = False
-
-
-def _warn_paper_scope_once() -> None:
-    """后台线程没有账户上下文时提示一次: 模拟盘盘中撮合/自动跟单暂不执行 (待每账户扇出)。"""
-    global _paper_scope_warned
-    if not _paper_scope_warned:
-        _paper_scope_warned = True
-        logger.warning(
-            "模拟盘盘中钩子跳过: 后台线程无账户上下文, 待每账户扇出 (S3); "
-            "此前会读写共享目录, 现已 fail-closed。"
-        )
 
 # Webhook(飞书等)投递专用线程池 —— 与行情轮询线程隔离。
 # send_feishu 内置重试(最坏 ~3×5s 超时 + 退避), 若在 _poll_loop 上同步投递,
@@ -217,9 +204,9 @@ def _group_by_account(events: list[dict], what: str) -> dict[int, list[dict]]:
 
     注: 模拟盘成交事件的 ``account_id`` 是**字符串模拟盘账户名** (见
     app.strategy.paper 的"两个 account_id 不是一回事"), 与这里的整数面板账号主键
-    命名空间不同, 因此会被本函数按"非法标签"拒收 —— 这是刻意的, 它还没有按面板
-    账户分家的迁移 (后台线程拿不到 user_root), 误当成面板账号会把随机一个字符串
-    当成账户 id 去读配置。
+    命名空间不同, 因此会被本函数按"非法标签"拒收。这是刻意的: 喂事件的一方必须先
+    把面板账户主键打上 (见 ``_stamp_paper_events``), 而不是让本函数去猜一个字符串
+    能不能当账户 id。
     """
     grouped: dict[int, list[dict]] = {}
     for ev in events:
@@ -241,6 +228,62 @@ def _monitor_name_map(repo) -> dict[str, str]:
     避免每轮监控对 ~7000 行维表 iter_rows 重建。过滤空名称与旧行为一致。
     """
     return {s: n for s, n in repo.get_name_map().items() if n}
+
+
+# 盘中模拟盘扇出用的账户根列表缓存时长 (秒)。
+#
+# user_paths.iter_user_roots() 要读 accounts.json 再逐账户 glob, 而行情轮询是
+# 1~6 秒一轮的高频循环 —— user_paths 的 docstring 明确要求它别进热路径。这里只缓存
+# 「账户根列表」这一份只读数据, 30 秒到期重建。
+# 取舍: 新建的账户最多 30 秒内不参与盘中撮合 (下单本身照常可用), 换来热路径不再每轮
+# 读盘。盘后结算 (daily_pipeline.settle_paper_accounts) 刻意**不用**本缓存 —— 一天只跑
+# 一次, 要的是实时名单。
+_PAPER_ROOTS_TTL_S = 30.0
+# (缓存时刻, 该时刻的 data_dir, 账户根列表) — 带上 data_dir 是为了让"换了数据目录"
+# (测试用 tmp 根、部署迁移) 立即失效, 否则会拿着上一个目录的账户根去读写。
+_paper_roots_cache: tuple[float, Path, list[tuple[int, Path]]] | None = None
+_paper_roots_lock = threading.Lock()
+
+
+def _paper_account_roots(
+    now: float | None = None, data_dir: Path | None = None,
+) -> list[tuple[int, Path]]:
+    """盘中扇出用的 ``(面板账户主键, 账户根)`` 列表, 带 ``_PAPER_ROOTS_TTL_S`` 缓存。
+
+    只给**行情轮询热路径**用 (见 _run_paper_hooks)。``now`` / ``data_dir`` 仅供测试
+    注入, 生产调用不传。
+    """
+    global _paper_roots_cache
+    from app.config import settings
+
+    current_dir = Path(data_dir) if data_dir is not None else Path(settings.data_dir)
+    ts = time.monotonic() if now is None else now
+    with _paper_roots_lock:
+        cached = _paper_roots_cache
+        if cached is not None and cached[1] == current_dir and ts - cached[0] < _PAPER_ROOTS_TTL_S:
+            return cached[2]
+    from app.services import user_paths
+
+    roots = list(user_paths.iter_user_roots())  # 锁外做 I/O: 两个线程各建一次也无害
+    with _paper_roots_lock:
+        _paper_roots_cache = (ts, current_dir, roots)
+    return roots
+
+
+def _stamp_paper_events(paper_events: list[dict], panel_account_id: int) -> list[dict]:
+    """模拟盘事件 → 打上**面板账户主键** (决策 D3), 供投递路径 (SSE/系统通知/Webhook) 路由。
+
+    paper 域产出的 ``account_id`` 是**字符串模拟盘账户名** (见 app.strategy.paper 的
+    "两个 account_id 不是一回事"), 与面板账号主键命名空间不同: 直接投递会被
+    ``_group_by_account`` 按非法标签拒收, 等于一条都推不到人。这里改写为整数主键,
+    同时把模拟盘账户名移到独立字段 ``paper_account`` 保留语义。
+
+    留痕不经过本函数: 成交记录由 ``paper._fill_order`` 在成交当时按账户写盘。
+    """
+    return [
+        {**ev, "paper_account": ev.get("account_id"), "account_id": panel_account_id}
+        for ev in paper_events
+    ]
 
 
 class QuoteService:
@@ -1431,55 +1474,62 @@ class QuoteService:
             # 模拟盘任何异常只留痕, 不得影响监控告警链路。
             if stock_ready and self._app_state is not None:
                 try:
-                    from app.strategy import paper as paper_trading
-                    from app.strategy import paper_auto
                     data_dir = self._app_state.repo.store.data_dir
                     snapshot = dict(zip(
                         enriched_today["symbol"].to_list(),
                         enriched_today["raw_close"].to_list(),
                         strict=False,
                     ))
-                    paper_events: list[dict] = []
-                    # 账户数据按面板账户分家 (data/users/<面板账户>/paper/...): 本线程
-                    # 是**后台线程**, 没有请求上下文, 必须按账户扇出并显式传 user_root=。
-                    # 扇出落地前这里拿不到账户 → 跳过并留痕一次 (每轮都告警会刷屏);
-                    # 刻意不传 data_dir 充数: 那等于把共享目录当账户目录读写, 会把
-                    # 账户 A 的订单当成人人可见的数据。
-                    try:
-                        account_ids = paper_trading.list_account_ids()
-                    except MissingUserContextError:
-                        _warn_paper_scope_once()
-                        account_ids = []
-                    for acc_id in account_ids:
-                        paper_events.extend(
-                            paper_trading.evaluate_intraday(data_dir, snapshot, account_id=acc_id))
-                        if rule_events:
-                            created = paper_auto.on_rule_events(rule_events, account_id=acc_id)
-                            paper_events.extend(paper_auto.auto_order_events(created, account_id=acc_id))
-                    # 成交/自动跟单下单推送 (V3): 复用监控中心既有管道 —— SSE toast /
-                    # 语音 (前端按 source 拼文案) / 系统通知 / alert_store 留痕 /
-                    # Webhook。全部静默降级。
-                    #
-                    # 注: 本块仍属**未迁移**的模拟盘域 (上面 _warn_paper_scope_once 已说明:
-                    # 后台线程拿不到账户 → account_ids 恒为空, 这里从不真的执行)。迁移时
-                    # 必须按面板账户扇出并显式传 user_root=: paper 事件的 account_id 是
-                    # **字符串模拟盘账户名**, 不是面板账号主键, 直接喂给
-                    # _broadcast_alerts 会被当作缺标签拒收 (见 _group_by_account),
-                    # 这正是我们要的 fail-closed, 而不是把随机字符串当账户 id 用。
-                    if paper_events:
-                        self._broadcast_alerts(paper_events)
-                        try:
-                            from app.services import alert_store
-                            alert_store.append_many(data_dir, paper_events)
-                        except Exception as e:  # noqa: BLE001
-                            logger.warning("模拟盘成交留痕失败: %s", e)
-                        self._maybe_send_system_notifications(paper_events)
-                        self._maybe_send_paper_webhook(paper_events)
+                    self._run_paper_hooks(data_dir, snapshot, rule_events)
                 except Exception as e:
                     logger.warning("模拟盘钩子失败 (不影响监控): %s", e)
 
         except Exception as e:  # noqa: BLE001
             logger.warning("监控评估失败: %s", e)
+
+    def _run_paper_hooks(
+        self, data_dir: Path, snapshot: dict[str, float], rule_events: list[dict],
+    ) -> None:
+        """盘中模拟盘钩子 —— **按面板账户扇出** (后台线程, 必须显式传 user_root=)。
+
+        账户数据按面板账户分家 (``<data_dir>/users/<面板账户>/paper/...``), 而本方法在
+        行情轮询线程里跑, 没有请求上下文: 早先直接调 ``list_account_ids()`` 会抛
+        ``MissingUserContextError`` 并整段跳过, 使盘中撮合与自动跟单从未执行。现遍历
+        账户注册表逐个传入账户根。
+
+        隔离与投递: 每个面板账户独立 try (一个账户坏不连累其余); 事件按 D3 打上**面板
+        账户主键**后投递到 SSE / alert_store (写明下该账户的 alerts.jsonl) / 系统通知 /
+        Webhook —— 各下游都按事件自带的整数 ``account_id`` 路由, 不跨账户串号。
+        """
+        from app.strategy import paper as paper_trading
+        from app.strategy import paper_auto
+
+        for panel_account_id, user_root in _paper_account_roots():
+            try:
+                paper_events: list[dict] = []
+                for acc_id in paper_trading.list_account_ids(user_root=user_root):
+                    paper_events.extend(paper_trading.evaluate_intraday(
+                        data_dir, snapshot, account_id=acc_id, user_root=user_root))
+                    if rule_events:
+                        created = paper_auto.on_rule_events(
+                            rule_events, account_id=acc_id, user_root=user_root)
+                        paper_events.extend(paper_auto.auto_order_events(created, account_id=acc_id))
+                if not paper_events:
+                    continue
+                # 成交/自动跟单下单推送 (V3): 复用监控中心既有管道 —— SSE toast /
+                # 语音 (前端按 source 拼文案) / 系统通知 / Webhook。全部静默降级。
+                # 投递前必须先打面板账户主键 (见 _stamp_paper_events)。
+                #
+                # 刻意**不**在此处调 alert_store.append_many: 成交留痕由
+                # paper._fill_order 在成交当时按账户写盘 (盘中/结算两条路径都经过它),
+                # 这里再写一遍会在同一个 alerts.jsonl 里留下两条近似记录。
+                events = _stamp_paper_events(paper_events, panel_account_id)
+                self._broadcast_alerts(events)
+                self._maybe_send_system_notifications(events)
+                self._maybe_send_paper_webhook(events, user_root)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "模拟盘钩子失败 (账户 %s, 不影响其余账户): %s", panel_account_id, e)
 
     def _persist_alerts_by_account(self, rule_events: list[dict]) -> None:
         """把触发记录按账户分别追加到各自的 alerts.jsonl。
@@ -1870,21 +1920,24 @@ class QuoteService:
                 enqueued, account_id,
             )
 
-    def _maybe_send_paper_webhook(self, events: list[dict]) -> None:
+    def _maybe_send_paper_webhook(self, events: list[dict], user_root: Path | None = None) -> None:
         """模拟盘成交 → 已配置的飞书/企业微信/自定义 Webhook (异步投递, 失败静默)。
 
         与监控规则的按规则勾选不同: 成交事件无规则载体, 渠道地址已配置即投递。
         模拟盘成交低频 (手动 + cooldown 规则), 刷屏风险低。
+
+        渠道地址/密钥是**每账户**偏好, 后台线程必须显式传该账户的 user_root 读;
+        不传则 contextvar 为空 → 读到的恒是默认空值 (用户配了也一条都发不出) 或直接抛。
         """
         try:
             from app import secrets_store
             from app.services import preferences, webhook_adapter
 
-            feishu_url = preferences.get_feishu_webhook_url()
-            feishu_secret = preferences.get_feishu_webhook_secret()
-            wecom_url = preferences.get_wecom_webhook_url()
-            custom_url = preferences.get_custom_webhook_url()
-            custom_secret = secrets_store.get_custom_webhook_secret()
+            feishu_url = preferences.get_feishu_webhook_url(user_root)
+            feishu_secret = preferences.get_feishu_webhook_secret(user_root)
+            wecom_url = preferences.get_wecom_webhook_url(user_root)
+            custom_url = preferences.get_custom_webhook_url(user_root)
+            custom_secret = secrets_store.get_custom_webhook_secret(user_root)
             if not any((feishu_url, wecom_url, custom_url)):
                 return
 

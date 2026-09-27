@@ -54,7 +54,7 @@ class TickflowKeyIn(BaseModel):
 @router.get("")
 def get_settings() -> dict:
     """返回当前配置概况(Key 脱敏)。"""
-    from app.config import settings
+    from app.config import AI_ENV_DEFAULTS
     from app.services import preferences
     from app.services.ai_provider import (
         ai_configured,
@@ -97,7 +97,10 @@ def get_settings() -> dict:
         "ai_codex_model": current_codex_model(),
         "ai_codex_command": current_codex_command(),
         "ai_codex_reasoning_effort": current_codex_reasoning_effort(),
-        "ai_user_agent": secrets_store.get_ai_config("ai_user_agent", settings.ai_user_agent),
+        # 默认值取 **env 初值快照**, 不取 settings 单例: 单例会残留别的账户保存过的 UA
+        "ai_user_agent": secrets_store.get_ai_config(
+            "ai_user_agent", AI_ENV_DEFAULTS.get("ai_user_agent", "")
+        ),
         "ai_max_output_tokens": current_ai_max_output_tokens(),
         "ai_context_window": current_ai_context_window(),
     }
@@ -304,39 +307,38 @@ def save_ai_settings(req: AiSettingsIn) -> dict:
         # 无条件写入: 空值也写, 免得存量旧地址在「用户只改了模型」时继续留着生效
         "ai_base_url": locked_base_url,
     }
+    # provider / base_url 是**与账户无关的部署常量**(上游锁定), 且是幂等赋值, 所以
+    # 仍同步到运行时单例。其余字段是**每用户配置** —— 一律只落各自的 `secrets.json`,
+    # **不写进程级单例**: 写了就等于「最后一个保存者成为所有未自配账户的凭据与模型」
+    # (复核 A5, 已实证)。读取侧统一由 `secrets_store`/`ai_provider` 从账户文件取,
+    # 回落档读 `config.AI_ENV_DEFAULTS` 只读快照。
     settings.ai_provider = OPENAI_COMPAT_PROVIDER
     settings.ai_base_url = locked_base_url
     if req.api_key is not None:
         if req.api_key:
             updates["ai_api_key"] = req.api_key
-            settings.ai_api_key = req.api_key
         else:
             secrets_store.clear("ai_api_key")
-            settings.ai_api_key = ""
     if req.model:
         updates["ai_model"] = req.model
-        settings.ai_model = req.model
     # user_agent 允许清空(回到默认浏览器 UA),故无条件持久化
     updates["ai_user_agent"] = req.user_agent
-    settings.ai_user_agent = req.user_agent
 
     # 输出上限 / 输入上下文窗口 (数值配置, 缺省保持原值)
     if req.max_output_tokens is not None:
         if req.max_output_tokens <= 0:
             raise HTTPException(status_code=400, detail="输出上限必须为正整数")
         updates["ai_max_output_tokens"] = req.max_output_tokens
-        settings.ai_max_output_tokens = req.max_output_tokens
     if req.context_window is not None:
         if req.context_window <= 0:
             raise HTTPException(status_code=400, detail="上下文窗口必须为正整数")
         updates["ai_context_window"] = req.context_window
-        settings.ai_context_window = req.context_window
 
     if updates:
         secrets_store.save(updates)
+    # 旧 codex 键清掉后, 读取侧的回落档是 env 快照(`ai_codex_command` 初值 "codex"),
+    # 语义与原先「重置单例为常量」逐位一致, 但不再改写进程级状态。
     secrets_store.clear(*_LEGACY_AI_KEYS)
-    settings.ai_codex_command = "codex"
-    settings.ai_codex_reasoning_effort = ""
 
     provider = current_ai_provider()
     return {
@@ -380,14 +382,10 @@ def clear_ai_settings() -> dict:
     )
     # 同步重置运行时内存。地址回到**锁定的常量**而不是空串 —— 清空凭证不等于取消
     # 上游锁定, 空的 base_url 会让下一次请求打到 SDK 默认的 api.openai.com。
+    # provider / base_url 是与账户无关的部署常量, 故照旧重置; 其余每用户字段不写单例
+    # (复核 A5) —— 凭据清空后读取侧自然回落到 `config.AI_ENV_DEFAULTS` 的 env 初值。
     settings.ai_provider = "openai_compat"
     settings.ai_base_url = ai_base_url()
-    settings.ai_api_key = ""
-    settings.ai_model = ""
-    settings.ai_codex_command = "codex"
-    settings.ai_codex_reasoning_effort = ""
-    settings.ai_max_output_tokens = 16384
-    settings.ai_context_window = 128000
 
     return {"ok": True, "ai_base_url": ai_base_url()}
 

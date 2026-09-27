@@ -6,15 +6,21 @@ Sub2API / SMTP 等凭据是个人凭据, 不能跨账户共享。user_root 由
 后台线程/调度器/子进程必须显式传 ``user_root=`` (没有账户上下文时抛
 MissingUserContextError, 刻意**不**回退到共享文件)。
 
-优先级:secrets.json > .env > 空(Free 模式)。
+优先级:secrets.json > 部署级 env 默认 > 空(Free 模式)。
 UI 改 Key 时只动这个文件,不动 .env。
+
+**每用户配置的回落档一律读 `config.AI_ENV_DEFAULTS`(import 期冻结的只读快照),
+不读进程级 `settings` 单例** —— 单例会被任意账户的保存请求改写, 读它等于把未自配
+账户的凭据交给最后一个保存者(复核 A5, 详见 `_env_default`)。
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
+import threading
 from pathlib import Path
+from typing import Any
 
 from app.services.fs_utils import atomic_write_text
 from app.services.user_paths import MissingUserContextError, resolve_user_root
@@ -22,9 +28,37 @@ from app.services.user_paths import MissingUserContextError, resolve_user_root
 logger = logging.getLogger(__name__)
 
 
+# ── B1: 读改写序列化 ──────────────────────────────────────────
+# `save()` / `save_deployment()` / `clear()` / `clear_deployment()` 都是
+# `load → update → atomic_write_text` 三步。原子写只保证**不出现半截文件**, 不保证
+# **不丢更新**: 两个请求并发保存时, 后写者拿的是先写者之前的旧快照, 先写者的键被
+# 静默抹掉(同 `preferences._SAVE_LOCK` 的动机)。RLock 而非 Lock —— `save()` 内部
+# 会调用 `save_deployment()`, 需要可重入。
+_SAVE_LOCK = threading.RLock()
+
+
+# ── B2: 热路径 mkdir 去重 ────────────────────────────────────
+# 凭证文件所在目录建好之后不会再消失(没有任何代码删账户目录), 而 `_path()` 在
+# **每次读**都被调用 —— 行情轮询每轮 8~12 次多余的系统调用。用进程内「已确保」
+# 集合记忆, 命中即跳过。只在新路径上真正 mkdir, 失败不进集合(下次照旧重试)。
+_ENSURED_DIRS: set[str] = set()
+_ENSURED_LOCK = threading.Lock()
+
+
+def _ensure_dir(path: Path) -> Path:
+    key = str(path)
+    if key in _ENSURED_DIRS:
+        return path
+    with _ENSURED_LOCK:
+        if key not in _ENSURED_DIRS:
+            path.mkdir(parents=True, exist_ok=True)
+            _ENSURED_DIRS.add(key)
+    return path
+
+
 def _path(user_root: Path | None = None) -> Path:
     p = resolve_user_root(user_root) / "user_data" / "secrets.json"
-    p.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_dir(p.parent)
     return p
 
 
@@ -45,7 +79,7 @@ DEPLOYMENT_KEYS: frozenset[str] = frozenset({
 def _deployment_path() -> Path:
     from app.config import settings
     p = settings.data_dir / "deployment_secrets.json"
-    p.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_dir(p.parent)
     return p
 
 
@@ -68,13 +102,14 @@ def save_deployment(updates: dict) -> dict:
     `ext_{id}_api_key`)无法用静态 DEPLOYMENT_KEYS 覆盖, 由调用方显式调本函数
     而不是 save() —— 显式优于按名字猜测。
     """
-    current = load_deployment()
-    current.update({k: v for k, v in updates.items() if v is not None})
-    atomic_write_text(
-        _deployment_path(),
-        json.dumps(current, indent=2, ensure_ascii=False), mode=0o600,
-    )
-    return current
+    with _SAVE_LOCK:
+        current = load_deployment()
+        current.update({k: v for k, v in updates.items() if v is not None})
+        atomic_write_text(
+            _deployment_path(),
+            json.dumps(current, indent=2, ensure_ascii=False), mode=0o600,
+        )
+        return current
 
 
 def get_deployment(field: str, default: str = "") -> str:
@@ -85,19 +120,20 @@ def get_deployment(field: str, default: str = "") -> str:
 
 def clear_deployment(*keys: str) -> dict:
     """清掉部署级凭据字段(留空清全部)。供"清除数据源配置"这类管理操作使用。"""
-    p = _deployment_path()
-    if not p.exists():
-        return {}
-    if not keys:
-        p.unlink()
-        return {}
-    current = load_deployment()
-    for k in keys:
-        current.pop(k, None)
-    atomic_write_text(
-        p, json.dumps(current, indent=2, ensure_ascii=False), mode=0o600,
-    )
-    return current
+    with _SAVE_LOCK:
+        p = _deployment_path()
+        if not p.exists():
+            return {}
+        if not keys:
+            p.unlink()
+            return {}
+        current = load_deployment()
+        for k in keys:
+            current.pop(k, None)
+        atomic_write_text(
+            p, json.dumps(current, indent=2, ensure_ascii=False), mode=0o600,
+        )
+        return current
 
 
 def load(user_root: Path | None = None) -> dict:
@@ -124,22 +160,23 @@ def save(updates: dict, user_root: Path | None = None) -> dict:
 
     只有当入参含**每用户**键时才需要账户上下文; 只写部署级键时不需要。
     """
-    dep = {k: v for k, v in updates.items() if k in DEPLOYMENT_KEYS}
-    usr = {k: v for k, v in updates.items() if k not in DEPLOYMENT_KEYS}
+    with _SAVE_LOCK:
+        dep = {k: v for k, v in updates.items() if k in DEPLOYMENT_KEYS}
+        usr = {k: v for k, v in updates.items() if k not in DEPLOYMENT_KEYS}
 
-    merged: dict = {}
-    if dep:
-        merged.update(save_deployment(dep))
-    if usr:
-        # 每用户部分才解析账户根 —— 无上下文且含每用户键时在此 fail-closed
-        p = _path(user_root)
-        current = load(user_root)
-        current.update({k: v for k, v in usr.items() if v is not None})
-        atomic_write_text(
-            p, json.dumps(current, indent=2, ensure_ascii=False), mode=0o600,
-        )
-        merged.update(current)
-    return merged
+        merged: dict = {}
+        if dep:
+            merged.update(save_deployment(dep))
+        if usr:
+            # 每用户部分才解析账户根 —— 无上下文且含每用户键时在此 fail-closed
+            p = _path(user_root)
+            current = load(user_root)
+            current.update({k: v for k, v in usr.items() if v is not None})
+            atomic_write_text(
+                p, json.dumps(current, indent=2, ensure_ascii=False), mode=0o600,
+            )
+            merged.update(current)
+        return merged
 
 
 def clear(*keys: str, user_root: Path | None = None) -> dict:
@@ -147,19 +184,20 @@ def clear(*keys: str, user_root: Path | None = None) -> dict:
 
     只作用于**每用户**凭据; 部署级键不在本函数范围内(避免无上下文时误删全站 Key)。
     """
-    p = _path(user_root)
-    if not p.exists():
-        return {}
-    if not keys:
-        p.unlink()
-        return {}
-    current = load(user_root)
-    for k in keys:
-        current.pop(k, None)
-    atomic_write_text(
-        p, json.dumps(current, indent=2, ensure_ascii=False), mode=0o600,
-    )
-    return current
+    with _SAVE_LOCK:
+        p = _path(user_root)
+        if not p.exists():
+            return {}
+        if not keys:
+            p.unlink()
+            return {}
+        current = load(user_root)
+        for k in keys:
+            current.pop(k, None)
+        atomic_write_text(
+            p, json.dumps(current, indent=2, ensure_ascii=False), mode=0o600,
+        )
+        return current
 
 
 def get_tickflow_key(user_root: Path | None = None) -> str:
@@ -176,34 +214,51 @@ def get_tickflow_key(user_root: Path | None = None) -> str:
     return settings.tickflow_api_key or ""
 
 
+def _env_default(key: str, default: Any = "") -> Any:
+    """每用户 AI 配置的**回落档**: 只读的 env 初值快照(``config.AI_ENV_DEFAULTS``)。
+
+    刻意不读 `settings.<key>` —— 那是进程级单例, 会被任意账户的保存请求就地改写。
+    读它等于「谁最后保存, 所有未自配账户就用谁的 Key 出网」: 串号 + 计费错位 +
+    设置页回显他人密钥(2026-09-27 复核 A5, 已实证)。快照在 import 期冻结, 之后
+    没有任何请求改得到它, 所以「env 里给了部署级默认 Key」这个正当能力仍在。
+    """
+    from app.config import AI_ENV_DEFAULTS
+
+    val = AI_ENV_DEFAULTS.get(key)
+    if val is None or val == "":
+        return default
+    return val
+
+
 def get_ai_key(user_root: Path | None = None) -> str:
-    """取当前账户的 AI Key:secrets.json 优先,否则 .env。"""
+    """取当前账户的 AI Key:secrets.json 优先, 否则部署级 env 默认(只读快照)。"""
     val = load(user_root).get("ai_api_key")
     if val:
         return val
-    from app.config import settings
-    return settings.ai_api_key or ""
+    return str(_env_default("ai_api_key", "") or "")
 
 
 def get_ai_config(key: str, default: str = "", user_root: Path | None = None) -> str:
-    """取当前账户的 AI 配置项:secrets.json 优先,否则 config。"""
+    """取当前账户的 AI 配置项:secrets.json 优先, 否则部署级 env 默认(只读快照)。"""
     val = load(user_root).get(key)
     if val:
         return val
-    from app.config import settings
-    return getattr(settings, key, default) or default
+    return _env_default(key, default) or default
 
 
 def get_ai_config_int(key: str, default: int, user_root: Path | None = None) -> int:
-    """取 AI 数值配置项 (如 ai_max_output_tokens): secrets.json 优先,否则 config。"""
+    """取 AI 数值配置项 (如 ai_max_output_tokens): secrets.json 优先, 否则 env 默认。"""
     val = load(user_root).get(key)
     if val is not None:
         try:
             return int(val)
         except (TypeError, ValueError):
             logger.warning("ai config %s is not an int: %r", key, val)
-    from app.config import settings
-    return int(getattr(settings, key, default) or default)
+    try:
+        return int(_env_default(key, default) or default)
+    except (TypeError, ValueError):
+        logger.warning("env default for %s is not an int: %r", key, _env_default(key, default))
+        return int(default)
 
 
 def get_custom_webhook_secret(user_root: Path | None = None) -> str:

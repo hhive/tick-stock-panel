@@ -15,7 +15,9 @@ import { motion } from 'framer-motion'
 import { Loader2, RotateCw, ShieldAlert, TriangleAlert } from 'lucide-react'
 import { ApiError, api } from '@/lib/api'
 import { Logo } from '@/components/Logo'
-import { captureJumpKeyFromUrl, getHeldJumpKey, setHeldJumpKey } from '@/lib/account'
+import {
+  applyAccountIdentity, captureJumpKeyFromUrl, clearAccountScopedStorage, getHeldJumpKey, setHeldJumpKey,
+} from '@/lib/account'
 
 type JumpState =
   | { kind: 'checking' }
@@ -44,6 +46,11 @@ async function runJump(): Promise<JumpState> {
     const res = await api.accountJump(key)
     if (res.status === 'logged_in') {
       setHeldJumpKey(null)  // 后端已建立绑定, 内存里不再留凭证
+      // 跳转登录同样是「换账号」: 本浏览器上可能是别人刚用过的账号, 上一账号落盘的
+      // 模拟盘账户等指针不能留给刚跳进来的人 (2026-09-27 复核 B3); 身份同时切到当前账号,
+      // 助手会话按身份命名空间隔离 (只换窗口, 不销毁任何人的历史)。
+      clearAccountScopedStorage()
+      applyAccountIdentity(res.email)
       return { kind: 'proceed' }
     }
     // key 有效但本面板还没有对应账号: 留在内存等注册/登录后绑定
