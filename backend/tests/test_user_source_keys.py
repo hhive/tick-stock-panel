@@ -195,6 +195,32 @@ def test_fuyao_provider_does_not_reuse_a_client_across_keys(monkeypatch, tmp_pat
     assert built == ["sk-a", "sk-b"]
 
 
+def test_user_key_reaches_the_plugin_client(ctx, monkeypatch):
+    """用户填的 Key 必须真的走到插件客户端 —— 这是「以用户填写的为准」的生效点。
+
+    不再 monkeypatch get_api_key: 走的就是 provider 真实的那条取值链
+    (get_api_key → get_env_backed_secret → 每用户文件), 只把 SDK 客户端换掉。
+    """
+    from app.plugins.fuyao import provider as fp
+
+    secrets_store.save_deployment({"fuyao_api_key": DEPLOY_KEY})
+    secrets_store.save_user_secret("fuyao_api_key", USER_KEY)
+
+    built: list[str] = []
+
+    class FakeFuyao:
+        def __init__(self, api_key=None, **kwargs):
+            built.append(api_key)
+
+        def close(self) -> None: ...
+
+    monkeypatch.setattr(fp.fuyao_client, "FuyaoClient", FakeFuyao)
+
+    fp.FuyaoProvider()._get_client()
+
+    assert built == [USER_KEY], "请求路径上必须用用户自己的 Key"
+
+
 # ── 端点: 用户填自己的 key ──────────────────────────────────────
 
 
