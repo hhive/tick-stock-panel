@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, createContext, useContext } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   Save, Loader2, Check, Wifi, WifiOff, Eye, EyeOff, Shield,
-  Shuffle, Plug, Settings2, Trash2, ChevronDown,
+  Shuffle, Plug, Settings2, Trash2, ChevronDown, RefreshCw,
 } from 'lucide-react'
 import { useSettings } from '@/lib/useSharedQueries'
 import { api, type SettingsState } from '@/lib/api'
@@ -168,6 +168,17 @@ export function SettingsAIPanel({ highlight }: { highlight?: string } = {}) {
     }
   }
 
+  // 首屏引导: AI 调用报错最常见的原因是模型不在该 key 的分组里 —— 直接把人带到
+  // 「模型」字段, 并用他自己的 Key 拉一次可见清单, 省掉「先滚下去、再找输入框」。
+  // scrollIntoView 在 jsdom 里不存在, 故显式判存在再调。
+  const revealModelPicker = () => {
+    void fetchModelOptions()
+    const box = modelBoxRef.current
+    if (box && typeof box.scrollIntoView === 'function') {
+      box.scrollIntoView({ block: 'center', behavior: 'smooth' })
+    }
+  }
+
   const filteredModelOptions = modelFilter.trim()
     ? modelOptions.filter(id => id.toLowerCase().includes(modelFilter.trim().toLowerCase()))
     : modelOptions
@@ -225,6 +236,13 @@ export function SettingsAIPanel({ highlight }: { highlight?: string } = {}) {
             </div>
           </div>
         </div>
+        {(configured || needsModel) && (
+          <button type="button" onClick={revealModelPicker} disabled={modelsLoading}
+            className="mt-3 inline-flex items-center gap-1.5 text-xs text-muted transition-colors duration-150 ease-smooth hover:text-accent disabled:opacity-50">
+            {modelsLoading ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
+            {needsModel ? '用你的 Key 拉取可用模型并选择' : 'AI 调用报错？用你的 Key 拉取可用模型'}
+          </button>
+        )}
         {testResult && (
           <div className={`mt-3 rounded-btn border px-3 py-2 text-xs flex items-center gap-2 ${testResult.ok ? 'border-emerald-400/20 bg-emerald-400/[0.04] text-emerald-400' : 'border-danger/20 bg-danger/[0.04] text-danger'}`}>
             <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${testResult.ok ? 'bg-emerald-400' : 'bg-danger'}`} />

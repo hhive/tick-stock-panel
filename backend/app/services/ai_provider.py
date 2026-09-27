@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import shutil
@@ -17,8 +18,12 @@ from pathlib import Path
 from types import TracebackType
 from urllib.parse import urlsplit, urlunsplit
 
+import httpx
+
 from app import secrets_store
-from app.config import settings
+from app.config import DEFAULT_AI_MODEL, settings
+
+logger = logging.getLogger(__name__)
 
 OPENAI_COMPAT_PROVIDER = "openai_compat"
 OPENAI_PROVIDER = "openai"
@@ -145,6 +150,71 @@ def ai_base_url() -> str:
     from app.config import AI_GATEWAY_BASE_URL
 
     return AI_GATEWAY_BASE_URL
+
+
+def _normalize_models(payload: object) -> list[str]:
+    """把 `/v1/models` 的响应体归一化为排序去重后的模型 id 列表。
+
+    与 `POST /api/settings/ai/models` 共用同一套口径: 上游形状变了(非 dict、
+    `data` 不是数组、混进缺 id 的项)只丢坏项, 不抛。
+    """
+    if not isinstance(payload, dict):
+        return []
+    items = payload.get("data")
+    if not isinstance(items, list):
+        return []
+    return sorted({
+        item["id"] for item in items
+        if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"]
+    })
+
+
+async def fetch_models_for_key(api_key: str, *, timeout: float = 15) -> list[str]:
+    """按 key 拉本站网关可见的模型清单(异步版, 供设置页端点用)。
+
+    必须是**用户自己的** key: Sub2API 按用户分组过滤模型, 服务端凭据代查会看到
+    该用户其实调不到的模型。失败向上抛, 由端点翻成 502 文案给用户看。
+    """
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        res = await client.get(
+            f"{ai_base_url()}/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        res.raise_for_status()
+        return _normalize_models(res.json())
+
+
+def pick_model_for_key(api_key: str, *, prefer: str = "", timeout: float = 3.0) -> str:
+    """给「带 key 跳转进来」的用户挑一个默认模型(同步版, 供登录/绑定路径用)。
+
+    清单里有 `prefer`(默认取部署级默认模型)就用它, 否则用清单第一个 —— 这样挑出来的
+    模型**一定在该用户自己的可见清单里**, 而不是一个可能不属于他分组的写死名字。
+
+    返回 "" 表示挑不出来: 调用方据此**不写入** `ai_model`, 让部署级默认
+    (`config.DEFAULT_AI_MODEL`)生效(写空串会把默认盖掉, 正是要避免的)。
+    **绝不抛**: 这是登录/绑定的附带收益, 网关不可达不该让用户连面板都进不去。
+
+    超时取 3s(设置页端点用 15s): 这条路径跑在用户等着的请求里, 且只在该账号还没有
+    模型时发生一次。
+    """
+    key = (api_key or "").strip()
+    if not key:
+        return ""
+    want = prefer or DEFAULT_AI_MODEL
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            res = client.get(
+                f"{ai_base_url()}/models",
+                headers={"Authorization": f"Bearer {key}"},
+            )
+            res.raise_for_status()
+            models = _normalize_models(res.json())
+    except Exception:  # noqa: BLE001 — 挑不到就走部署级默认, 这不是错误路径
+        logger.warning("pick ai model failed; falling back to deployment default", exc_info=True)
+        return ""
+    if not models:
+        return ""
+    return want if want in models else models[0]
 
 
 def current_openai_model() -> str:

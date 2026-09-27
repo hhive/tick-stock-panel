@@ -160,6 +160,39 @@ it('key 与模型齐备时显示已连接', async () => {
   expect(host.textContent ?? '').toContain('AI 已连接')
 })
 
+it('首屏给出「用你的 Key 拉取可用模型」入口，点击即拉列表', async () => {
+  // 跳转进来的人只会带一把 key, 不会带「该选哪个模型」。默认模型可能不在他的分组里,
+  // 所以首屏必须给一条自助路径, 而不是让人自己滚下去找输入框。
+  h.state = baseState({
+    has_ai_key: true, ai_api_key_masked: 'sk-a......z', ai_model: 'gpt-x', ai_configured: true,
+  })
+  m.aiModels.mockResolvedValue({ models: ['gpt-6-sol', 'gpt-5.6'] } as never)
+  await renderPanel()
+
+  const guide = buttonByText('拉取可用模型')
+  expect(guide).toBeTruthy()
+
+  await act(async () => { guide!.click() })
+  await settle()
+
+  expect(m.aiModels).toHaveBeenCalledTimes(1)
+  expect(host.textContent ?? '').toContain('gpt-6-sol')
+})
+
+it('只有 key、还没模型时，首屏入口的文案是「拉取并选择」而不是「调用报错」', async () => {
+  h.state = baseState({ has_ai_key: true, ai_api_key_masked: 'sk-a......z', ai_configured: false })
+  await renderPanel()
+
+  expect(buttonByText('拉取可用模型并选择')).toBeTruthy()
+  expect(buttonByText('调用报错')).toBeUndefined()
+})
+
+it('没有 key 时不显示拉模型入口（先有 key 才有意义）', async () => {
+  await renderPanel()
+
+  expect(buttonByText('拉取可用模型')).toBeUndefined()
+})
+
 it('页面上不再有其它 AI 上游预设', async () => {
   await renderPanel()
 

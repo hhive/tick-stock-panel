@@ -84,6 +84,16 @@ _ENV_FILE = Path(
 # 兜底常量(仅首屏用, 加载后以服务端返回值为准), 两边要一起改。
 AI_GATEWAY_BASE_URL = "https://xiaoni-model.top/v1"
 
+# 部署级默认模型(用户裁定 2026-09-27)。
+#
+# 它是**兜底**, 不是「所有人就用这个」: 带 apikey 从 Sub2API 跳转进来的用户, 走
+# `ai_provider.pick_model_for_key()` 用他自己的 key 拉 `/v1/models` 挑一个(清单里
+# 有这个就用它, 否则用清单第一个)。只有在拉取失败、或用户从未走过跳转时才落到这里。
+#
+# 为什么要有它: 跳转只带得回 key, 带不回「该用哪个模型」; 而 `ai_configured()` 要求
+# key 与模型都齐(`config` 的默认空值会让跳转用户停在「还差一步: 选择模型」)。
+DEFAULT_AI_MODEL = "gpt-6-sol"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -99,9 +109,11 @@ class Settings(BaseSettings):
     ai_provider: str = "openai_compat"
     ai_base_url: str = AI_GATEWAY_BASE_URL
     ai_api_key: str = ""
-    # 默认模型留空: 旧默认值是 RunningHub 专属模型名, 换到本站网关后没有意义。
-    # 由用户在 AI 设置页填写(可从本站网关拉取模型列表), 空值不会被静默当成可用配置。
-    ai_model: str = ""
+    # 默认模型 = 部署级兜底 `DEFAULT_AI_MODEL`, 不再是空串:
+    # 空串会让「跳转带了 key 但没人知道选哪个模型」的用户卡在 `ai_configured()=false`。
+    # 走跳转的用户会先按自己的 key 的可见清单挑(见 ai_provider.pick_model_for_key),
+    # 这里只是挑不到时的落点; 用户随时可在 AI 设置页拉列表改。
+    ai_model: str = DEFAULT_AI_MODEL
     ai_codex_command: str = "codex"
     ai_codex_reasoning_effort: str = ""
     # 默认浏览器风格 UA,绕过 Cloudflare 等 CDN/WAF 的 Bot 拦截(Issue #8)。

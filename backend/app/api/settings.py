@@ -401,29 +401,17 @@ async def list_ai_models(req: AiModelsIn = AiModelsIn()) -> dict:
     模型名不再由预设预填(预设已下线), 而本站网关的 `/v1/models` 正是权威来源:
     Sub2API 按用户分组过滤模型, 故必须带**用户自己的 key**, 不能用服务端凭据代查。
     """
-    from app.services.ai_provider import ai_base_url
+    from app.services.ai_provider import ai_base_url, fetch_models_for_key
 
     api_key = (req.api_key or "").strip() or secrets_store.get_ai_key()
     if not api_key:
         raise HTTPException(status_code=400, detail="请先填写 AI API Key，再拉取模型列表")
 
-    import httpx
-
     base_url = ai_base_url()
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            res = await client.get(
-                f"{base_url}/models",
-                headers={"Authorization": f"Bearer {api_key}"},
-            )
-            res.raise_for_status()
-            data = res.json()
+        models = await fetch_models_for_key(api_key, timeout=15)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"获取模型列表失败: {exc}") from exc
-    models = sorted({
-        item.get("id") for item in data.get("data", [])
-        if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"]
-    })
     return {"models": models, "base_url": base_url}
 
 

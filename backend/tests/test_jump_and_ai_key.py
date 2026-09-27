@@ -174,6 +174,12 @@ def _ai_user_ctx(tmp_path, monkeypatch):
     # 「模型为空」取决于谁先跑过。
     for field, value in (("ai_api_key", ""), ("ai_model", ""), ("ai_provider", "openai_compat")):
         monkeypatch.setattr(app_config.settings, field, value)
+    # 2026-09-27 起部署级默认模型不再为空(`config.DEFAULT_AI_MODEL`), 故「有 key 无
+    # 模型」不再自然出现 —— 本用例钉的是那条**谓词**本身, 所以要连 env 快照一起置空。
+    # `secrets_store._env_default` 在调用时才从 app.config 取这个名字, 故可被替换。
+    monkeypatch.setattr(
+        app_config, "AI_ENV_DEFAULTS", {**app_config.AI_ENV_DEFAULTS, "ai_model": ""}
+    )
     token = preferences.set_current_user_root(tmp_path)
     yield tmp_path
     preferences.reset_current_user_root(token)

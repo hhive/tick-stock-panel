@@ -123,26 +123,43 @@ def _signed_in_account_id(request: Request) -> int | None:
 
 
 def _adopt_ai_key_if_unset(account_id: int, api_key: str) -> None:
-    """把已验证的跳转 key 记为**该账号的 AI 凭据** —— 仅在尚未设置时。
+    """把已验证的跳转 key 记为**该账号的 AI 凭据**, 并顺手挑一个默认模型。
 
     为什么在这里做: AI 消耗走用户自己的 Sub2API key(spec 8.2), 而面板拿到这把明文
     key 的唯一时机就是跳转/绑定 —— 在此之前全后端只有 AI 设置页的手动保存会写
     `ai_api_key`, 所以「跳进来就能用 AI」这件事一直缺一段。
 
-    写入策略由用户裁定(2026-09-27): **仅未设置时填**。用户手动填过的 key 是显式选择
-    (可能是给 AI 单独计费的另一个子账号 key), 不能被跳转静默改写。
+    写入策略由用户裁定(2026-09-27): **两件事各自「仅未设置时填」**, 互不牵连 ——
 
-    静默失败是刻意的: 这是登录/绑定的**附带收益**, 凭据落盘失败不该让用户连面板都
-    进不去; 失败只记日志, 用户仍可在 AI 设置页手动填。
+    - `ai_api_key`: 手动填过的 key 是显式选择(可能是给 AI 单独计费的另一个子账号
+      key), 不能被跳转静默改写。
+    - `ai_model`: 跳转能带回来的只有 key, 带不回「该用哪个模型」。只填 key 会让
+      `ai_configured()` 恒 false、界面停在「还差一步: 选择模型」—— 这正是 2026-09-27
+      用户报的实况。故按**账号实际生效的 key** 拉一次可见清单挑一个; 挑不到就不写,
+      让部署级默认(`config.DEFAULT_AI_MODEL`)生效 —— 写空串会把默认盖掉。
+      用账号的 key 而不是跳转那把: 两者可能不同, 用错会挑到该账号其实调不到的模型。
+
+    静默失败是刻意的: 这是登录/绑定的**附带收益**, 凭据落盘或挑模型失败都不该让用户
+    连面板都进不去; 失败只记日志, 用户仍可在 AI 设置页手动填。
     """
     from app import secrets_store
+    from app.services.ai_provider import pick_model_for_key
 
     try:
         root = user_paths.ensure_user_dirs(account_id)
-        if secrets_store.load(root).get("ai_api_key"):
-            return
-        secrets_store.save({"ai_api_key": api_key}, user_root=root)
-        logger.info("ai key adopted from jump: account_id=%s", account_id)
+        stored = secrets_store.load(root)
+
+        if not stored.get("ai_api_key"):
+            secrets_store.save({"ai_api_key": api_key}, user_root=root)
+            logger.info("ai key adopted from jump: account_id=%s", account_id)
+
+        if not stored.get("ai_model"):
+            # get_ai_key 内部重新读盘, 所以上面刚补写的 key 也算数。
+            effective_key = secrets_store.get_ai_key(root)
+            picked = pick_model_for_key(effective_key) if effective_key else ""
+            if picked:
+                secrets_store.save({"ai_model": picked}, user_root=root)
+                logger.info("ai model picked: account_id=%s model=%s", account_id, picked)
     except Exception:  # noqa: BLE001
         logger.exception("adopt ai key failed: account_id=%s", account_id)
 

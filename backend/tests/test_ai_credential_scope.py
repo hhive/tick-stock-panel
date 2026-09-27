@@ -125,7 +125,11 @@ def test_a_saved_key_never_leaks_to_another_account(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "ai_api_key", "sk-left-over-by-last-saver")
     monkeypatch.setattr(settings, "ai_model", "gpt-left-over")
     assert secrets_store.get_ai_key(b) == ""
-    assert secrets_store.get_ai_config("ai_model", "", user_root=b) == ""
+    # 期望值取 env 快照而不是写死空串: 2026-09-27 起部署级默认模型非空
+    # (`config.DEFAULT_AI_MODEL`)。写死空串会让「把回落改回读单例」这种回归
+    # 因为默认值本身变了而被误报成通过 —— 所以这里显式点名它**不得**是单例里那个值。
+    assert secrets_store.get_ai_config("ai_model", "", user_root=b) == app_config.AI_ENV_DEFAULTS.get("ai_model", "")
+    assert secrets_store.get_ai_config("ai_model", "", user_root=b) != "gpt-left-over"
 
 
 def test_saving_never_mutates_the_process_singleton(tmp_path):
