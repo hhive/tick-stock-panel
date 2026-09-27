@@ -107,6 +107,41 @@ def _current_account_id(request: Request) -> int:
     return int(account_id)
 
 
+def _signed_in_account_id(request: Request) -> int | None:
+    """取当前账号 id, **未登录返回 None 而不是抛错**。
+
+    跳转端点需要它: 「key 有效但未绑定」有两种截然不同的结局 —— 有会话就绑到当前
+    账号, 没会话才交给前端引导注册/登录。
+    """
+    account_id = getattr(request.state, "account_id", None)
+    return int(account_id) if account_id is not None else None
+
+
+def _adopt_ai_key_if_unset(account_id: int, api_key: str) -> None:
+    """把已验证的跳转 key 记为**该账号的 AI 凭据** —— 仅在尚未设置时。
+
+    为什么在这里做: AI 消耗走用户自己的 Sub2API key(spec 8.2), 而面板拿到这把明文
+    key 的唯一时机就是跳转/绑定 —— 在此之前全后端只有 AI 设置页的手动保存会写
+    `ai_api_key`, 所以「跳进来就能用 AI」这件事一直缺一段。
+
+    写入策略由用户裁定(2026-09-27): **仅未设置时填**。用户手动填过的 key 是显式选择
+    (可能是给 AI 单独计费的另一个子账号 key), 不能被跳转静默改写。
+
+    静默失败是刻意的: 这是登录/绑定的**附带收益**, 凭据落盘失败不该让用户连面板都
+    进不去; 失败只记日志, 用户仍可在 AI 设置页手动填。
+    """
+    from app import secrets_store
+
+    try:
+        root = user_paths.ensure_user_dirs(account_id)
+        if secrets_store.load(root).get("ai_api_key"):
+            return
+        secrets_store.save({"ai_api_key": api_key}, user_root=root)
+        logger.info("ai key adopted from jump: account_id=%s", account_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("adopt ai key failed: account_id=%s", account_id)
+
+
 def _check_register_rate_limit(ip: str) -> None:
     now = time.time()
     with _register_lock:
@@ -139,11 +174,19 @@ def _record_register(ip: str) -> None:
 def jump(req: JumpIn, request: Request, response: Response) -> dict:
     """从 Sub2API 跳转带来的 apikey 自动登录。
 
-    key 无效 → 401(绝不放行)。key 有效但未绑定任何账号 → needs_auth, 前端引导
-    注册/登录, 成功后由前端调用 /bindings 完成绑定。
+    key 无效 → 401(绝不放行)。
 
     key 已绑定到某账号 → 以该账号身份登录。这是「持有 key 即身份」的直接推论:
     URL 上的 key 本身就是 bearer 凭据, 不因当前浏览器另有一个登录态而改变归属。
+
+    key 有效但**未绑定任何账号**时分两种, 按当前有无会话:
+      - **已有会话** → 直接绑到当前账号并放行。这是最常见的情形(用户注册过、之后每次
+        都从 Sub2API 跳进来), 此前会被丢到登录页, 而登录页因「已认证」立刻回面板,
+        **绑定那一步从不执行、凭证被静默丢弃**(2026-09-27 用户报告的根因)。
+      - 无会话 → needs_auth, 前端引导注册/登录, 成功后由前端调 /bindings 补绑。
+
+    两条路径都会把这把 key 采纳为该账号的 AI 凭据(仅当尚未设置, 见
+    `_adopt_ai_key_if_unset`)。
     """
     if not sub2api_verify.verify_api_key(req.api_key):
         # 不区分「key 不存在」与「校验服务不可用」, 对外一律 401, 避免探测。
@@ -151,11 +194,29 @@ def jump(req: JumpIn, request: Request, response: Response) -> dict:
 
     key_hash = accounts.hash_api_key(req.api_key)
     owner = accounts.find_by_key_hash(key_hash)
+
     if owner is None:
-        return {"status": "needs_auth"}
+        current = _signed_in_account_id(request)
+        if current is None:
+            return {"status": "needs_auth"}
+        try:
+            accounts.bind_api_key(current, key_hash)
+        except accounts.BindingConflictError:
+            # 查询与绑定之间的竞态: 另一个请求先绑走了。退回引导路径, 不吞掉事实。
+            logger.warning("jump bind conflicted: account_id=%s", current)
+            return {"status": "needs_auth"}
+        except accounts.AccountNotFoundError:
+            # 会话指向已不存在的账号: 当作未登录, 由前端走登录页
+            return {"status": "needs_auth"}
+        _adopt_ai_key_if_unset(current, req.api_key)
+        acc = accounts.get_by_id(current)
+        logger.info("jump bind ok: account_id=%s", current)
+        # 不重发会话 cookie —— 调用者本来就带着有效会话, 只是把 key 补绑上去
+        return {"status": "logged_in", "email": acc.email if acc else ""}
 
     token = account_sessions.create_session(owner.id)
     _set_session_cookie(request, response, token)
+    _adopt_ai_key_if_unset(owner.id, req.api_key)
     logger.info("jump login ok: account_id=%s", owner.id)
     return {"status": "logged_in", "email": owner.email}
 
@@ -200,6 +261,7 @@ def register(req: RegisterIn, request: Request, response: Response) -> dict:
                 status_code=409,
                 detail="账号已创建, 但该 API Key 已被其它账号绑定, 请登录后更换",
             ) from None
+        _adopt_ai_key_if_unset(acc.id, req.api_key)
 
     _record_register(ip)
     token = account_sessions.create_session(acc.id)
@@ -262,6 +324,7 @@ def add_binding(req: BindingIn, request: Request) -> dict:
         raise HTTPException(status_code=409, detail=str(e)) from e
     except accounts.AccountNotFoundError as e:
         raise HTTPException(status_code=401, detail="未登录或会话已过期") from e
+    _adopt_ai_key_if_unset(account_id, req.api_key)
     return {"ok": True}
 
 

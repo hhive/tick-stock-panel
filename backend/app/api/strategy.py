@@ -850,7 +850,8 @@ def ai_status(request: Request):
     model = current_ai_model()
     provider = current_ai_provider()
     return {
-        "configured": ai_configured(provider) and bool(model or provider == "codex_cli"),
+        # 「有 key 且 有模型」的判定收在 ai_configured 里, 这里不再重复一遍
+        "configured": ai_configured(provider),
         "has_key": has_key,
         "has_model": bool(model),
         "provider": provider,

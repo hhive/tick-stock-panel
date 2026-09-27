@@ -312,10 +312,17 @@ def codex_cli_available() -> bool:
 
 
 def ai_configured(provider: str | None = None) -> bool:
+    """AI 是否**真的可用** —— 必须同时有凭据和模型。
+
+    只看 key 会造出假绿: 从 Sub2API 跳转进来时面板会自动填入 key(见
+    `api/account.py` 的 `_adopt_ai_key_if_unset`), 但没人知道该选哪个模型。此时
+    界面若显示「AI 已连接」, 真去调用必然失败(请求体 model="")。用户 2026-09-27
+    裁定收紧为两件都齐 —— 界面因此会诚实显示「还差选择模型」。
+    """
     provider = provider or current_ai_provider()
     if is_codex_cli_provider(provider):
         return codex_cli_available()
-    return bool(secrets_store.get_ai_key())
+    return bool(secrets_store.get_ai_key()) and bool(current_ai_model().strip())
 
 
 async def generate_ai_text(

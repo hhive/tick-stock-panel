@@ -53,7 +53,12 @@ export function SettingsAIPanel({ highlight }: { highlight?: string } = {}) {
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<{ ok: boolean; msg: string } | null>(null)
 
-  const configured = s?.ai_configured ?? s?.has_ai_key ?? false
+  // 三态, 不是两态: 从 Sub2API 跳转进来时后端会自动填入 API Key, 但没人知道该用哪个
+  // 模型。此时「有 key」和「能用」是两回事 —— 混为一谈就会显示「AI 已连接」而真去
+  // 调用必然失败(model="")。服务端 ai_configured 已收紧为「有 key 且 有模型」。
+  const hasKey = s?.has_ai_key ?? false
+  const configured = s?.ai_configured ?? hasKey
+  const needsModel = hasKey && !configured
   // 服务端返回优先: 地址栏必须显示请求**实际**打向哪里。本地常量只在首屏(或服务端
   // 返回空值)时兜底, 不能反过来盖住服务端的值。
   const baseUrl = s?.ai_base_url || AI_GATEWAY_BASE_URL
@@ -208,11 +213,15 @@ export function SettingsAIPanel({ highlight }: { highlight?: string } = {}) {
             {configured ? <Wifi className="h-4.5 w-4.5" /> : <WifiOff className="h-4.5 w-4.5" />}
           </div>
           <div className="min-w-0">
-            <div className="text-sm font-medium text-foreground">{configured ? 'AI 已连接' : 'AI 未配置'}</div>
+            <div className="text-sm font-medium text-foreground">
+              {configured ? 'AI 已连接' : needsModel ? '还差一步：选择模型' : 'AI 未配置'}
+            </div>
             <div className="text-xs text-muted mt-0.5 truncate">
               {configured
                 ? `${s?.ai_model} · ${s?.ai_api_key_masked}`
-                : '填入 Sub2API 的 API Key 后即可使用 AI 功能。'}
+                : needsModel
+                  ? `已填入 ${s?.ai_api_key_masked}，在下方「模型」里选一个即可使用`
+                  : '填入 Sub2API 的 API Key 后即可使用 AI 功能。'}
             </div>
           </div>
         </div>

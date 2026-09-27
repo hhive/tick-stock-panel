@@ -140,6 +140,26 @@ it('保存时提交锁定地址与自定义 provider，用户改不了上游', a
   expect(payload.provider).toBe('openai_compat')
 })
 
+it('跳转自动填入 key 但还没选模型时，不得显示「AI 已连接」', async () => {
+  // 服务端把 ai_configured 收紧为「有 key 且 有模型」; 只有 key 时界面必须诚实说
+  // 还差一步, 否则用户以为能用了, 一调用就失败(请求体 model="")
+  h.state = baseState({ has_ai_key: true, ai_api_key_masked: 'sk-a......z', ai_configured: false })
+  await renderPanel()
+
+  const text = host.textContent ?? ''
+  expect(text).not.toContain('AI 已连接')
+  expect(text).toContain('选择模型')
+})
+
+it('key 与模型齐备时显示已连接', async () => {
+  h.state = baseState({
+    has_ai_key: true, ai_api_key_masked: 'sk-a......z', ai_model: 'gpt-x', ai_configured: true,
+  })
+  await renderPanel()
+
+  expect(host.textContent ?? '').toContain('AI 已连接')
+})
+
 it('页面上不再有其它 AI 上游预设', async () => {
   await renderPanel()
 

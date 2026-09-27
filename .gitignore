@@ -109,3 +109,6 @@ TickFlowStockPanel.app/
 TickFlowStockPanel-macos*.dmg
 TickFlowStockPanel-macos*.zip
 reports/cursor_tickflow_pro_rate_limit_p0.bundle
+
+# 部署回滚锚点(含旧 dist 与旧环境文件), 属本机运维产物, 不入库
+.deploy-anchors/
